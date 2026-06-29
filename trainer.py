@@ -49,8 +49,9 @@ class EvNetModel(LightningModule):
         
        
     def init_optimizers(self):
+        from torchmetrics import Accuracy
         self.criterion = nn.NLLLoss(weight = self.loss_weights)
-        self.accuracy = pl.metrics.Accuracy()
+        self.accuracy = Accuracy(task='multiclass', num_classes=self.clf_params['opt_classes'])
         
 
     def forward(self, x, pixels):
@@ -131,6 +132,8 @@ def train(folder_name, path_results, data_params, backbone_params, clf_params,
         if k == 'lr_monitor': callbacks.append(LearningRateMonitor(**params))
         if k == 'model_chck': 
             params['dirpath'] = params['dirpath'].format(path_model)
+            if 'period' in params:
+                params['every_n_epochs'] = params.pop('period')
             callbacks.append(ModelCheckpoint(**params))
         
     loggers = []
@@ -159,6 +162,9 @@ def train(folder_name, path_results, data_params, backbone_params, clf_params,
                        loss_weights = None if not data_params['balance'] else dm.train_dataloader().dataset.get_class_weights()
                        )
     
+    if training_params.pop('stochastic_weight_avg', False):
+        from pytorch_lightning.callbacks import StochasticWeightAveraging
+        callbacks.append(StochasticWeightAveraging(swa_lrs=1e-2))
     trainer = Trainer(**training_params, callbacks=callbacks, logger=loggers)
     
     # Save all params

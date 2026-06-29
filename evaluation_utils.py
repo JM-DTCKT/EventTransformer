@@ -1,7 +1,7 @@
 import torch
 from data_generation import Event_DataModule
 
-from pytorch_lightning.metrics import Accuracy
+from torchmetrics import Accuracy
 from sklearn.metrics import confusion_matrix
 import pandas as pd
 import json

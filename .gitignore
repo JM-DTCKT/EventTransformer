@@ -127,3 +127,11 @@ dmypy.json
 
 # Pyre type checker
 .pyre/
+
+# 데이터셋
+datasets/
+
+# 학습된 모델 및 결과
+pretrained_models/
+
+.ckpt

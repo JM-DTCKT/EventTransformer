@@ -1,7 +1,7 @@
 import torch
 from data_generation import Event_DataModule
 
-from pytorch_lightning.metrics import Accuracy
+from torchmetrics import Accuracy
 import pandas as pd
 import json
 from tqdm import tqdm
