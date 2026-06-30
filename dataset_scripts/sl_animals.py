@@ -13,7 +13,7 @@ from tqdm import tqdm
 
 np.random.seed(0)
 
-chunk_len_ms = 2
+chunk_len_ms = 12
 chunk_len_us = chunk_len_ms*1000
 height, width = 128, 128
 size = 0.25

@@ -389,12 +389,12 @@ class Event_DataModule(LightningDataModule):
             self.num_classes = 24
             self.class_mapping = { i:l for i,l in enumerate('a b c d e f g h i k l m n o p q r s t u v w x y'.split()) }
         elif dataset_name == 'SLAnimals_3s':
-            self.data_folder = './datasets/SL_animal_splits/dataset_3sets_2000/'
+            self.data_folder = './datasets/SL_animal_splits/dataset_3sets_12000/'
             self.width, self.height = 128, 128
             self.num_classes = 19
             self.class_mapping = { i:l for i,l in enumerate(range(self.num_classes)) }
         elif dataset_name == 'SLAnimals_4s':
-            self.data_folder = './datasets/SL_animal_splits/dataset_4sets_2000/'
+            self.data_folder = './datasets/SL_animal_splits/dataset_4sets_12000/'
             self.width, self.height = 128, 128
             self.num_classes = 19
             self.class_mapping = { i:l for i,l in enumerate(range(self.num_classes)) }
