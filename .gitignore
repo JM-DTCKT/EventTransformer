@@ -130,6 +130,10 @@ dmypy.json
 
 # 데이터셋
 datasets/
+quantization/fpga_export/
+quantization/ASL_DVS/
+quantization/DVS128_10/
+quantization/DVS128_11/
 
 # 학습된 모델 및 결과
 pretrained_models/

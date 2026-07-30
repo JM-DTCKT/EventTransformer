@@ -1,0 +1,19 @@
+dataset,case,accuracy,stage,sanity_check_max_logit_diff,n_eval_samples,eval_time_s,n_calib_batches
+DVS128_10,fp32_baseline,0.981060606060606,"n/a (reference, from run_quantization.py; int8_w8a8_static here still has the out_proj gap)",,,,
+DVS128_10,int8_weightonly_perchannel,0.981060606060606,"n/a (reference, from run_quantization.py; int8_w8a8_static here still has the out_proj gap)",,,,
+DVS128_10,int8_w8a8_static,0.9772727272727272,"n/a (reference, from run_quantization.py; int8_w8a8_static here still has the out_proj gap)",,,,
+DVS128_10,int8_w8a8_static+outproj,0.9772727272727273,baseline,3.814697265625e-06,264.0,8.337113857269287,16.0
+DVS128_10,int8_w8a8_static+qk_mac,0.9772727272727273,qk_mac,3.814697265625e-06,264.0,8.7059326171875,16.0
+DVS128_10,int8_w8a8_static+qkv_mac,0.9734848484848485,qkv_mac,3.814697265625e-06,264.0,8.316370487213135,16.0
+DVS128_11,fp32_baseline,0.9583333333333334,"n/a (reference, from run_quantization.py; int8_w8a8_static here still has the out_proj gap)",,,,
+DVS128_11,int8_weightonly_perchannel,0.9583333333333334,"n/a (reference, from run_quantization.py; int8_w8a8_static here still has the out_proj gap)",,,,
+DVS128_11,int8_w8a8_static,0.9583333333333334,"n/a (reference, from run_quantization.py; int8_w8a8_static here still has the out_proj gap)",,,,
+DVS128_11,int8_w8a8_static+outproj,0.9513888888888888,baseline,3.814697265625e-06,288.0,9.31974744796753,18.0
+DVS128_11,int8_w8a8_static+qk_mac,0.9583333333333334,qk_mac,3.814697265625e-06,288.0,9.052828788757324,18.0
+DVS128_11,int8_w8a8_static+qkv_mac,0.9548611111111112,qkv_mac,3.814697265625e-06,288.0,9.711963415145874,18.0
+ASL_DVS,fp32_baseline,0.999652726100114,"n/a (reference, from run_quantization.py; int8_w8a8_static here still has the out_proj gap)",,,,
+ASL_DVS,int8_weightonly_perchannel,0.9996031155429876,"n/a (reference, from run_quantization.py; int8_w8a8_static here still has the out_proj gap)",,,,
+ASL_DVS,int8_w8a8_static,0.9995038944287344,"n/a (reference, from run_quantization.py; int8_w8a8_static here still has the out_proj gap)",,,,
+ASL_DVS,int8_w8a8_static+outproj,0.999553504985861,baseline,1.1444091796875e-05,20157.0,62.92566275596619,1260.0
+ASL_DVS,int8_w8a8_static+qk_mac,0.9997023366572406,qk_mac,1.1444091796875e-05,20157.0,58.998401403427124,1260.0
+ASL_DVS,int8_w8a8_static+qkv_mac,0.999553504985861,qkv_mac,1.1444091796875e-05,20157.0,59.841108560562134,1260.0

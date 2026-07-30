@@ -17,6 +17,9 @@ train_files, test_files = 'trials_to_train.txt', 'trials_to_test.txt'
 with open(path_dataset_src + train_files, 'r') as f: train_files = f.read().splitlines()
 with open(path_dataset_src + test_files, 'r') as f: test_files = f.read().splitlines()
 
+os.makedirs(os.path.join(path_dataset_dst, 'train'), exist_ok=True)
+os.makedirs(os.path.join(path_dataset_dst, 'test'), exist_ok=True)
+
 
 # Load and stor dataset event samples
 def store_samples(events_files, mode):

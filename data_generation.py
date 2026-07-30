@@ -384,17 +384,17 @@ class Event_DataModule(LightningDataModule):
             for c in classes_to_exclude: del self.class_mapping[c]
             self.class_mapping = { i:l[1] for i,l in enumerate(sorted(self.class_mapping.items(), key=lambda x:x[0])) }
         elif dataset_name == 'ASL_DVS':
-            self.data_folder = './datasets/ICCV2019_DVS_dataset/clean_dataset_frames_2000/'
+            self.data_folder = '/data/sgh/ASL_DVS/clean_dataset_frames_2000/'
             self.width, self.height = 240, 180
             self.num_classes = 24
             self.class_mapping = { i:l for i,l in enumerate('a b c d e f g h i k l m n o p q r s t u v w x y'.split()) }
         elif dataset_name == 'SLAnimals_3s':
-            self.data_folder = './datasets/SL_animal_splits/dataset_3sets_12000/'
+            self.data_folder = './datasets/SL_animal_splits/dataset_3sets_2000/'
             self.width, self.height = 128, 128
             self.num_classes = 19
             self.class_mapping = { i:l for i,l in enumerate(range(self.num_classes)) }
         elif dataset_name == 'SLAnimals_4s':
-            self.data_folder = './datasets/SL_animal_splits/dataset_4sets_12000/'
+            self.data_folder = './datasets/SL_animal_splits/dataset_4sets_2000/'
             self.width, self.height = 128, 128
             self.num_classes = 19
             self.class_mapping = { i:l for i,l in enumerate(range(self.num_classes)) }
@@ -418,9 +418,7 @@ class Event_DataModule(LightningDataModule):
             # Sample -> time_sequence
             # #samples == batch_size
             
-            if sample is None or len(sample[0]) == 0: 
-                print('Empty sample')
-                print(len(sample), len(sample[0]))
+            if sample is None or len(sample[0]) == 0:
                 continue
             
             pols.append(sample[0])
@@ -448,11 +446,23 @@ class Event_DataModule(LightningDataModule):
                            dataset_name=self.dataset_name, height=self.height, width=self.width,
                            augmentation_params=self.augmentation_params, 
                            classes_to_exclude=self.classes_to_exclude)
+        # CustomBatchSampler.__iter__ is an infinite generator (Lightning only
+        # pulls len(dataloader) batches per epoch, it doesn't stop the
+        # underlying sampler itself). With num_workers > 0, the default
+        # DataLoader prefetching (prefetch_factor batches queued *per
+        # worker*, ahead of what's actually consumed) will happily keep
+        # pulling extra batches from that infinite stream. That's harmless
+        # for small samples, but here each batch requires loading dozens of
+        # huge (hundreds of MB) pickle files, so a handful of speculatively
+        # prefetched-but-unused batches can mean tens of GB of wasted
+        # disk reads/deserialization before a single training step runs.
+        # Keep prefetching to the minimum (1 batch/worker) to limit this.
+        extra_kwargs = {'prefetch_factor': 1} if self.workers > 0 else {}
         if self.custom_sampler: 
             sampler = CustomBatchSampler(batch_size=self.batch_size, label_dict=dt.get_label_dict(), sample_repetitions=self.sample_repetitions)
-            dl = DataLoader(dt, batch_sampler=sampler, collate_fn=self.custom_collate_fn, num_workers=self.workers, pin_memory=self.pin_memory)
+            dl = DataLoader(dt, batch_sampler=sampler, collate_fn=self.custom_collate_fn, num_workers=self.workers, pin_memory=self.pin_memory, **extra_kwargs)
         else:
-            dl = DataLoader(dt, batch_size=self.batch_size, collate_fn=self.custom_collate_fn, shuffle=True, num_workers=self.workers, pin_memory=self.pin_memory)
+            dl = DataLoader(dt, batch_size=self.batch_size, collate_fn=self.custom_collate_fn, shuffle=True, num_workers=self.workers, pin_memory=self.pin_memory, **extra_kwargs)
         return dl
     def val_dataloader(self):
         dt = EventDataset(self.data_folder+'test/', chunk_len_ms = self.chunk_len_ms, 
@@ -465,7 +475,8 @@ class Event_DataModule(LightningDataModule):
                            dataset_name=self.dataset_name, height=self.height, width=self.width,
                            augmentation_params=self.augmentation_params, 
                            classes_to_exclude=self.classes_to_exclude)
-        dl = DataLoader(dt, batch_size=(self.batch_size//2)+1, shuffle=False, collate_fn=self.custom_collate_fn, num_workers=self.workers, pin_memory=self.pin_memory)
+        extra_kwargs = {'prefetch_factor': 1} if self.workers > 0 else {}
+        dl = DataLoader(dt, batch_size=(self.batch_size//2)+1, shuffle=False, collate_fn=self.custom_collate_fn, num_workers=self.workers, pin_memory=self.pin_memory, **extra_kwargs)
         return dl
     
     
