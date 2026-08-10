@@ -23,22 +23,24 @@
 `timescale 1ns/1ps
 
 module gelu_pwl #(
-    parameter W  = 16,   // data width (Q5.10)
-    parameter QF = 10,   // fractional bits of x/y
+    parameter W  = 16,   // data width
+    parameter QF = 11,   // fractional bits of x/y  (Q(W-1-QF).QF)
     parameter FR = 14    // fractional bits of internal R
 )(
     input                     clk,
     input                     rst_n,
     input                     in_valid,
-    input      signed [W-1:0] x,        // Q5.10
+    input      signed [W-1:0] x,        // Q(W-1-QF).QF
     output reg                out_valid,
-    output reg signed [W-1:0] y         // Q5.10  ~= GELU(x)
+    output reg signed [W-1:0] y         // Q(W-1-QF).QF  ~= GELU(x)
 );
-    localparam integer K        = 4;               // width = 2^-K = 0.0625
-    localparam integer IDXBITS  = QF - K;          // = 6  (segment index bits)
-    localparam integer FRACBITS = QF - K;          // = 6  (in-segment frac bits)
-    localparam integer A_MAX_FIX= (4 << QF);       // = 4096  (a>=4 → R(a)=0)
-    localparam integer RSH      = FR - QF;          // = 4  (Q14 -> Q10)
+    localparam integer K        = 4;               // segment width = 2^-K = 0.0625
+    localparam integer A_INT    = 4;               // A_MAX = 4.0
+    localparam integer NSEG     = A_INT << K;      // = 64  (A_MAX/width), QF 무관
+    localparam integer IDXBITS  = $clog2(NSEG);    // = 6   (segment index bits)
+    localparam integer FRACBITS = QF - K;          // in-segment frac bits (QF-4)
+    localparam integer A_MAX_FIX= (A_INT << QF);   // a>=4 -> R(a)=0
+    localparam integer RSH      = FR - QF;          // Q(FR) -> Q(QF)
 
     // ---- LUT (base14_rom[64], delta14_rom[64]) ----
     `include "gelu_lut.vh"
@@ -73,30 +75,31 @@ module gelu_pwl #(
     end
 
     // ======================= Stage 2 : linear interpolation =================
-    // interp = delta*frac >>> FRACBITS ; R14 = base + interp ; R10 = round(R14)
+    // interp = delta*frac >>> FRACBITS  (frac 은 세그먼트를 2^FRACBITS 등분한 위치)
+    // r14 = base + interp   (R in Q(FR)=Q14) ;  r_out = round(r14) -> Q(QF)
     wire signed [W+FRACBITS:0] prod   = delta_s1 * $signed({1'b0, frac_s1});
-    wire signed [W:0]          interp = prod >>> FRACBITS; // Seg length = 0.0625 => x2^(10) = 64
-    wire signed [W:0]          r14    = ge4_s1 ? {(W+1){1'b0}} : (base_s1 + interp); // Q5.14 format
-    wire signed [W:0]          r10    = (r14 + (1 << (RSH-1))) >>> RSH;   // round(r14)>>4 ; Q5.10 format conversion
+    wire signed [W:0]          interp = prod >>> FRACBITS;                 // R in Q(FR)
+    wire signed [W:0]          r14    = ge4_s1 ? {(W+1){1'b0}} : (base_s1 + interp);
+    wire signed [W:0]          r_out  = (r14 + (1 << (RSH-1))) >>> RSH;    // Q(FR)->Q(QF), round
 
     reg                 vld_s2, sign_s2;
     reg  signed [W-1:0] x_s2;
-    reg  signed [W-1:0] r10_s2;
+    reg  signed [W-1:0] r_out_s2;
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            vld_s2 <= 1'b0; sign_s2 <= 1'b0; x_s2 <= 0; r10_s2 <= 0;
+            vld_s2 <= 1'b0; sign_s2 <= 1'b0; x_s2 <= 0; r_out_s2 <= 0;
         end else begin
-            vld_s2  <= vld_s1;
-            sign_s2 <= sign_s1;
-            x_s2    <= x_s1;
-            r10_s2  <= r10[W-1:0];
+            vld_s2   <= vld_s1;
+            sign_s2  <= sign_s1;
+            x_s2     <= x_s1;
+            r_out_s2 <= r_out[W-1:0];
         end
     end
 
     // ======================= Stage 3 : combine ==============================
-    //   x >= 0 : y = x - R ;   x < 0 : y = -R
-    wire signed [W-1:0] y_next = sign_s2 ? (-r10_s2) : (x_s2 - r10_s2);
+    //   x >= 0 : y = x - R ;   x < 0 : y = -R   (모두 Q(QF))
+    wire signed [W-1:0] y_next = sign_s2 ? (-r_out_s2) : (x_s2 - r_out_s2);
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
