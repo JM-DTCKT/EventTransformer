@@ -1,376 +1,427 @@
 // ============================================================================
-//  softmax_top.v  --  96-D softmax unit   (입력 Q6.9 x96 병렬 / 출력 UQ1.15 스트림)
+//  softmax_top.v    --  32행 Tile 단위 T-축 softmax  (Q6.9 in / signed Q1.14 out)
 // ----------------------------------------------------------------------------
-//  y_i = exp(x_i - max) / sum_j exp(x_j - max)        (i = 0 .. N-1, N = 96)
+//  attention 의 QK^T 결과 (Tile_M x T) 에 대해 **T 축(키 축)** 으로 softmax 한다.
+//  Tensor Core 출력을 **열 단위(32원소)** 로 받아 32 x T Tile 을 모으고,
+//  32개 행의 softmax 를 한꺼번에 처리한다.
 //
-//  [입력 인터페이스]  벡터 전체(N x DW = 1536-bit)를 1 clk 에 받는다.
-//    upstream (QK^T score) 이 벡터를 한 번에 내주는 구조에 맞춘 것으로,
-//    직렬로 96 clk 동안 긁어모으던 LOAD pass 가 통째로 사라진다.
+//     for r in 0..Tile_M-1:  y[r][0..T-1] = softmax( x[r][0..T-1] )
 //
-//  [왜 그래도 버퍼가 필요한가]
-//    softmax 는 max 와 sum 이라는 "전역" 의존성이 있어 x_95 를 보기 전에는
-//    y_0 을 낼 수 없다.  1 clk 에 다 받더라도 1 clk 에 96개 exp 를 계산하지
-//    않는 이상 96 word 를 어딘가 들고 있어야 한다 -> xbuf 는 제거 불가.
-//    단, 96개를 동시에 써야 하므로 xbuf 는 SRAM 이 아니라 96x16 flip-flop 이다.
+//  [입력]  매 clk "한 열" = 32행 각각의 원소 1개  (Tile_M x DW = 512-bit)
+//    · 열 하나가 32행에 1원소씩이므로 **부분 beat 가 없다** -> keep 마스크 불필요
+//    · T 는 런타임 가변(<= TMAX). 마지막 열에 in_last 를 실어준다.
 //
-//  [P-lane exp 병렬]  exp2_unit 을 P개(기본 8) 깔아 매 clk P원소씩 처리한다.
-//    lane j 는 step k 에서 원소 (k*P + j) 를 담당한다 (원소 i -> step i/P, lane i%P).
-//    xbuf / ebuf 를 [step][lane] 2차원으로 두면 lane 당 NS:1 mux 만으로 접근된다.
-//    exp 결과 P개는 가산 트리로 합쳐 분모 S 에 한 번에 누산한다.
+//  [핵심 1] 수신하면서 max 를 같이 구한다
+//    데이터가 어차피 버스를 지나가므로 **비교기 Tile_M개**만 얹으면 추가 사이클/추가
+//    메모리 읽기 없이 행별 max 가 확정된다.  -> 이후 단계엔 max 로직이 아예 없다.
 //
-//  [단계별 사이클]  (N=96, P=8 기준)
-//    ST_LOAD :  in_vec 전체를 xbuf 에 래치 + max tree stage A         1 clk
-//    ST_MAX  :  max tree stage B -> maxv 확정                         1 clk
-//    ST_EXP  :  z = x - max (<=0) 를 P-lane exp2_unit 에 흘리고
-//               결과를 ebuf 저장 + 가산트리로 S 누산    NS + 4 =     16 clk
-//    ST_RCP  :  R = 1/S 를 recip_unit 으로 한 번만 계산                4 clk
-//    ST_MUL  :  y_i = e_i * R  (나눗셈 대신 역수 곱셈)   NS + 1 =     13 clk
-//                                                          합계      35 clk
-//    * exp 와 출력 곱셈 모두 P-lane 이라 남은 최대 항목은 ST_EXP(16 clk) 다.
-//      출력은 매 clk P원소씩 NS(=12) beat 로 나간다.
-//    * [주의] 원소 단위는 완전 파이프라인이지만 "벡터 단위 중첩은 없다".
-//      FSM 이 순차로 돌므로 in_ready 는 35 clk 중 34 clk 동안 low 이고,
-//      35 clk 이 latency 이자 처리주기다 (평균 2.74 elem/clk, 8/clk 은 버스트).
-//      지속 8 elem/clk 을 내려면 xbuf/ebuf 를 ping-pong 으로 2벌 두고
-//      벡터 단위 파이프라이닝을 해야 한다 -> 하한 12 clk/vector.
+//      rmax[r] <= (t==0) ? x[r] : max(rmax[r], x[r])     매 clk Tile_M개 동시
 //
-//  * max 뺄셈 : exp 입력을 항상 <=0 으로 만들어 오버플로를 원천 차단하고
-//               (e_i in (0,1]) exp LUT 의 정의역도 한쪽으로 고정시킨다.
-//               최대 원소가 exp(0)=1.0 정확히 나오므로 S >= 1.0 이 보장된다.
-//  * 나눗셈   : 분모 역수를 1회 구해 96번 곱한다.  나눗셈기 없이 곱셈기 1개.
-//               역수는 벡터당 1회뿐이라 lane 을 늘릴 대상이 아니다.
+//  [핵심 2] 3개의 독립 FSM 을 Tile 단위로 파이프라인
+//    한 Tile 안에서는 max 가 전역 의존성이라 RECV 와 EXP 를 겹칠 수 없다.
+//    대신 **서로 다른 Tile** 을 세 단계가 동시에 처리한다.
 //
-//  [max tree]  N 을 2의 거듭제곱(NP=128)으로 패딩해 균일한 7-레벨 트리로 만든다.
-//    패딩값은 표현 가능한 최소값(-64.0)이라 실제 max 를 절대 이기지 못하고,
-//    상수끼리의 비교라 합성 시 전부 제거된다 (실질 비교기 N-1 = 95개).
-//    7 레벨을 한 clk 에 태우면 500MHz 에서 빠듯하므로 4+3 레벨 2단으로 쪼갠다.
+//      Tile k+2 :  [S1 RECV  T=324 clk ]
+//      Tile k+1 :               [S2 EXP+RCP  1+(T+L+4)+(Tile_M+3) = 365 clk ]
+//      Tile k   :                            [S3 MUL  1+(T+L) = 326 clk ]
+//                 주기 = max(324, 365, 326) = 365 clk    (L = BRAM_LAT = 1)
+//
+//    S1 RECV    : in_col -> xbuf[뱅크] + rmax 갱신                    T clk
+//    S2 EXP+RCP : z = x - rmax[r] -> exp2_unit xTile_M -> ebuf[뱅크] T+L+4 clk
+//                 (BRAM 읽기 L단 + exp 파이프 4단)
+//                 행별 sum Tile_M개 누산, 이어서 행별 1/S 를 recip 1개로  Tile_M+3 clk
+//    S3 MUL     : y = e * R[r] >> (p[r]+3) -> out_col              T+L clk
+//
+//  [버퍼를 몇 벌 두는가]  "생산자와 소비자가 서로 다른 Tile 을 동시에 다루는가"
+//    xbuf : S1(Tile k+2 수신) ‖ S2(Tile k+1 소비) -> 다른 Tile -> **2 뱅크**
+//           뱅크 하나 = TMAX word x (Tile_M*DW) = 32 x T 원소 전부 = 166 kbit
+//    ebuf : S2(Tile k+1 생산) ‖ S3(Tile k 소비)   -> 다른 Tile -> **2 뱅크**
+//           뱅크 하나 = TMAX word x (Tile_M*EW)                     = 176 kbit
+//    rr/pp/etlen 도 Tile 별 상태라 2벌 (작음)
+//    합계 : xbuf 332 kbit + ebuf 352 kbit = 684 kbit
+//
+//    ebuf 를 2벌로 둔 이유는 **S2 와 S3 가 서로 다른 연산기를 쓰는데 1벌이면
+//    직렬화되기 때문**이다.  1벌일 때는 EXP 동안 곱셈기 32개가, MUL 동안 exp
+//    유닛 32개가 놀아서 가동률이 ~48% 였다.  2벌이면 둘 다 ~90% 로 올라간다.
+//
+//  [메모리 추론]  xbuf + ebuf = 684 kbit 라 FF 로는 불가능하다 (68만 개).
+//    둘 다 **등록형 read** 로 작성해 BRAM(simple dual-port) 으로 추론되게 했다.
+//    조합 read 로 두면 distributed RAM 이 되어 LUT 을 수천 개 먹는다.
+//    읽기 지연은 파라미터 BRAM_LAT 로 조절한다 :
+//      1 = BRAM 코어만        -> 주기 365, e2e(3) = 1,745 clk   (기본)
+//      2 = 출력 레지스터까지  -> 주기 366, e2e(3) = 1,749 clk
+//    차이가 4 clk (0.2%) 뿐이므로 **사이클이 아니라 타이밍 클로저로 정한다**.
+//    ~400MHz 까지는 1 로 충분하고, 500MHz 에서 WNS 가 음수면 2 로 올리면 된다
+//    (BRAM 출력 레지스터 사용).  파라미터 한 줄이라 합성 후 뒤집어도 된다.
 //
 //  [고정소수점 포맷]
-//    x (in_vec)   signed   Q6.9   16b   범위 [-64, 64),   LSB 2^-9  = 1.95e-3
-//    z (내부)     signed   Q7.9   17b   = x - max,  범위 (-128, 0]
-//    e (내부)     unsigned UQ1.16 17b   exp 결과 (0,1],   1.0 = 2^16
-//    S (내부)     unsigned UQ8.16 24b   sum(e), 범위 [1, 96]
-//    R (내부)     unsigned UQ1.17 18b   1/m  (m = S/2^p, m in [1,2))
-//    y (out_data) unsigned UQ1.15 16b   범위 [0,1],       1.0 = 16'h8000
+//    x (in_col)   signed   Q6.9    16b   범위 [-64, 64),  LSB 2^-9 = 1.95e-3
+//    z (내부)     signed   Q7.9    17b   = x - max,  범위 (-128, 0]
+//    e (내부)     unsigned UQ1.16  17b   exp 결과 (0,1],  1.0 = 2^16
+//    S (내부)     unsigned UQ10.16 26b   sum(e), 범위 [1, TMAX]
+//    R (내부)     unsigned UQ1.17  18b   1/m  (m = S/2^p, m in [1,2))
+//    y (out_col)  **signed** Q1.14 16b   범위 [0,1],      1.0 = 2^14 = 16'h4000
+//                 (부호 1 + 정수 1 + 소수 14).  softmax 출력은 항상 >= 0 이고
+//                 y <= 1.0 = 0x4000 < 0x8000 이므로 **부호비트가 절대 서지 않는다**
+//                 -> 포화(saturation) 로직 불필요.  TB 에서 전 원소 검증한다.
 //
-//    y = e/S = e * R * 2^-p  이므로  y15 = (e*R) >> (p + RF - OF) = >> (p+2)
+//    y = e/S = e*R*2^-p  이므로  y_out = (e*R) >> (p + RF - OF) = >> (p+3)
 //    * e(17b) x R(18b) = 18s x 19s -> DSP48 (25x18 / 27x18) 1개에 정확히 들어간다.
-//
-//  [핸드셰이크 / 타이밍]  (시뮬레이션 실측치, N=96 / P=8)
-//    입력 : in_valid / in_ready 로 벡터 1개 = 1 handshake.
-//           in_ready 는 idle 일 때만 high 이고, 연산 내내 low 를 유지하다가
-//           마지막 출력(out_last)과 같은 사이클에 복귀한다 -> back-to-back 무버블.
-//           별도 busy 출력은 정확히 ~in_ready 라 중복이므로 두지 않는다.
-//    출력 : out_valid 가 NS(=12) clk 연속 high, 매 beat 마다 P(=8)원소.
-//           마지막 beat 에서 out_last.  (출력측 back-pressure 없음)
-//    latency  = 24 clk  (in_valid handshake -> 첫 out_valid, 첫 P원소)
-//    벡터주기 = 35 clk  (2 load/max + 16 exp + 4 recip + 13 mul)
+//    * 시프트량 p 는 **행마다 다르므로** lane 별 배럴 시프터가 필요하다
+//      (p in [16,24] -> sh in [19,27], 9가지뿐이라 9:1 mux 규모).
 // ============================================================================
 `timescale 1ns/1ps
 
 module softmax_top #(
-    parameter integer N  = 96,   // softmax 차원
-    parameter integer P  = 8,    // exp lane 수 (N 의 약수, 2의 거듭제곱)
-    parameter integer DW = 16,   // 입력 원소 폭 (signed Q6.9)
-    parameter integer IF = 9,    // 입력 소수부 비트수
-    parameter integer OW = 16,   // 출력 폭 (unsigned UQ1.15)
-    parameter integer OF = 15,   // 출력 소수부 비트수
-    parameter integer EW = 17,   // 내부 exp 폭 (unsigned UQ1.16, = EF+1)
-    parameter integer EF = 16,   // 내부 exp 소수부 비트수
-    parameter integer RW = 18,   // 역수 폭 (unsigned UQ1.17, = RF+1)
-    parameter integer RF = 17    // 역수 소수부 비트수
+    parameter integer Tile_M = 32,   // Tile 행 수 (= Tensor Core 타일 행 수)
+    parameter integer TMAX   = 324,  // 최대 T (정규화 축 길이)
+    parameter integer DW     = 16,   // 입력 원소 폭 (signed Q6.9)
+    parameter integer IF     = 9,    // 입력 소수부 비트수
+    parameter integer OW     = 16,   // 출력 폭 (signed Q1.14 : 부호1+정수1+소수14)
+    parameter integer OF     = 14,   // 출력 소수부 비트수 (signed Q1.14)
+    parameter integer EW     = 17,   // 내부 exp 폭 (unsigned UQ1.16, = EF+1)
+    parameter integer EF     = 16,   // 내부 exp 소수부 비트수
+    parameter integer RW     = 18,   // 역수 폭 (unsigned UQ1.17, = RF+1)
+    parameter integer RF     = 17,   // 역수 소수부 비트수
+    // BRAM read latency : 1 = 코어만,  2 = 출력 레지스터까지 (고Fmax 권장)
+    parameter integer BRAM_LAT = 1
 )(
     input                        clk,
     input                        rst_n,
-    // ---- 입력 : 벡터 전체를 1 clk 에 (원소 i = in_vec[i*DW +: DW]) ----
+    // ---- 입력 : 매 clk 한 열(Tile_M원소), T 회 ----
     input                        in_valid,
     output                       in_ready,
-    input       [N*DW-1:0]       in_vec,      // Q6.9 x N, 원소 0 이 LSB 쪽
-    // ---- 출력 : 매 clk P원소씩 NS beat (원소 j = out_data[j*OW +: OW]) ----
+    input       [Tile_M*DW-1:0]       in_col,    // Q6.9 x Tile_M (행 r = in_col[r*DW +: DW])
+    input                        in_last,   // 이 Tile 의 마지막 열
+    // ---- 출력 : 매 clk 한 열(Tile_M원소), T 회 ----
     output reg                   out_valid,
-    output reg  [P*OW-1:0]       out_data,    // UQ1.15 x P, beat k 는 y[k*P .. k*P+P-1]
+    output reg  [Tile_M*OW-1:0]       out_col,   // signed Q1.14 x Tile_M (원소 r = [r*OW +: OW])
     output reg                   out_last
 );
     // ---- width 파라미터 ----------------------------------------------------
-    localparam integer AW      = $clog2(N);        // = 7,  원소 인덱스 폭
-    localparam integer NS      = N / P;            // = 12, exp step 수
-    localparam integer SW1     = $clog2(NS);       // = 4,  step 인덱스 폭
-    localparam integer PL      = $clog2(P);        // = 3,  lane 인덱스 폭
-    localparam integer ZW      = DW + 1;           // = 17, z = x - max 폭
-    localparam integer SW      = EF + AW + 1;      // = 24, S = sum(e) 폭
-                                                   //   S <= N*2^EF < 2^(EF+AW) 이므로 충분
-    localparam integer ESW     = EW + PL;          // = 20, P개 exp 합(가산트리) 폭
-    localparam integer PW      = 5;                // p (S 의 MSB 위치) 폭, p in [16,22]
-    localparam integer SH_OFF  = RF - OF;          // = 2,  최종 시프트 오프셋
-    localparam integer PDW     = EW + RW;          // = 35, e*R 곱 폭 (17b x 18b)
+    localparam integer TW     = $clog2(TMAX);          // = 9,  열 인덱스 폭
+    localparam integer TCW    = TW + 1;                // = 10, 열 카운터 폭
+    localparam integer MW     = $clog2(Tile_M);        // = 5,  행 인덱스 폭
+    localparam integer MCW    = MW + 1;                // = 6,  행 카운터 폭
+    localparam integer ZW     = DW + 1;                // = 17, z = x - max 폭
+    localparam integer SW     = EF + TW + 1;           // = 26, S = sum(e) 폭
+    localparam integer PW     = 5;                     // p (S 의 MSB 위치) 폭
+    localparam integer SH_OFF = RF - OF;               // = 3,  최종 시프트 오프셋
+    localparam integer PDW    = EW + RW;               // = 35, e*R 곱 폭
+    localparam signed [DW-1:0] XMIN = {1'b1, {(DW-1){1'b0}}};   // -64.0
 
-    // max tree : NP 로 패딩 후 LVL 레벨, LA + LB 두 단으로 파이프라인
-    // Tree 구조로 max값을 찾기 위해 최솟값으로 padding
-    localparam integer LVL     = $clog2(N);        // = 7,  전체 레벨 수
-    localparam integer NP      = 1 << LVL;         // = 128, 패딩된 원소 수
-    localparam integer LA      = (LVL + 1) / 2;    // = 4,  stage A 레벨 수
-    localparam integer LB      = LVL - LA;         // = 3,  stage B 레벨 수
-    localparam integer NA      = NP >> LA;         // = 8,  stage A 출력 개수
-    localparam signed [DW-1:0] XPAD = {1'b1, {(DW-1){1'b0}}};  // 패딩값 = 최소값
-
-    localparam [2:0] ST_LOAD = 3'd0,   // 벡터 래치 + max tree stage A
-                     ST_MAX  = 3'd1,   // max tree stage B -> maxv 확정
-                     ST_EXP  = 3'd2,   // P-lane exp 계산 + 분모 누산
-                     ST_RCP  = 3'd3,   // 분모 역수
-                     ST_MUL  = 3'd4;   // e * (1/S) 출력
-
-    genvar  gl, gi, gj;
-    integer bk, bj;
-
-    // ---- 상태 / 버퍼 / 포인터 ---------------------------------------------
-    //  버퍼는 [step][lane] 2차원.  원소 i <-> (step i/P, lane i%P).
-    //  덕분에 P개 동시 접근이 lane 당 NS:1 mux 하나로 끝난다.
-    reg [2:0]           state;
-    reg signed [DW-1:0] xbuf [0:NS-1][0:P-1];  // 입력 버퍼 — N개 동시 write 라 FF
-    reg        [EW-1:0] ebuf [0:NS-1][0:P-1];  // exp 결과 버퍼 (UQ1.17)
-    reg signed [DW-1:0] maxv;                  // 벡터 최대값
-    reg        [SW-1:0] sum;                   // 분모 S
-    reg        [SW1:0]  sptr;                  // ST_EXP  exp 투입 step 포인터
-    reg        [SW1:0]  cptr;                  // ST_EXP  exp 결과 수집 step 포인터
-    reg        [SW1:0]  mptr;                  // ST_MUL  곱셈 step 포인터
-    reg                 rcp_go;                // recip_unit 1-cycle start pulse
-
-    // in_ready 하나로 상태가 다 드러난다 (high = idle, low = 연산 중).
-    assign in_ready = (state == ST_LOAD);
-    wire   load_hs  = in_valid & in_ready;
+    genvar  gr;
+    integer i;
 
     // ======================================================================
-    //  입력 언팩 : 1536-bit 버스 -> 원소 배열
+    //  뱅크 full 플래그  (단일 드라이버 — 각 FSM 은 done 펄스만 낸다)
     // ======================================================================
-    wire signed [DW-1:0] xin [0:N-1];
+    reg  [1:0] xfull, efull;      // xbuf / ebuf 뱅크가 소비 대기중인가
+    reg        wbank;             // S1 이 쓰는 xbuf 뱅크
+    reg        xrb, ewb;          // S2 가 읽는 xbuf / 쓰는 ebuf 뱅크
+    reg        erb;               // S3 가 읽는 ebuf 뱅크
+
+    wire recv_hs   = in_valid & in_ready;
+    wire recv_done;               // S1 : Tile 수신 완료
+    wire exp_done;                // S2 : exp+recip 완료
+    wire mul_done;                // S3 : 출력 완료
+
+    assign in_ready = ~xfull[wbank];
+    assign recv_done = recv_hs & in_last;
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            xfull <= 2'b00; efull <= 2'b00;
+        end else begin
+            if (recv_done) xfull[wbank] <= 1'b1;   // S1 -> S2 로 넘김
+            if (exp_done)  xfull[xrb]   <= 1'b0;   // S2 가 xbuf 반납
+            if (exp_done)  efull[ewb]   <= 1'b1;   // S2 -> S3 로 넘김
+            if (mul_done)  efull[erb]   <= 1'b0;   // S3 가 ebuf 반납
+        end
+    end
+
+    // ======================================================================
+    //  S1 : 수신 + running max   (Tensor Core 와 독립적으로 굴러감)
+    // ======================================================================
+    reg  [DW-1:0]   rmax [0:1][0:Tile_M-1];      // 행별 max (수신 중 갱신)
+    reg  [TCW-1:0]  tlen [0:1];             // 뱅크별 유효 열 수 T
+    reg  [TCW-1:0]  wptr;                   // 수신 열 포인터
+
+    wire signed [DW-1:0] xcol     [0:Tile_M-1];
+    wire signed [DW-1:0] rmax_nxt [0:Tile_M-1];
     generate
-        for (gi = 0; gi < N; gi = gi + 1) begin : g_unpack
-            assign xin[gi] = in_vec[gi*DW +: DW];
+        for (gr = 0; gr < Tile_M; gr = gr + 1) begin : g_rmax
+            assign xcol[gr] = in_col[gr*DW +: DW];
+            // 첫 열이면 그대로, 아니면 기존 rmax 와 비교 (비교기 Tile_M개)
+            assign rmax_nxt[gr] = (wptr == {TCW{1'b0}}) ? xcol[gr]
+                                : (($signed(xcol[gr]) > $signed(rmax[wbank][gr]))
+                                   ? xcol[gr] : rmax[wbank][gr]);
         end
     endgenerate
 
-    // ======================================================================
-    //  max reduction tree  (stage A : 조합 LA 레벨,  NP -> NA)
-    //    입력을 in_vec 에서 바로 받으므로 xbuf 래치와 같은 clk 에 처리된다.
-    // ======================================================================
-    wire signed [DW-1:0] ta [0:LA][0:NP-1];
-    generate
-        for (gi = 0; gi < NP; gi = gi + 1) begin : g_ta0
-            if (gi < N) assign ta[0][gi] = xin[gi];
-            else        assign ta[0][gi] = XPAD;      // 패딩 (합성 시 소거됨)
-        end
-        for (gl = 0; gl < LA; gl = gl + 1) begin : g_ta
-            for (gi = 0; gi < (NP >> (gl+1)); gi = gi + 1) begin : g_node
-                assign ta[gl+1][gi] = (ta[gl][2*gi] > ta[gl][2*gi+1])
-                                    ?  ta[gl][2*gi] : ta[gl][2*gi+1];
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            wbank <= 1'b0;
+            wptr  <= {TCW{1'b0}};
+            for (i = 0; i < Tile_M; i = i + 1) begin
+                rmax[0][i] <= XMIN; rmax[1][i] <= XMIN;
+            end
+            tlen[0] <= {TCW{1'b0}};  tlen[1] <= {TCW{1'b0}};
+        end else if (recv_hs) begin
+            for (i = 0; i < Tile_M; i = i + 1)
+                rmax[wbank][i] <= rmax_nxt[i];               // 비교기 Tile_M개
+            wptr <= wptr + 1'b1;
+            if (in_last) begin                                // Tile 완성
+                tlen[wbank] <= wptr + 1'b1;
+                wbank       <= ~wbank;
+                wptr        <= {TCW{1'b0}};
             end
         end
+    end
+
+    // ======================================================================
+    //  S2 : exp + 행별 sum + 행별 역수      (xbuf[xrb] -> ebuf[ewb])
+    // ======================================================================
+    localparam [1:0] ES_IDLE = 2'd0, ES_EXP = 2'd1, ES_RCP = 2'd2;
+
+    reg  [1:0]      estate;
+    reg  [TCW-1:0]  ei, ec, etc_;           // 투입/수집 열 포인터, 이번 Tile 의 T
+    reg  [MCW-1:0]  qi, qc;                 // 역수 투입/수집 행 포인터
+    reg  [SW-1:0]   sum  [0:Tile_M-1];           // 행별 분모 (S2 안에서만 사용)
+
+    reg  [RW-1:0]   rr    [0:1][0:Tile_M-1];     // 행별 1/m   (Tile 별 상태)
+    reg  [PW-1:0]   pp    [0:1][0:Tile_M-1];     // 행별 p     (Tile 별 상태)
+    reg  [TCW-1:0]  etlen [0:1];            // 뱅크별 T
+
+    wire [TW-1:0] e_rd = (ei < etc_) ? ei[TW-1:0] : {TW{1'b0}};
+    wire          e_iv = (estate == ES_EXP) && (ei < etc_);
+
+    // ==================================================================
+    //  xbuf : simple dual-port BRAM   (write = S1,  등록형 read = S2)
+    // ------------------------------------------------------------------
+    //  BRAM 은 0-latency 조합 읽기가 물리적으로 불가능하므로 **읽기를
+    //  레지스터 뒤로** 뺀다.  아래가 Vivado 의 표준 SDP 추론 템플릿이다.
+    //     cycle k          : 주소 e_rd 제시
+    //     cycle k+BRAM_LAT : xrd 에 데이터 도착 -> z 계산 -> exp 투입
+    //  BRAM_LAT 은 **총 읽기 지연 단수**다 (0 은 불가능) :
+    //    1 = BRAM 코어 출력 레지스터만        (RAMB 의 필수 1단)
+    //    2 = + 선택적 출력 레지스터 (DO_REG)  (고Fmax 용)
+    //  UltraScale+ 에서 500MHz 를 노리면 출력 레지스터(=2)가 사실상 필수다.
+    //  조합 읽기로 두면 332 kbit 가 distributed RAM 으로 깔려 LUT 을 먹는다.
+    // ==================================================================
+    reg [Tile_M*DW-1:0] xbuf [0:1][0:TMAX-1];   // 입력 Tile (열 단위)
+    reg [Tile_M*DW-1:0] xrd_c;   // BRAM 코어 출력 레지스터 (= 읽기 1단째, 필수)
+    reg                 xrv_c;
+
+    always @(posedge clk) begin
+        if (recv_hs) xbuf[wbank][wptr[TW-1:0]] <= in_col;   // write 포트
+        xrd_c <= xbuf[xrb][e_rd];    // read 포트 : 주소 제시 -> 다음 clk 에 데이터
+                                     //   BRAM 은 0-cycle 조합 읽기가 불가능하므로
+                                     //   이 1단은 BRAM_LAT 값과 무관하게 항상 있다
+    end
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) xrv_c <= 1'b0;
+        else        xrv_c <= e_iv;
+    end
+
+    wire [Tile_M*DW-1:0] xrd;
+    wire                 xrv;
+    generate
+        if (BRAM_LAT >= 2) begin : g_xoreg  // 선택적 출력 레지스터 추가 -> 총 2단
+            reg [Tile_M*DW-1:0] xrd_r;
+            reg                 xrv_r;
+            always @(posedge clk) xrd_r <= xrd_c;
+            always @(posedge clk or negedge rst_n)
+                if (!rst_n) xrv_r <= 1'b0; else xrv_r <= xrv_c;
+            assign xrd = xrd_r;  assign xrv = xrv_r;
+        end else begin : g_xoreg            // 출력 레지스터 생략 -> 코어 1단만
+            assign xrd = xrd_c;  assign xrv = xrv_c;
+        end
     endgenerate
 
-    reg signed [DW-1:0] ma_q [0:NA-1];   // stage A 결과 파이프라인 레지스터
-
-    // ======================================================================
-    //  max reduction tree  (stage B : 조합 LB 레벨,  NA -> 1)
-    // ======================================================================
-    wire signed [DW-1:0] tb [0:LB][0:NA-1];
+    wire [Tile_M-1:0]    exp_ov_v;
+    wire [EW-1:0]   exp_e_v [0:Tile_M-1];
+    wire [Tile_M*EW-1:0] e_pack;
     generate
-        for (gi = 0; gi < NA; gi = gi + 1) begin : g_tb0
-            assign tb[0][gi] = ma_q[gi];
-        end
-        for (gl = 0; gl < LB; gl = gl + 1) begin : g_tb
-            for (gi = 0; gi < (NA >> (gl+1)); gi = gi + 1) begin : g_node
-                assign tb[gl+1][gi] = (tb[gl][2*gi] > tb[gl][2*gi+1])
-                                    ?  tb[gl][2*gi] : tb[gl][2*gi+1];
-            end
-        end
-    endgenerate
-    wire signed [DW-1:0] max_c = tb[LB][0];
-
-    // ======================================================================
-    //  Pass 1 : z = x - max  ->  P-lane exp2_unit  ->  ebuf / sum
-    // ======================================================================
-    // sptr 은 NS 까지 올라가므로 읽기 인덱스는 범위 안으로 묶어둔다 (X 전파 방지)
-    wire [SW1-1:0] rd_step = (sptr < NS) ? sptr[SW1-1:0] : {SW1{1'b0}};
-    wire           exp_iv  = (state == ST_EXP) && (sptr < NS);
-
-    wire signed [ZW-1:0] z_w    [0:P-1];
-    wire        [P-1:0]  exp_ov_v;
-    wire        [EW-1:0] exp_e_v [0:P-1];
-
-    generate
-        for (gj = 0; gj < P; gj = gj + 1) begin : g_lane
-            // 17비트로 부호확장 후 뺄셈 : z <= 0 보장 (max 가 벡터 최대값이므로)
-            wire signed [DW-1:0] x_rd = xbuf[rd_step][gj];
-            assign z_w[gj] = {x_rd[DW-1], x_rd} - {maxv[DW-1], maxv};
+        for (gr = 0; gr < Tile_M; gr = gr + 1) begin : g_lane
+            wire signed [DW-1:0] xr = xrd[gr*DW +: DW];   // BRAM 출력 (1 clk 지연)
+            wire signed [DW-1:0] mr = rmax[xrb][gr];      // ES_EXP 동안 상수
+            // 17비트 부호확장 후 뺄셈 : z <= 0 보장
+            wire signed [ZW-1:0] zr = {xr[DW-1], xr} - {mr[DW-1], mr};
 
             exp2_unit #(.ZW(ZW), .ZF(IF), .EW(EW), .EF(EF)) u_exp (
                 .clk(clk), .rst_n(rst_n),
-                .in_valid(exp_iv), .z(z_w[gj]),
-                .out_valid(exp_ov_v[gj]), .e(exp_e_v[gj])
+                .in_valid(xrv), .z(zr),
+                .out_valid(exp_ov_v[gr]), .e(exp_e_v[gr])
             );
+            assign e_pack[gr*EW +: EW] = exp_e_v[gr];
         end
     endgenerate
-    wire exp_ov = exp_ov_v[0];      // 모든 lane 이 동일 valid 로 lockstep 동작
+    wire e_ov = exp_ov_v[0];                 // 전 lane lockstep
 
-    // ---- P개 exp 결과 가산 트리 (PL 레벨) : S 에 한 번에 누산 ----
-    wire [ESW-1:0] et [0:PL][0:P-1];
-    generate
-        for (gj = 0; gj < P; gj = gj + 1) begin : g_et0
-            assign et[0][gj] = {{PL{1'b0}}, exp_e_v[gj]};
-        end
-        for (gl = 0; gl < PL; gl = gl + 1) begin : g_et
-            for (gj = 0; gj < (P >> (gl+1)); gj = gj + 1) begin : g_node
-                assign et[gl+1][gj] = et[gl][2*gj] + et[gl][2*gj+1];
-            end
-        end
-    endgenerate
-    wire [ESW-1:0] esum = et[PL][0];        // 이번 step 의 P원소 합
-
-    // ======================================================================
-    //  Pass 2-a : 분모 역수  R = 1/m,  S = m * 2^p   (벡터당 1회, lane 없음)
-    // ======================================================================
-    wire            rcp_ov;
-    wire [RW-1:0]   rcp_r;
-    wire [PW-1:0]   rcp_p;
+    // 역수 유닛 1개를 Tile_M회 파이프라인
+    wire          rcp_iv = (estate == ES_RCP) && (qi < Tile_M);
+    wire [SW-1:0] rcp_s  = sum[qi[MW-1:0]];
+    wire          rcp_ov;
+    wire [RW-1:0] rcp_r;
+    wire [PW-1:0] rcp_p;
     recip_unit #(.SW(SW), .RW(RW), .RF(RF), .PW(PW)) u_rcp (
         .clk(clk), .rst_n(rst_n),
-        .in_valid(rcp_go), .s(sum),
+        .in_valid(rcp_iv), .s(rcp_s),
         .out_valid(rcp_ov), .r(rcp_r), .p(rcp_p)
     );
 
-    reg [RW-1:0] r_reg;     // 확정된 1/m
-    reg [PW-1:0] p_reg;     // 확정된 p
+    assign exp_done = (estate == ES_RCP) && rcp_ov && (qc == Tile_M-1);
 
-    // ======================================================================
-    //  Pass 2-b : y_i = e_i * R  (P-lane, 2-stage 출력 파이프라인)
-    //     Stage A : ebuf 한 step(P원소) 읽기   Stage B : P개 곱셈 + 시프트/반올림
-    //  R 과 시프트량 sh 는 벡터당 하나뿐이라 전 lane 이 공유(브로드캐스트)한다.
-    //  exp lane 과 달리 복제할 LUT 이 없어서 곱셈기 P개만 늘면 된다.
-    // ======================================================================
-    wire            mul_iss = (state == ST_MUL) && (mptr < NS);
-    reg             va, la;             // Stage A valid / last
-    reg  [EW-1:0]   ea [0:P-1];         // Stage A 로 읽어온 e (P개)
-
-    wire [5:0]     sh   = p_reg + SH_OFF;  // = p + 2, p in [16,22] -> sh in [18,24]
-    wire [PDW-1:0] half = {{(PDW-1){1'b0}}, 1'b1} << (sh - 1);   // 0.5 LSB (공유)
-    wire [PDW-1:0] prod [0:P-1];
-    wire [PDW-1:0] yshf [0:P-1];
-    generate
-        for (gj = 0; gj < P; gj = gj + 1) begin : g_omul
-            // e(17b) x R(18b) -> DSP48 (25x18 / 27x18) 1개, lane 당 1개씩
-            assign prod[gj] = ea[gj] * r_reg;
-            assign yshf[gj] = (prod[gj] + half) >> sh;           // UQ1.15 반올림
-        end
-    endgenerate
-
-    // ======================================================================
-    //  메인 FSM
-    // ======================================================================
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            state     <= ST_LOAD;
-            sptr      <= {(SW1+1){1'b0}};
-            cptr      <= {(SW1+1){1'b0}};
-            mptr      <= {(SW1+1){1'b0}};
-            maxv      <= {DW{1'b0}};
-            sum       <= {SW{1'b0}};
-            rcp_go    <= 1'b0;
-            r_reg     <= {RW{1'b0}};
-            p_reg     <= {PW{1'b0}};
-            va        <= 1'b0;
-            la        <= 1'b0;
-            for (bk = 0; bk < P; bk = bk + 1) ea[bk] <= {EW{1'b0}};
-            out_valid <= 1'b0;
-            out_data  <= {(P*OW){1'b0}};
-            out_last  <= 1'b0;
-            for (bk = 0; bk < NA; bk = bk + 1) ma_q[bk] <= {DW{1'b0}};
+            estate <= ES_IDLE;
+            xrb <= 1'b0; ewb <= 1'b0;
+            ei <= 0; ec <= 0; etc_ <= 0; qi <= 0; qc <= 0;
+            for (i = 0; i < Tile_M; i = i + 1) sum[i] <= {SW{1'b0}};
+            etlen[0] <= 0; etlen[1] <= 0;
         end else begin
-            rcp_go    <= 1'b0;      // 기본값 : 1-cycle pulse
-            va        <= 1'b0;
-            out_valid <= 1'b0;
-            out_last  <= 1'b0;
-
-            case (state)
-            // ------------------------------- 벡터 래치 + max tree stage A
-            ST_LOAD: begin
-                if (load_hs) begin
-                    for (bk = 0; bk < NS; bk = bk + 1)
-                        for (bj = 0; bj < P; bj = bj + 1)
-                            xbuf[bk][bj] <= xin[bk*P + bj];
-                    for (bk = 0; bk < NA; bk = bk + 1) ma_q[bk] <= ta[LA][bk];
-                    state <= ST_MAX;
-                end
+            case (estate)
+            // ---- xbuf 뱅크가 차고 ebuf 뱅크가 비면 시작
+            ES_IDLE: if (xfull[xrb] && !efull[ewb]) begin
+                etc_ <= tlen[xrb];
+                ei <= 0; ec <= 0;
+                for (i = 0; i < Tile_M; i = i + 1) sum[i] <= {SW{1'b0}};
+                estate <= ES_EXP;
             end
-            // ------------------------------- max tree stage B -> maxv 확정
-            ST_MAX: begin
-                maxv  <= max_c;
-                state <= ST_EXP;
-                sptr  <= {(SW1+1){1'b0}};
-                cptr  <= {(SW1+1){1'b0}};
-                sum   <= {SW{1'b0}};
-            end
-            // --------------------------- P-lane exp + 분모 누산 (NS step)
-            ST_EXP: begin
-                if (sptr < NS) sptr <= sptr + 1'b1;         // 매 clk P원소 투입
-                if (exp_ov) begin                            // 4 clk 뒤부터 결과 도착
-                    for (bj = 0; bj < P; bj = bj + 1)
-                        ebuf[cptr[SW1-1:0]][bj] <= exp_e_v[bj];
-                    sum  <= sum + {{(SW-ESW){1'b0}}, esum};  // 가산트리 결과를 누산
-                    cptr <= cptr + 1'b1;
-                    if (cptr == NS-1) begin                  // 전체 누산 완료
-                        state  <= ST_RCP;
-                        rcp_go <= 1'b1;                      // 이 시점 sum 이 최종값
+            // ---- exp + 행별 sum 누산
+            ES_EXP: begin
+                if (ei < etc_) ei <= ei + 1'b1;              // 매 clk 한 열 투입
+                if (e_ov) begin                               // 5 clk 뒤부터 수집
+                    for (i = 0; i < Tile_M; i = i + 1)             // 행별 독립 누산
+                        sum[i] <= sum[i] + {{(SW-EW){1'b0}}, exp_e_v[i]};
+                    ec <= ec + 1'b1;
+                    if (ec == etc_ - 1'b1) begin
+                        estate <= ES_RCP; qi <= 0; qc <= 0;
                     end
                 end
             end
-            // ------------------------------------------------- 분모 역수
-            ST_RCP: begin
+            // ---- 행별 1/S (Tile_M개 파이프라인)
+            ES_RCP: begin
+                if (qi < Tile_M) qi <= qi + 1'b1;
                 if (rcp_ov) begin
-                    r_reg <= rcp_r;
-                    p_reg <= rcp_p;
-                    state <= ST_MUL;
-                    mptr  <= {(SW1+1){1'b0}};
+                    rr[ewb][qc[MW-1:0]] <= rcp_r;
+                    pp[ewb][qc[MW-1:0]] <= rcp_p;
+                    qc <= qc + 1'b1;
+                    if (qc == Tile_M-1) begin                      // exp_done 펄스
+                        etlen[ewb] <= etc_;
+                        xrb    <= ~xrb;                       // xbuf 뱅크 넘김
+                        ewb    <= ~ewb;                       // ebuf 뱅크 넘김
+                        estate <= ES_IDLE;
+                    end
                 end
             end
-            // -------------------------------------- e * R -> 출력 (P원소/clk)
-            ST_MUL: begin
-                // Stage A : ebuf 한 step(P원소) 읽기
-                if (mul_iss) begin
-                    va <= 1'b1;
-                    for (bj = 0; bj < P; bj = bj + 1)
-                        ea[bj] <= ebuf[mptr[SW1-1:0]][bj];
-                    la   <= (mptr == NS-1);
-                    mptr <= mptr + 1'b1;
-                end
-                // Stage B : P개 곱셈 결과를 한 beat 로 출력
-                if (va) begin
-                    out_valid <= 1'b1;
-                    for (bj = 0; bj < P; bj = bj + 1)
-                        out_data[bj*OW +: OW] <= yshf[bj][OW-1:0];
-                    out_last  <= la;
-                    if (la) state <= ST_LOAD;                // 마지막 -> 다음 벡터
-                end
-            end
-            default: state <= ST_LOAD;
+            default: estate <= ES_IDLE;
             endcase
         end
     end
 
-    // ---- 파라미터 정합성 체크 (합성에는 영향 없음) ------------------------
+    // ======================================================================
+    //  S3 : y = e * R  ->  출력            (ebuf[erb] -> out_col)
+    // ======================================================================
+    localparam MS_IDLE = 1'b0, MS_MUL = 1'b1;
+
+    reg             mstate;
+    reg  [TCW-1:0]  mi, mtc;
+
+    wire [TW-1:0] m_rd  = (mi < mtc) ? mi[TW-1:0] : {TW{1'b0}};
+    wire          m_iss = (mstate == MS_MUL) && (mi < mtc);
+
+    // ==================================================================
+    //  ebuf : simple dual-port BRAM   (write = S2,  등록형 read = S3)
+    // ==================================================================
+    reg [Tile_M*EW-1:0] ebuf [0:1][0:TMAX-1];   // exp 결과 (뱅크 x 열)
+    reg [Tile_M*EW-1:0] ea_c;    // BRAM 코어 출력 레지스터 (= 읽기 1단째, 필수)
+    always @(posedge clk) begin
+        if (e_ov) ebuf[ewb][ec[TW-1:0]] <= e_pack;   // write 포트
+        ea_c <= ebuf[erb][m_rd];     // read 포트 : 주소 제시 -> 다음 clk 에 데이터
+    end
+
+    // 주소 제시 시점의 valid/last 를 BRAM_LAT 만큼 지연시켜 데이터와 정렬
+    reg  va_c, la_c;
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin va_c <= 1'b0; la_c <= 1'b0; end
+        else begin
+            va_c <= m_iss;
+            la_c <= m_iss && (mi == mtc - 1'b1);
+        end
+    end
+
+    wire [Tile_M*EW-1:0] ea;
+    wire                 va, la;
+    generate
+        if (BRAM_LAT >= 2) begin : g_eoreg  // 선택적 출력 레지스터 추가 -> 총 2단
+            reg [Tile_M*EW-1:0] ea_r;
+            reg                 va_r, la_r;
+            always @(posedge clk) ea_r <= ea_c;
+            always @(posedge clk or negedge rst_n)
+                if (!rst_n) begin va_r <= 1'b0; la_r <= 1'b0; end
+                else        begin va_r <= va_c;  la_r <= la_c;  end
+            assign ea = ea_r;  assign va = va_r;  assign la = la_r;
+        end else begin : g_eoreg            // 출력 레지스터 생략 -> 코어 1단만
+            assign ea = ea_c;  assign va = va_c;  assign la = la_c;
+        end
+    endgenerate
+
+    wire [Tile_M*OW-1:0] y_pack;
+    generate
+        for (gr = 0; gr < Tile_M; gr = gr + 1) begin : g_omul
+            wire [EW-1:0]  e_r = ea[gr*EW +: EW];
+            // e(17b) x R(18b) -> DSP48 1개.  R 과 p 는 행마다 다름.
+            wire [PDW-1:0] prd = e_r * rr[erb][gr];
+            wire [5:0]     shr = pp[erb][gr] + SH_OFF;
+            wire [PDW-1:0] hlf = {{(PDW-1){1'b0}}, 1'b1} << (shr - 1);
+            wire [PDW-1:0] ysh = (prd + hlf) >> shr;          // Q1.14 반올림
+            assign y_pack[gr*OW +: OW] = ysh[OW-1:0];
+        end
+    endgenerate
+
+    assign mul_done = (mstate == MS_MUL) && va && la;
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            mstate    <= MS_IDLE;
+            erb       <= 1'b0;
+            mi <= 0; mtc <= 0;
+            out_valid <= 1'b0;
+            out_col   <= {(Tile_M*OW){1'b0}};
+            out_last  <= 1'b0;
+        end else begin
+            out_valid <= 1'b0;
+            out_last  <= 1'b0;
+
+            case (mstate)
+            MS_IDLE: if (efull[erb]) begin
+                mtc    <= etlen[erb];
+                mi     <= 0;
+                mstate <= MS_MUL;
+            end
+            MS_MUL: begin
+                if (m_iss) mi <= mi + 1'b1;                   // Stage A : ebuf 주소 제시
+                if (va) begin                                 // Stage B : 곱셈 출력
+                    out_valid <= 1'b1;
+                    out_col   <= y_pack;
+                    out_last  <= la;
+                    if (la) begin                             // mul_done 펄스
+                        erb    <= ~erb;
+                        mstate <= MS_IDLE;
+                    end
+                end
+            end
+            endcase
+        end
+    end
+
+    // ---- 파라미터 정합성 체크 (합성 무관) ---------------------------------
     initial begin
-        // y15 = (e17 * R20) >> (p + RF - OF) 이므로 RF > OF 여야 한다
-        if (SH_OFF < 1)
-            $display("ERROR: softmax_top RF(%0d) must be > OF(%0d)", RF, OF);
-        // S = sum(e) 가 SW 비트에 담겨야 한다 : N * 2^EF < 2^SW
-        if (SW <= EF + AW)
-            $display("ERROR: softmax_top SW(%0d) too small for N=%0d, EF=%0d", SW, N, EF);
-        // lane 분할이 딱 떨어져야 하고, P 는 2의 거듭제곱이어야 한다
-        if (N % P != 0)
-            $display("ERROR: softmax_top N(%0d) must be divisible by P(%0d)", N, P);
-        if ((1 << PL) != P)
-            $display("ERROR: softmax_top P(%0d) must be a power of 2", P);
-        // e, R 은 각각 1.0(=2^EF, 2^RF) 을 담아야 하므로 폭이 소수부+1
-        if (EW != EF+1) $display("ERROR: softmax_top EW must be EF+1");
-        if (RW != RF+1) $display("ERROR: softmax_top RW must be RF+1");
+        if (SH_OFF < 1)   $display("ERROR: softmax_top RF(%0d) must be > OF(%0d)", RF, OF);
+        if (SW < EF + TW) $display("ERROR: softmax_top SW too small");
+        if (EW != EF+1)   $display("ERROR: softmax_top EW must be EF+1");
+        if (RW != RF+1)   $display("ERROR: softmax_top RW must be RF+1");
     end
 endmodule
