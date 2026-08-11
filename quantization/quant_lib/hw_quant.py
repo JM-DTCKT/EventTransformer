@@ -1,60 +1,40 @@
-"""ZCU102-oriented "everything is an integer" quantization of EvT.
+"""ZCU102 integer datapath for EvT -- see `../hw_flow.md` for the unit-by-unit
+description and `../README.md` for how to run it.
 
-`attention_mac.py` already made the attention matmuls real INT8xINT8->INT32
-GEMMs, but four things in that pipeline were still floating point and would
-have to be fp32 hardware on the FPGA:
+The only numeric types left anywhere in the datapath are **INT8** (multiplier
+operands), **INT32** (accumulators and folded biases) and **16-bit fixed point
+Qm.n** (scales, non-linear I/O, LayerNorm affine params, the latent memory
+table) -- plus **bfloat16** inside LayerNorm. There is no fp32 fallback: the
+fake-quantization paths this module grew out of have been removed.
 
-  1. **biases** were fp32 and added *after* the rescale;
-  2. the learned **positional encoding** was an fp32 table in BRAM;
-  3. all **scales** (weight per-channel scales, activation scales) were fp32
-     multipliers;
-  4. the tensors entering the **non-linear units** (GELU, LayerNorm, softmax)
-     came out of the INT32 accumulator and were consumed in fp32.
+What that means concretely
+--------------------------
+*Bias* is folded into the accumulator: with `x = x_int * s_x` and
+`W = W_int * s_w` (per output channel), `b_int = round(b / (s_x * s_w))` is an
+INT32 addend and the layer output is `(x_int @ W_int^T + b_int) * (s_x * s_w)`
+-- one integer add instead of an fp32 add after an fp32 multiply. Same rule for
+`in_proj_bias`, `out_proj.bias` and MHA's `bias_k`/`bias_v` (which live in the
+post-projection K/V domain and are appended as one extra K/V token).
 
-This module closes all four, so that the only numeric types left anywhere in
-the datapath are **INT8** (operands), **INT32** (accumulators / biases) and
-**16-bit fixed point Qm.n** (scales, non-linear I/O, LayerNorm affine params,
-the latent memory table).
+*Every scale* is a 16-bit Qm.n code with a per-tensor shared exponent (per
+layer for the per-output-channel weight scales: one int16 multiplier vector +
+one shift, exactly the shape of a hardware rescale unit). See `fixed_point.py`.
 
-What each option does
----------------------
-`int32_bias`
-    Bias is folded into the accumulator: with `x = x_int * s_x` and
-    `W = W_int * s_w` (per output channel), `b_int = round(b / (s_x * s_w))`
-    is an INT32 addend on the accumulator, and the layer output is
-    `(x_int @ W_int^T + b_int) * (s_x * s_w)` -- one integer add instead of
-    an fp32 add after an fp32 multiply. Same rule for `in_proj_bias`,
-    `out_proj.bias` and MHA's `bias_k`/`bias_v` (which live in the
-    post-projection K/V domain).
+*The positional encoding* is an INT8 table plus one Q-format scale, sharing the
+consumer Linear's input scale (no K-split GEMM).
 
-`int8_pos_enc`
-    `backbone.pos_encoding` becomes an INT8 table plus one Q-format scale.
-    This costs almost nothing in accuracy because the tensor it is
-    concatenated into is re-quantized to INT8 by `preproc_block_events`'s
-    input quantizer anyway (with a *coarser* step than the pos-enc's own, see
-    the analysis script) -- but it removes an fp32 BRAM table.
-
-`fx16_scales`
-    Every scale is stored as a 16-bit fixed-point Qm.n code with a per-tensor
-    shared exponent (per-layer for the per-output-channel weight scales, i.e.
-    one int16 multiplier vector + one shift amount per layer -- exactly the
-    shape of a hardware rescale unit). See `fixed_point.py`.
-
-`fx_nonlinear`
-    Every tensor entering or leaving a non-linear unit is snapped onto a
-    16-bit fixed-point grid whose Q format was picked from a calibration
-    pass: GELU in/out, LayerNorm in / normalized intermediate / out, softmax
-    in/out, and the final log_softmax input. `ReLU` is the exception the
-    request called out: only the sign matters, so its input is requantized to
-    **INT8** rather than 16-bit fixed point. Because LayerNorm is now a
-    fixed-point unit, its affine parameters (and the latent memory table
-    `memory_vertical`, which is fed straight into a LayerNorm) are stored as
-    Q-format int16 as well -- otherwise fp32 constants would sneak back into
-    the datapath.
+*Every tensor entering or leaving a non-linear unit* is snapped onto a grid
+picked by a calibration pass: GELU in/out (pinned Q4.11), softmax in (pinned
+Q6.9) / out (analytic Q1.14 -> uint8 step 1/127). The classifier head ends at
+`argmax(acc*M)` -- no log_softmax, no output grid. `ReLU` is the exception --
+only the sign matters, so its input is
+requantized to INT8. LayerNorm runs in bfloat16, so its Qm.n sites are
+observers only; its affine params and `memory_vertical` are still Q-format
+int16 so no fp32 constant sneaks back in.
 
 Everything runs through `build_payload()` -> `torch.save` -> `instantiate()`,
-so the model that gets evaluated is always the one reconstructed from the
-saved file, and `payload_size_bytes()` reports what that file actually costs.
+so the model that gets evaluated is always the one reconstructed from the saved
+file, and `payload_size_bytes()` reports what that file actually costs.
 """
 
 import math
@@ -65,8 +45,23 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from . import fixed_point as fx
-from . import quant_ops
-from .attention_mac import merge_heads, split_heads, REAL_INT8_ACCUM_BOUND
+# float32 represents every integer below 2**24 exactly, so an INT8xINT8->INT32
+# accumulator modelled in fp32 is bit-exact as long as it stays under this.
+REAL_INT8_ACCUM_BOUND = 2 ** 24
+
+
+# --- head reshape (must match torch's own MultiheadAttention split exactly:
+# embed_dim cut into `num_heads` contiguous chunks of `head_dim`) -------------
+def split_heads(t, num_heads):
+    """(L, B, E) -> (B, H, L, Dh)."""
+    L, B, E = t.shape
+    return t.reshape(L, B, num_heads, E // num_heads).permute(1, 2, 0, 3)
+
+
+def merge_heads(t):
+    """(B, H, L, Dh) -> (L, B, E), inverse of `split_heads`."""
+    B, H, L, Dh = t.shape
+    return t.permute(2, 0, 1, 3).reshape(L, B, H * Dh)
 
 INT8_QMAX = 127
 INT8_QMIN = -128
@@ -76,6 +71,18 @@ POSENC_LINEAR = 'backbone.preproc_block_events.seq_init.0'
 # Set to a callable(tag, a_int, b_int, acc, bias_int) to observe every integer
 # MAC in the model; see `audit_inference_datapath.py`. None = no overhead.
 MAC_PROBE = None
+
+
+# Set to a dict to capture the attention block's internal GEMM I/O, which no
+# module forward hook can see (`attention_forward_hw` calls `int8_linear`
+# directly). `export_fpga.py --verify` uses this to check `in_proj`/`out_proj`.
+ATTN_TAP = None
+
+
+def _attn_tap(name, **kw):
+    if ATTN_TAP is not None:
+        ATTN_TAP.setdefault(name, {}).update(
+            {k: v.detach().clone() for k, v in kw.items()})
 
 
 def _probe(tag, a_int, b_int, acc, bias_int=None):
@@ -88,122 +95,52 @@ EXACT_INT_BOUND = 2 ** 24
 
 
 # =============================================================================
-# Config
+# Config -- frozen
 # =============================================================================
-class HWConfig:
-    FIELDS = ('int32_bias', 'int8_pos_enc', 'fx16_scales', 'fx_nonlinear',
-              'ln_dynamic_exp', 'ln_per_step_q', 'ln_bits', 'ln_centered_bits',
-              'ln_headroom_bits', 'split_posenc_scale', 'gelu_frac_bits')
+class FinalConfig:
+    """The one configuration this repo ships. There are no alternatives left:
+    every choice below is the outcome recorded in `hw_flow.md`, and the fp32
+    fallbacks that used to sit beside them are gone.
 
-    def __init__(self, name='base', int32_bias=False, int8_pos_enc=False,
-                 fx16_scales=False, fx_nonlinear=False, ln_dynamic_exp=False,
-                 ln_per_step_q=False, ln_bits=16, ln_centered_bits=None,
-                 ln_headroom_bits=0, split_posenc_scale=False, gelu_frac_bits=None):
-        self.name = name
-        self.int32_bias = int32_bias
-        self.int8_pos_enc = int8_pos_enc
-        self.fx16_scales = fx16_scales
-        self.fx_nonlinear = fx_nonlinear
-        # LayerNorm is scale-invariant, so its input may use a per-call shared
-        # exponent (block floating point) instead of one static Q format.
-        # GELU/softmax cannot: they are not scale-invariant, a LUT needs a
-        # fixed input format -- those stay static in every config.
-        self.ln_dynamic_exp = ln_dynamic_exp
-        # ...or keep 16-bit registers and pick the shift from the *time step*
-        # instead of from the data: a small ROM of shift amounts indexed by the
-        # step counter. No max tree, no barrel shifter, no extra pass.
-        self.ln_per_step_q = ln_per_step_q
-        # ...or just widen the LayerNorm input register and keep one static Q
-        # format. Simplest RTL of all, at the cost of a wider residual-stream
-        # datapath.
-        self.ln_bits = ln_bits
-        # Width of the *centered* value (x - mean) that feeds the variance
-        # squarer. None = full precision (what the other configs assume);
-        # 16 = a 16x16->32 squarer with a ~40-bit accumulator.
-        self.ln_centered_bits = ln_centered_bits
-        # Guard band on the LayerNorm-input format: the test set's residual
-        # stream can exceed what training-set calibration saw, and a static
-        # fixed-point format clips rather than degrading.
-        self.ln_headroom_bits = ln_headroom_bits
-        # Give the [event-projection | positional-encoding] concatenation two
-        # activation scales instead of one shared scale (K-split GEMM).
-        self.split_posenc_scale = split_posenc_scale
-        # Pin every GELU input/output to one 16-bit Q format instead of letting
-        # each site pick its own, so a single LUT serves the whole network.
-        # `gelu_frac_bits=11` -> Q4.11 (range +-16, LSB 2^-11).
-        self.gelu_frac_bits = gelu_frac_bits
+        weights           INT8, per-output-channel scale (one shared exponent)
+        activations       INT8, per-tensor scale
+        accumulators      INT32; bias folded to an INT32 accumulator addend
+        scales            16-bit Qm.n codes (no fp32 scale anywhere)
+        GELU              Q4.11 in and out -- one LUT for the whole network
+        softmax           input Q6.9 -- one exp LUT; output Q1.14 -> uint8, step 1/127
+        LayerNorm         bfloat16 datapath (input, mean, centered, var, rsqrt, affine)
+        positional enc.   INT8 table, sharing the consumer's input scale (no K-split)
+    """
+
+    name = 'fpga_int8'
+    gelu_frac_bits = 11        # Q4.11
+    softmax_frac_bits = 9      # Q6.9
+    # LayerNorm is bf16 only up to `rsqrt`; after normalisation the range is
+    # bounded (|xhat| < 9) so a 16-bit Qm.n grid is ~16x finer than bf16 there.
+    ln_xhat_frac_bits = 11     # Q4.11   (observed |xhat| <= 9.02)
+    ln_out_frac_bits = 11      # Q4.11   (observed |out|  <= 9.45)
+    ln_gamma_frac_bits = 14    # Q1.14   (|gamma| <= 1.26; multiplies xhat, keep it fine)
+    ln_beta_frac_bits = 11     # Q4.11   (added to the output, so finer than out's LSB is wasted)
+    FIELDS = ('gelu_frac_bits', 'softmax_frac_bits', 'ln_xhat_frac_bits',
+              'ln_out_frac_bits', 'ln_gamma_frac_bits', 'ln_beta_frac_bits')
 
     def as_dict(self):
         return dict(name=self.name, **{f: getattr(self, f) for f in self.FIELDS})
 
     @classmethod
     def from_dict(cls, d):
-        return cls(**d)
+        cfg = cls()
+        assert d.get('name') == cls.name, (
+            f"checkpoint was packed by config {d.get('name')!r}, not {cls.name!r} -- "
+            f"re-run quantize.py")
+        for f in cls.FIELDS:
+            assert int(d[f]) == getattr(cls, f), f'{f} mismatch: {d[f]} != {getattr(cls, f)}'
+        return cfg
 
     def __repr__(self):
-        on = [f if not isinstance(getattr(self, f), int) or isinstance(getattr(self, f), bool)
-              else f'{f}={getattr(self, f)}'
-              for f in self.FIELDS if getattr(self, f) not in (False, 16, None)]
-        return f"HWConfig({self.name}: {', '.join(on) if on else 'none'})"
-
-
-# The ablation set: baseline, each change alone, and everything together.
-def ablation_configs():
-    return [
-        HWConfig('base'),
-        HWConfig('int32_bias', int32_bias=True),
-        HWConfig('int8_pos_enc', int8_pos_enc=True),
-        HWConfig('fx16_scales', fx16_scales=True),
-        HWConfig('fx_nonlinear', fx_nonlinear=True),
-        HWConfig('fx_nonlinear_lndyn', fx_nonlinear=True, ln_dynamic_exp=True),
-        HWConfig('fx_nonlinear_ln32', fx_nonlinear=True, ln_bits=32),
-        HWConfig('fx_nonlinear_lnstepq', fx_nonlinear=True, ln_per_step_q=True),
-        HWConfig('all', int32_bias=True, int8_pos_enc=True, fx16_scales=True, fx_nonlinear=True),
-        HWConfig('all_lndyn', int32_bias=True, int8_pos_enc=True, fx16_scales=True,
-                 fx_nonlinear=True, ln_dynamic_exp=True),
-        HWConfig('all_lnstepq', int32_bias=True, int8_pos_enc=True, fx16_scales=True,
-                 fx_nonlinear=True, ln_per_step_q=True),
-        HWConfig('all_ln32', int32_bias=True, int8_pos_enc=True, fx16_scales=True,
-                 fx_nonlinear=True, ln_bits=32),
-        HWConfig('all_ln32_splitpos', int32_bias=True, int8_pos_enc=True, fx16_scales=True,
-                 fx_nonlinear=True, ln_bits=32, split_posenc_scale=True),
-        # everything, with the LayerNorm variance path also narrowed to what a
-        # 16x16->32 squarer would see
-        HWConfig('all_ln32_ctr16', int32_bias=True, int8_pos_enc=True, fx16_scales=True,
-                 fx_nonlinear=True, ln_bits=32, ln_centered_bits=16),
-        HWConfig('all_ln32_ctr32', int32_bias=True, int8_pos_enc=True, fx16_scales=True,
-                 fx_nonlinear=True, ln_bits=32, ln_centered_bits=32),
-        # 24 bits is the widest LayerNorm datapath a float32 simulator can model
-        # *faithfully* (a Q value needs log2(max) + frac + 1 mantissa bits, and
-        # float32 carries 24), so this row is an exact result rather than a
-        # lower bound -- and it answers "how narrow can the register be".
-        HWConfig('all_ln24', int32_bias=True, int8_pos_enc=True, fx16_scales=True,
-                 fx_nonlinear=True, ln_bits=24, ln_centered_bits=24,
-                 split_posenc_scale=True),
-        # ...plus a 2-bit guard band, so the format no longer clips on samples
-        # the training-set calibration never saw
-        HWConfig('all_ln24_guard2', int32_bias=True, int8_pos_enc=True, fx16_scales=True,
-                 fx_nonlinear=True, ln_bits=24, ln_centered_bits=24,
-                 ln_headroom_bits=2, split_posenc_scale=True),
-        # where exactly is the cliff between 16 (fails) and 24 (works)?
-        HWConfig('all_ln18_guard2', int32_bias=True, int8_pos_enc=True, fx16_scales=True,
-                 fx_nonlinear=True, ln_bits=18, ln_centered_bits=18,
-                 ln_headroom_bits=2, split_posenc_scale=True),
-        HWConfig('all_ln20_guard2', int32_bias=True, int8_pos_enc=True, fx16_scales=True,
-                 fx_nonlinear=True, ln_bits=20, ln_centered_bits=20,
-                 ln_headroom_bits=2, split_posenc_scale=True),
-        HWConfig('all_ln22_guard2', int32_bias=True, int8_pos_enc=True, fx16_scales=True,
-                 fx_nonlinear=True, ln_bits=22, ln_centered_bits=22,
-                 ln_headroom_bits=2, split_posenc_scale=True),
-        # --- the deployment target: no K-split on the pos-enc concat, and every
-        # GELU pinned to one Q4.11 format so a single LUT serves the network ---
-        HWConfig('deploy_nosplit', int32_bias=True, int8_pos_enc=True, fx16_scales=True,
-                 fx_nonlinear=True, ln_bits=24, ln_centered_bits=24,
-                 ln_headroom_bits=2, split_posenc_scale=False),
-        HWConfig('deploy_gelu_q411', int32_bias=True, int8_pos_enc=True, fx16_scales=True,
-                 fx_nonlinear=True, ln_bits=24, ln_centered_bits=24,
-                 ln_headroom_bits=2, split_posenc_scale=False, gelu_frac_bits=11),
-    ]
+        return (f'FinalConfig({self.name}: INT8 w/a, INT32 acc+bias, Qm.n scales, '
+                f'GELU Q4.{self.gelu_frac_bits}, softmax in Q6.{self.softmax_frac_bits}, '
+                f'LayerNorm bf16 -> Q4.{self.ln_out_frac_bits})')
 
 
 # =============================================================================
@@ -376,11 +313,23 @@ class SiteBook(dict):
 # =============================================================================
 # Integer GEMM primitives
 # =============================================================================
+def compute_weight_scale(w, num_bits=8):
+    """Symmetric per-output-channel weight scale: `max|W[c,:]| / qmax`.
+
+    One scale per row of a (E_out, E_in) weight, i.e. per output neuron. The
+    exponent is shared across the row vector when it is packed (`_pack_scale`),
+    so the datapath carries one int16 code per channel plus one shift.
+    """
+    qmax = 2 ** (num_bits - 1) - 1
+    max_abs = w.detach().abs().amax(dim=1, keepdim=True)
+    return max_abs.clamp(min=1e-8) / qmax
+
+
 def _to_int8(x, scale):
     return torch.clamp(torch.round(x / scale), INT8_QMIN, INT8_QMAX)
 
 
-def int8_linear(x, x_scale, w_int, w_scale, b_int=None, b_fp=None):
+def int8_linear(x, x_scale, w_int, w_scale, b_int=None):
     """`(x_int @ w_int^T + b_int) * (x_scale * w_scale)`.
 
     x: (..., E_in) fp32 tensor of a value that is representable on the INT8
@@ -388,8 +337,7 @@ def int8_linear(x, x_scale, w_int, w_scale, b_int=None, b_fp=None):
     w_int: (E_out, E_in) fp32 tensor holding exact INT8 integers.
     w_scale: (E_out,) fp32 per-output-channel scale.
     b_int: (E_out,) fp32 tensor holding exact INT32 integers, already divided
-       by `x_scale * w_scale` at build time (the `int32_bias` path).
-    b_fp: (E_out,) fp32 bias added after the rescale (the fp32-bias path).
+       by `x_scale * w_scale` at build time.
     """
     reduce_dim = x.shape[-1]
     bound = INT8_QMAX * INT8_QMAX * reduce_dim
@@ -401,10 +349,7 @@ def int8_linear(x, x_scale, w_int, w_scale, b_int=None, b_fp=None):
     if b_int is not None:
         acc = acc + b_int
     _probe(f'linear_K{reduce_dim}', x_int, w_int, acc, b_int)
-    out = acc * (x_scale * w_scale)
-    if b_fp is not None:
-        out = out + b_fp
-    return out
+    return acc * (x_scale * w_scale)
 
 
 def fold_bias_to_int32(bias, x_scale, w_scale):
@@ -425,40 +370,32 @@ def _block_name_of_attention(module_name):
     return None
 
 
-def _pack_scale(t, use_fx16):
-    """Per-tensor shared-exponent packing of a scale tensor."""
-    t = t.detach().float().reshape(-1)
-    if not use_fx16:
-        return dict(mode='fp32', values=t.clone())
-    codes, frac_bits = fx.pack_fx16(t)
-    return dict(mode='fx16', codes=codes, frac_bits=frac_bits)
+def _pack_scale(t):
+    """Per-tensor shared-exponent packing of a scale tensor: int16 codes + one
+    shift. No fp32 scale survives anywhere in the datapath."""
+    codes, frac_bits = fx.pack_fx16(t.detach().float().reshape(-1))
+    return dict(codes=codes, frac_bits=frac_bits)
 
 
 def _unpack_scale(entry):
-    if entry['mode'] == 'fp32':
-        return entry['values'].float()
     return fx.unpack_fx16(entry['codes'], entry['frac_bits'])
 
 
-def _pack_param_fx16(t, use_fx16):
-    if not use_fx16:
-        return dict(mode='fp32', values=t.detach().clone())
-    codes, frac_bits = fx.pack_fx16(t)
-    return dict(mode='fx16', codes=codes, frac_bits=frac_bits, shape=tuple(t.shape))
+def _pack_param_fx16(t, frac_bits=None):
+    codes, frac_bits = fx.pack_fx16(t, frac_bits)
+    return dict(codes=codes, frac_bits=frac_bits, shape=tuple(t.shape))
 
 
 def _unpack_param_fx16(entry):
-    if entry['mode'] == 'fp32':
-        return entry['values'].float()
     return fx.unpack_fx16(entry['codes'], entry['frac_bits']).reshape(entry['shape'])
 
 
 def build_payload(model, scales, cfg, site_book=None, weight_bits=8):
     """Pack a *fresh fp32* `model` into a fully-integer payload.
 
-    `scales`: the entry `run_attention_mac.py` saved for
-        `int8_w8a8_static+qkv_mac` (pre-projection Q/K/V scales, post-projection
-        Q/K/V scales, out_proj scales, per-Linear activation max-abs).
+    `scales`: what `calibration.calibrate_activation_scales` returned
+        (pre-projection Q/K/V scales, post-projection Q/K/V scales, out_proj
+        scales, per-Linear activation max-abs).
     `site_book`: calibrated non-linear requantization sites (see
         `calibrate_sites`); may be None for the calibration run itself.
     """
@@ -472,20 +409,10 @@ def build_payload(model, scales, cfg, site_book=None, weight_bits=8):
     covered = set()
     sd = model.state_dict()
 
-    # The [event-projection features | positional encoding] concatenation is
-    # the one Linear input whose two halves live on wildly different scales;
-    # `split_posenc_scale` gives each half its own INT8 scale (K-split GEMM).
-    posenc_split = None
-    if cfg.split_posenc_scale and site_book is not None:
-        sa = site_book.get(f'{POSENC_LINEAR}.in_a')
-        sb = site_book.get(f'{POSENC_LINEAR}.in_b')
-        assert sa is not None and sa.scale and sb is not None and sb.scale, (
-            'split_posenc_scale needs the .in_a/.in_b observers calibrated first')
-        posenc_split = (float(sa.scale), float(sb.scale))
-
+    # The [event-projection features | positional encoding] concatenation shares
+    # ONE input scale across both halves (no K-split GEMM), so it needs no
+    # special case here -- see hw_flow.md 9.1 [2].
     def _act_scale_for(name, module):
-        if posenc_split is not None and name == POSENC_LINEAR:
-            return posenc_split[0]          # the accumulator step is set by half A
         if name in act_max:
             return float(act_max[name]) / INT8_QMAX
         blk = _block_name_of_attention(name)
@@ -500,21 +427,18 @@ def build_payload(model, scales, cfg, site_book=None, weight_bits=8):
             if not isinstance(m, nn.Linear):
                 continue
             w = m.weight.data
-            w_scale = quant_ops.compute_qparams(w, weight_bits, per_channel=True, channel_dim=0)  # (E_out,1)
+            w_scale = compute_weight_scale(w, weight_bits)  # (E_out,1)
             w_int = torch.clamp(torch.round(w / w_scale), -qmax - 1, qmax)
             x_scale = _act_scale_for(name, m)
             entry = dict(kind='linear', shape=tuple(w.shape),
                          q=w_int.to(torch.int8),
-                         scale=_pack_scale(w_scale.reshape(-1), cfg.fx16_scales),
-                         x_scale=_pack_scale(torch.tensor([x_scale if x_scale else 1.0]), cfg.fx16_scales),
+                         scale=_pack_scale(w_scale.reshape(-1)),
+                         x_scale=_pack_scale(torch.tensor([x_scale if x_scale else 1.0])),
                          x_scale_valid=x_scale is not None)
-            if posenc_split is not None and name == POSENC_LINEAR:
-                entry['x_scale_b'] = _pack_scale(torch.tensor([posenc_split[1]]), cfg.fx16_scales)
-                entry['split_at'] = w.shape[1] - int(sd['backbone.pos_encoding'].shape[-1])
             covered.add(f'{name}.weight')
             if m.bias is not None:
-                entry['bias'] = _pack_bias(m.bias.data, x_scale, _unpack_scale(entry['scale']),
-                                           cfg, diag)
+                entry['bias'] = _pack_bias(m.bias.data, x_scale,
+                                           _unpack_scale(entry['scale']), diag)
                 covered.add(f'{name}.bias')
             layers[f'{name}.weight'] = entry
 
@@ -525,7 +449,7 @@ def build_payload(model, scales, cfg, site_book=None, weight_bits=8):
             blk = _block_name_of_attention(name)
             E = m.embed_dim
             w = m.in_proj_weight.data
-            w_scale = quant_ops.compute_qparams(w, weight_bits, per_channel=True, channel_dim=0)
+            w_scale = compute_weight_scale(w, weight_bits)
             w_int = torch.clamp(torch.round(w / w_scale), -qmax - 1, qmax)
             # per-row activation scale: rows [0:E)=Q, [E:2E)=K, [2E:3E)=V
             x_scales = torch.tensor(
@@ -534,11 +458,11 @@ def build_payload(model, scales, cfg, site_book=None, weight_bits=8):
                 + [float(scales['v_in_scales'][blk])] * E)
             entry = dict(kind='in_proj', shape=tuple(w.shape), embed_dim=E,
                          q=w_int.to(torch.int8),
-                         scale=_pack_scale(w_scale.reshape(-1), cfg.fx16_scales))
+                         scale=_pack_scale(w_scale.reshape(-1)))
             covered.add(f'{name}.in_proj_weight')
             if m.in_proj_bias is not None:
                 entry['bias'] = _pack_bias_vec(m.in_proj_bias.data, x_scales,
-                                               _unpack_scale(entry['scale']), cfg, diag)
+                                               _unpack_scale(entry['scale']), diag)
                 covered.add(f'{name}.in_proj_bias')
             # bias_k / bias_v live in the *post-projection* K/V domain: they are
             # appended as an extra K/V token, so fold them with the same
@@ -547,9 +471,9 @@ def build_payload(model, scales, cfg, site_book=None, weight_bits=8):
                 wk_scale = _unpack_scale(entry['scale'])[E:2 * E]
                 wv_scale = _unpack_scale(entry['scale'])[2 * E:3 * E]
                 entry['bias_k'] = _pack_bias_vec(m.bias_k.data.reshape(-1),
-                                                 x_scales[E:2 * E], wk_scale, cfg, diag)
+                                                 x_scales[E:2 * E], wk_scale, diag)
                 entry['bias_v'] = _pack_bias_vec(m.bias_v.data.reshape(-1),
-                                                 x_scales[2 * E:3 * E], wv_scale, cfg, diag)
+                                                 x_scales[2 * E:3 * E], wv_scale, diag)
                 covered.add(f'{name}.bias_k')
                 covered.add(f'{name}.bias_v')
             layers[f'{name}.in_proj_weight'] = entry
@@ -559,29 +483,28 @@ def build_payload(model, scales, cfg, site_book=None, weight_bits=8):
         pos_enc = None
         if pos_key in sd:
             p = sd[pos_key]
-            if cfg.int8_pos_enc:
-                p_scale = float(p.abs().max()) / INT8_QMAX
-                p_scale = fx.fx_round_scalar(p_scale)[0] if cfg.fx16_scales else p_scale
-                pos_enc = dict(mode='int8', q=fx.pack_int8(p, p_scale),
-                               scale=_pack_scale(torch.tensor([p_scale]), cfg.fx16_scales),
-                               shape=tuple(p.shape))
-            else:
-                pos_enc = dict(mode='fp32', values=p.clone(), shape=tuple(p.shape))
+            p_scale = fx.fx_round_scalar(float(p.abs().max()) / INT8_QMAX)[0]
+            pos_enc = dict(q=fx.pack_int8(p, p_scale),
+                           scale=_pack_scale(torch.tensor([p_scale])),
+                           shape=tuple(p.shape))
             covered.add(pos_key)
 
         # ---- LayerNorm affine + latent memory table: fixed point when the
         #      non-linear datapath is fixed point ----
         for name, m in model.named_modules():
             if isinstance(m, nn.LayerNorm):
-                for attr in ('weight', 'bias'):
+                for attr, n in (('weight', cfg.ln_gamma_frac_bits),
+                                ('bias', cfg.ln_beta_frac_bits)):
                     t = getattr(m, attr)
                     if t is None:
                         continue
-                    fx_params[f'{name}.{attr}'] = _pack_param_fx16(t.data, cfg.fx_nonlinear)
+                    # gamma multiplies xhat, beta is added to the output -- so
+                    # they get different (pinned) grids, see FinalConfig
+                    fx_params[f'{name}.{attr}'] = _pack_param_fx16(t.data, n)
                     covered.add(f'{name}.{attr}')
         mem_key = 'backbone.memory_vertical'
         if mem_key in sd:
-            fx_params[mem_key] = _pack_param_fx16(sd[mem_key], cfg.fx_nonlinear)
+            fx_params[mem_key] = _pack_param_fx16(sd[mem_key])
             covered.add(mem_key)
 
         # ---- anything left (training-only buffers) ----
@@ -597,7 +520,7 @@ def build_payload(model, scales, cfg, site_book=None, weight_bits=8):
         fx_params=fx_params,
         pos_encoding=pos_enc,
         fp32_other=fp32_other,
-        attention_scales=_pack_attention_scales(scales, cfg),
+        attention_scales=_pack_attention_scales(scales),
         sites=_pack_sites(site_book, cfg),
         diagnostics=diag,
     )
@@ -612,32 +535,26 @@ def _pack_sites(site_book, cfg):
     if site_book is None:
         return None
     out = site_book.to_dict()
-    if cfg.fx16_scales:
-        for entry in out.values():
-            if entry['kind'] == 'int8' and entry['scale'] is not None:
-                entry['scale'] = fx.fx_round_scalar(entry['scale'])[0]
+    for entry in out.values():
+        if entry['kind'] == 'int8' and entry['scale'] is not None:
+            entry['scale'] = fx.fx_round_scalar(entry['scale'])[0]
     return out
 
 
-def _pack_bias(bias, x_scale, w_scale, cfg, diag):
-    """Per-output-channel bias of a Linear."""
-    if cfg.int32_bias and x_scale is not None:
-        b_int = fold_bias_to_int32(bias, x_scale, w_scale)
-        diag['max_abs_bias_int'] = max(diag['max_abs_bias_int'], float(b_int.abs().max()))
-        return dict(mode='int32', q=b_int.to(torch.int32))
-    return dict(mode='fp32', values=bias.detach().clone())
+def _pack_bias(bias, x_scale, w_scale, diag):
+    """Per-output-channel bias of a Linear, folded onto the INT32 accumulator."""
+    assert x_scale is not None, 'bias folding needs the input activation scale'
+    return _pack_bias_vec(bias, x_scale, w_scale, diag)
 
 
-def _pack_bias_vec(bias, x_scales, w_scale, cfg, diag):
+def _pack_bias_vec(bias, x_scales, w_scale, diag):
     """Same, with a per-row activation scale vector (MHA in_proj)."""
-    if cfg.int32_bias:
-        b_int = fold_bias_to_int32(bias, x_scales, w_scale)
-        diag['max_abs_bias_int'] = max(diag['max_abs_bias_int'], float(b_int.abs().max()))
-        return dict(mode='int32', q=b_int.to(torch.int32))
-    return dict(mode='fp32', values=bias.detach().clone())
+    b_int = fold_bias_to_int32(bias, x_scales, w_scale)
+    diag['max_abs_bias_int'] = max(diag['max_abs_bias_int'], float(b_int.abs().max()))
+    return dict(q=b_int.to(torch.int32))
 
 
-def _pack_attention_scales(scales, cfg):
+def _pack_attention_scales(scales):
     """The handful of per-attention-block activation scales (pre-projection
     Q/K/V, post-projection Q/K/V, out_proj input) -- fx16 or fp32."""
     out = {}
@@ -645,14 +562,14 @@ def _pack_attention_scales(scales, cfg):
         src = scales.get(key)
         if src is None:
             continue
-        out[key] = {b: _pack_scale(torch.tensor([float(v)]), cfg.fx16_scales) for b, v in src.items()}
+        out[key] = {b: _pack_scale(torch.tensor([float(v)])) for b, v in src.items()}
     if scales.get('qk_scales'):
         out['qk_scales'] = {
-            b: dict(q_scale=_pack_scale(torch.tensor([float(v['q_scale'])]), cfg.fx16_scales),
-                    k_scale=_pack_scale(torch.tensor([float(v['k_scale'])]), cfg.fx16_scales))
+            b: dict(q_scale=_pack_scale(torch.tensor([float(v['q_scale'])])),
+                    k_scale=_pack_scale(torch.tensor([float(v['k_scale'])])))
             for b, v in scales['qk_scales'].items()}
     # softmax output scale is analytic (1/127), no calibration needed
-    out['softmax_scale'] = _pack_scale(torch.tensor([1.0 / INT8_QMAX]), cfg.fx16_scales)
+    out['softmax_scale'] = _pack_scale(torch.tensor([1.0 / INT8_QMAX]))
     return out
 
 
@@ -669,34 +586,26 @@ def payload_size_bytes(payload, include_non_inference=False):
         return x.numel() * x.element_size()
 
     def _scale_bytes(entry):
-        if entry['mode'] == 'fp32':
-            return _t(entry['values'])
-        return _t(entry['codes']) + 1
+        return _t(entry['codes']) + 1        # int16 codes + one shared shift
 
     for entry in payload['layers'].values():
         groups['weights_int8'] += _t(entry['q'])
         groups['weight_scales'] += _scale_bytes(entry['scale'])
-        for sk in ('x_scale', 'x_scale_b'):
+        for sk in ('x_scale',):
             if sk in entry:
                 groups['act_scales'] += _scale_bytes(entry[sk])
         for bkey in ('bias', 'bias_k', 'bias_v'):
             b = entry.get(bkey)
             if b is None:
                 continue
-            groups['biases'] += _t(b['q']) if b['mode'] == 'int32' else _t(b['values'])
+            groups['biases'] += _t(b['q'])
 
     pe = payload.get('pos_encoding')
     if pe is not None:
-        if pe['mode'] == 'int8':
-            groups['pos_encoding'] += _t(pe['q']) + _scale_bytes(pe['scale'])
-        else:
-            groups['pos_encoding'] += _t(pe['values'])
+        groups['pos_encoding'] += _t(pe['q']) + _scale_bytes(pe['scale'])
 
     for entry in payload['fx_params'].values():
-        if entry['mode'] == 'fp32':
-            groups['fx_params'] += _t(entry['values'])
-        else:
-            groups['fx_params'] += _t(entry['codes']) + 1
+        groups['fx_params'] += _t(entry['codes']) + 1
 
     def _walk_scales(d):
         total = 0
@@ -730,7 +639,7 @@ class HWRuntime:
     whose forwards have been patched by `instantiate`."""
 
     def __init__(self, payload, device):
-        self.cfg = HWConfig.from_dict(payload['config'])
+        self.cfg = FinalConfig.from_dict(payload['config'])
         self.device = device
         self.sites = SiteBook.from_dict(payload['sites']) if payload.get('sites') else SiteBook()
         self.attention_scales = payload['attention_scales']
@@ -745,7 +654,7 @@ class HWRuntime:
     def const(self, value):
         """A hard-wired datapath constant (e.g. 1/sqrt(head_dim)), snapped onto
         a Q format when the design stores its multipliers as fixed point."""
-        return fx.fx_round_scalar(value)[0] if self.cfg.fx16_scales else float(value)
+        return fx.fx_round_scalar(value)[0]
 
 
 @torch.no_grad()
@@ -770,9 +679,6 @@ def instantiate(payload, model, device):
 
         if entry['kind'] == 'linear':
             info['x_scale'] = float(_unpack_scale(entry['x_scale'])[0]) if entry['x_scale_valid'] else None
-            if 'x_scale_b' in entry:
-                info['x_scale_b'] = float(_unpack_scale(entry['x_scale_b'])[0])
-                info['split_at'] = int(entry['split_at'])
             # accumulator step of every output channel: s_x * s_w
             steps = dict(bias=(info['x_scale'] or 1.0) * w_scale)
             sd_names = dict(bias=f'{base}.bias')
@@ -794,14 +700,8 @@ def instantiate(payload, model, device):
             b = entry.get(bkey)
             if b is None:
                 continue
-            if b['mode'] == 'int32':
-                info[f'{bkey}_int'] = b['q'].to(torch.float32)
-                info[f'{bkey}_fp'] = None
-                effective = info[f'{bkey}_int'] * steps[bkey]
-            else:
-                info[f'{bkey}_int'] = None
-                info[f'{bkey}_fp'] = b['values'].float()
-                effective = info[f'{bkey}_fp']
+            info[f'{bkey}_int'] = b['q'].to(torch.float32)
+            effective = info[f'{bkey}_int'] * steps[bkey]
             # write the *effective* fp32 value back into the state dict so the
             # saved checkpoint stays a self-contained, loadable model
             sd[sd_names[bkey]] = effective.reshape(sd[sd_names[bkey]].shape)
@@ -812,11 +712,8 @@ def instantiate(payload, model, device):
 
     pe = payload.get('pos_encoding')
     if pe is not None:
-        if pe['mode'] == 'int8':
-            pscale = float(_unpack_scale(pe['scale'])[0])
-            sd['backbone.pos_encoding'] = (pe['q'].to(torch.float32) * pscale).reshape(pe['shape'])
-        else:
-            sd['backbone.pos_encoding'] = pe['values'].float().reshape(pe['shape'])
+        pscale = float(_unpack_scale(pe['scale'])[0])
+        sd['backbone.pos_encoding'] = (pe['q'].to(torch.float32) * pscale).reshape(pe['shape'])
 
     for k, v in payload['fp32_other'].items():
         sd[k] = v
@@ -828,7 +725,7 @@ def instantiate(payload, model, device):
     for info in layer_info.values():
         info['w_int'] = info['w_int'].to(device)
         info['w_scale'] = info['w_scale'].to(device)
-        for key in ('bias_int', 'bias_k_int', 'bias_v_int', 'bias_fp', 'bias_k_fp', 'bias_v_fp'):
+        for key in ('bias_int', 'bias_k_int', 'bias_v_int'):
             if info.get(key) is not None:
                 info[key] = info[key].to(device)
 
@@ -845,37 +742,39 @@ def instantiate(payload, model, device):
         lambda _m, _args: rt.sites.reset_call_counters())
 
     # ---------- 3) arm the non-linear requantizers ----------
-    if cfg.fx16_scales:
-        # the INT8 requant step in front of each ReLU is a datapath constant
-        # too -- it must be a Q-format multiplier, not an fp32 one
-        for site in rt.sites.values():
-            if site.kind == 'int8' and site.scale is not None:
-                site.scale = fx.fx_round_scalar(site.scale)[0]
+    # the INT8 requant step in front of each ReLU is a datapath constant too --
+    # it must be a Q-format multiplier, not an fp32 one
+    for site in rt.sites.values():
+        if site.kind == 'int8' and site.scale is not None:
+            site.scale = fx.fx_round_scalar(site.scale)[0]
     for key, site in rt.sites.items():
-        # only LayerNorm's *input* may use a run-time shared exponent / a wider
-        # register -- everything else stays a static 16-bit Q format
-        is_ln_in = site.kind == 'fx16' and key.endswith('.in') and '.layer_norm' in key
-        site.dynamic = bool(cfg.ln_dynamic_exp) and is_ln_in
-        site.per_call = bool(cfg.ln_per_step_q) and is_ln_in
-        site.set_width(int(cfg.ln_bits) if is_ln_in else fx.TOTAL_BITS,
-                       headroom_bits=int(cfg.ln_headroom_bits) if is_ln_in else 0)
-        if key.endswith('.centered'):
-            # off by default: modelling the variance path at full precision.
-            # Set `ln_centered_bits` to narrow it to what an RTL squarer sees.
-            site.set_width(int(cfg.ln_centered_bits or fx.TOTAL_BITS),
-                           headroom_bits=int(cfg.ln_headroom_bits))
-            site.force_off = cfg.ln_centered_bits is None
-        if cfg.gelu_frac_bits is not None and site.role == 'gelu':
+        site.set_width(fx.TOTAL_BITS)
+        if site.role == 'gelu':
             # one LUT for the whole network: same Q format at every GELU
-            site.set_width(fx.TOTAL_BITS)
-            site.frac_bits = int(cfg.gelu_frac_bits)
-    if cfg.fx_nonlinear:
+            site.frac_bits = cfg.gelu_frac_bits
+        elif site.role == 'softmax' and key.endswith('.in'):
+            # one exp LUT for the whole network: same input Q format at every
+            # softmax (the output is analytic and already shared)
+            site.frac_bits = cfg.softmax_frac_bits
+        elif '.layer_norm' in key and key.endswith('.hat'):
+            site.frac_bits = cfg.ln_xhat_frac_bits
+        elif '.layer_norm' in key and key.endswith('.out'):
+            site.frac_bits = cfg.ln_out_frac_bits
+    # LayerNorm runs in bf16, so its Qm.n sites are observers only
+    for m in model.modules():
+        if isinstance(m, nn.LayerNorm):
+            m._ln_bf16 = True
+    # A payload built with `site_book=None` is the calibration vehicle: the
+    # sites exist but have no format yet, so they stay in observe-and-pass-
+    # through mode. Any other payload must have every site calibrated.
+    armed = payload.get('sites') is not None
+    if armed:
         missing = [k for k, s in rt.sites.items()
-                   if not s.dynamic and (s.frac_bits is None if s.kind == 'fx16' else s.scale is None)]
+                   if (s.frac_bits is None if s.kind == 'fx16' else s.scale is None)]
         assert not missing, (
             f"{len(missing)} requantization site(s) have no calibrated Q format "
             f"(e.g. {missing[:3]}) -- run `calibrate_sites` first.")
-    rt.sites.enable(cfg.fx_nonlinear)
+    rt.sites.enable(armed)
     return model, rt
 
 
@@ -897,63 +796,53 @@ def _patch_linears(model, layer_info, rt):
             continue
         m._hw = info
 
-        if name == POSENC_LINEAR:
-            # Always observe the two halves of the concatenation separately, so
-            # a split-scale config can be built from the same calibration pass.
-            pos_dim = model.backbone.pos_encoding.shape[-1]
-            m._split_at = info['w_int'].shape[1] - int(pos_dim)
-            m._sites = (rt.sites.site(f'{name}.in_a', kind='int8'),
-                        rt.sites.site(f'{name}.in_b', kind='int8'))
-
-            def posenc_forward(self, x):
-                i = self._hw
-                sa, sb = self._sites
-                k = self._split_at
-                if sa.calibrating:
-                    sa.observe(x[..., :k])
-                    sb.observe(x[..., k:])
-                if 'x_scale_b' not in i:
-                    return int8_linear(x, i['x_scale'], i['w_int'], i['w_scale'],
-                                       b_int=i.get('bias_int'), b_fp=i.get('bias_fp'))
-                # K-split GEMM: two INT32 partial accumulators, one per input
-                # scale, combined by two rescale multipliers (the bias was
-                # folded into the half-A accumulator at pack time).
-                w = i['w_int']
-                xa_int, xb_int = _to_int8(x[..., :k], i['x_scale']), _to_int8(x[..., k:], i['x_scale_b'])
-                acc_a = torch.matmul(xa_int, w[:, :k].transpose(-2, -1))
-                acc_b = torch.matmul(xb_int, w[:, k:].transpose(-2, -1))
-                if i.get('bias_int') is not None:
-                    acc_a = acc_a + i['bias_int']
-                _probe(f'posenc_splitA_K{k}', xa_int, w[:, :k], acc_a, i.get('bias_int'))
-                _probe(f'posenc_splitB_K{x.shape[-1] - k}', xb_int, w[:, k:], acc_b)
-                out = acc_a * (i['x_scale'] * i['w_scale']) \
-                    + acc_b * (i['x_scale_b'] * i['w_scale'])
-                if i.get('bias_fp') is not None:
-                    out = out + i['bias_fp']
-                return out
-
-            m.forward = types.MethodType(posenc_forward, m)
-            continue
-
         def forward(self, x):
             i = self._hw
             return int8_linear(x, i['x_scale'], i['w_int'], i['w_scale'],
-                               b_int=i.get('bias_int'), b_fp=i.get('bias_fp'))
+                               b_int=i.get('bias_int'))
 
         m.forward = types.MethodType(forward, m)
 
 
+def _bf16(t):
+    """Round to bfloat16 precision, keep an fp32 container (so the rest of the
+    graph is unchanged). bf16 = 1 sign + 8 exponent + 7 stored mantissa bits."""
+    return t.to(torch.bfloat16).to(t.dtype)
+
+
 def _patch_layernorms(model, rt):
     """LayerNorm as a fixed-point unit: input, the normalized intermediate and
-    the output are each snapped onto their own Q format."""
+    the output are each snapped onto their own Q format.
+
+    The four Q grids are replaced by bfloat16 rounding at the same four points
+    once the sites are armed. During calibration the Qm.n path runs instead, so
+    the site statistics (and the audit report) still describe the ranges."""
     for name, m in model.named_modules():
         if not isinstance(m, nn.LayerNorm):
             continue
         m._sites = (rt.sites.site(f'{name}.in'), rt.sites.site(f'{name}.hat'),
                     rt.sites.site(f'{name}.out'), rt.sites.site(f'{name}.centered'))
+        m._ln_bf16 = False
 
         def forward(self, x):
             s_in, s_hat, s_out, s_ctr = self._sites
+            if self._ln_bf16 and s_in.enabled:
+                # --- bf16 front end: the input's dynamic range spans ~5 decades
+                # (max|x| up to 2.4e5), which is what bf16's 8-bit exponent is
+                # for. Mean/variance reduce in fp32 and round to bf16 on output.
+                x = _bf16(x)
+                mu = _bf16(x.mean(dim=-1, keepdim=True))
+                centered = _bf16(x - mu)
+                var = _bf16(centered.pow(2).mean(dim=-1, keepdim=True))
+                # --- Qm.n back end: after normalisation |xhat| < 9, so bf16's
+                # exponent is wasted and its 8-bit mantissa is the binding
+                # limit. Q4.11 is ~16x finer for the same 16 bits, and it hands
+                # the next GEMM a Qm.n code -- the same integer requantizer the
+                # rest of the datapath uses.
+                xhat = s_hat(_bf16(centered * _bf16(torch.rsqrt(var + self.eps))))
+                if self.weight is None:
+                    return xhat
+                return s_out(xhat * self.weight + self.bias)
             x = s_in(x)
             mu = x.mean(dim=-1, keepdim=True)
             # The variance accumulator is the widest thing in a fixed-point
@@ -1009,14 +898,17 @@ def _patch_compressor_and_clf(model, rt):
 
             m.forward = types.MethodType(comp_forward, m)
         elif isinstance(m, CLFBlock):
-            m._sites = (rt.sites.site(f'{name}.relu.in', kind='int8'),
-                        rt.sites.site(f'{name}.log_softmax.in'))
+            m._sites = (rt.sites.site(f'{name}.relu.in', kind='int8'),)
 
             def clf_forward(self, z):
-                s_relu, s_lsm = self._sites
-                z = F.relu(s_relu(self.linear_1(z)))
-                z = self.linear_2(z)
-                return F.log_softmax(s_lsm(z), dim=1)
+                z = F.relu(self._sites[0](self.linear_1(z)))
+                # No log_softmax and no output requantization: inference only
+                # takes the argmax, and log_softmax is monotonic, so
+                # argmax(log_softmax(z)) == argmax(z). The hardware compares
+                # `acc[c] * M[c]` directly -- no shift, no rounding, no
+                # saturation. `M[c]` is still needed because the per-class
+                # weight scale s_w[c] would otherwise reorder the classes.
+                return self.linear_2(z)
 
             m.forward = types.MethodType(clf_forward, m)
 
@@ -1092,16 +984,17 @@ def attention_forward_hw(q_in, k_in, v_in, mha, key_padding_mask, ctx):
 
     ip = ctx['in_proj']
     w_int, w_scale = ip['w_int'], ip['w_scale']
-    b_int, b_fp = ip.get('bias_int'), ip.get('bias_fp')
+    b_int = ip.get('bias_int')
 
     def _proj(x, x_scale, lo, hi):
         return int8_linear(x, x_scale, w_int[lo:hi], w_scale[lo:hi],
-                           b_int=None if b_int is None else b_int[lo:hi],
-                           b_fp=None if b_fp is None else b_fp[lo:hi])
+                           b_int=None if b_int is None else b_int[lo:hi])
 
     q = _proj(q_in, ctx['q_in'], 0, E)
     k = _proj(k_in, ctx['k_in'], E, 2 * E)
     v = _proj(v_in, ctx['v_in'], 2 * E, 3 * E)
+
+    _attn_tap(ctx['name'], q_in=q_in, k_in=k_in, v_in=v_in, q=q, k=k, v=v)
 
     if mha.bias_k is not None:
         # bias_k/bias_v are stored in the same post-projection domain (INT32
@@ -1143,8 +1036,10 @@ def attention_forward_hw(q_in, k_in, v_in, mha, key_padding_mask, ctx):
 
     # ---- out_proj ----
     op = ctx['out_proj']
-    return int8_linear(out, ctx['out_proj_in'], op['w_int'], op['w_scale'],
-                       b_int=op.get('bias_int'), b_fp=op.get('bias_fp'))
+    y = int8_linear(out, ctx['out_proj_in'], op['w_int'], op['w_scale'],
+                    b_int=op.get('bias_int'))
+    _attn_tap(ctx['name'], out_proj_in=out, out_proj_out=y)
+    return y
 
 
 # =============================================================================

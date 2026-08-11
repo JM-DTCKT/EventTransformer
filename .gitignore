@@ -139,3 +139,34 @@ quantization/DVS128_11/
 pretrained_models/
 
 .ckpt
+# =============================================================================
+# 생성물 — 전부 스크립트로 다시 만들 수 있습니다 (합계 약 245 MB)
+# 원본은 datasets/ 와 pretrained_models/ 이고 그 둘은 위에서 이미 제외했습니다.
+# =============================================================================
+
+# 전처리 결과 163 MB (tokens.fp32 130 MB, tokens.int8 33 MB)
+#   재생성: cd real_dvs_script && python3 preprocess.py
+real_dvs_script/data/
+
+# 디버깅용 텐서 덤프 7 MB
+#   재생성: cd real_dvs_script && python3 taps.py --sample 0 --steps 2
+real_dvs_script/taps/
+
+# MNIST 64 MB — torchvision 이 처음 실행 때 자동으로 내려받습니다
+linear_script/data/
+
+# RTL/보드용 메모리 이미지 (.hex/.bin) 4.4 MB
+#   재생성: 각 폴더에서 python3 export_rtl.py
+*_script/rtl_export/
+
+# 양자화 산출 체크포인트 2 MB
+#   재생성: 각 폴더에서 python3 quantize.py
+linear_script/*.pt
+nonlinear_script/*.pt
+
+# 분석 스크립트가 뱉는 그림·표 (문서용 model_overview_v6.png 는 추적 대상이므로
+# 확장자로 뭉뚱그리지 않고 폴더를 지정합니다)
+quantization/*.png
+quantization/*.csv
+*_script/*.png
+*_script/*.csv

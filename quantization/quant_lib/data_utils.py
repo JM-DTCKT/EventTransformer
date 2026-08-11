@@ -11,6 +11,9 @@ import json
 import os
 import sys
 
+import random
+
+import numpy as np
 import torch
 from tqdm import tqdm
 
@@ -72,6 +75,25 @@ def load_model(weights_path, all_params_path, device='cpu'):
     model.eval()
     model.to(device)
     return model, all_params
+
+
+def seed_dataloader(loader, seed):
+    """Make a dataloader's draws reproducible.
+
+    The event pipeline augments inside `__getitem__` with `np.random`
+    (`data_generation.py`: random time window, crop, flip, token drop), and
+    PyTorch seeds only `torch`/`random` in its workers -- never numpy. Without
+    this, two runs calibrate on different data and the packed scales, and with
+    them the last decimal of the accuracy, move between runs.
+    """
+    def _init(worker_id):
+        np.random.seed(seed + worker_id)
+        random.seed(seed + worker_id)
+
+    np.random.seed(seed)
+    random.seed(seed)
+    loader.worker_init_fn = _init          # read when the worker procs spawn
+    return loader
 
 
 def build_datamodule(all_params, workers=4, batch_size=None):
