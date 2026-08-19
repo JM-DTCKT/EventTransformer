@@ -1,0 +1,8 @@
+{
+ "Lk": 53,
+ "head": 0,
+ "mult": 1165286311,
+ "shift": 32,
+ "block": "cross_attention",
+ "source": "\uc815\uc218 LUT \ud30c\uc774\ud504\ub77c\uc778 (Softmax_Attn.v \uc640 \ub3d9\uc77c)"
+}

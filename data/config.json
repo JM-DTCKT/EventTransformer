@@ -1,0 +1,489 @@
+{
+ "dataset": "DVS128_10",
+ "N": 32,
+ "E": 128,
+ "LATENT": 96,
+ "HEADS": 4,
+ "HEAD_DIM": 32,
+ "N_CLASS": 10,
+ "T_MAX": 20,
+ "TOK_MAX": 128,
+ "words": {
+  "w": 14000,
+  "pb": 869,
+  "pg": 208
+ },
+ "w_base": {
+  "backbone.event_projection.seq_init.0": 0,
+  "backbone.preproc_block_events.seq_init.0": 432,
+  "backbone.proc_event_blocks.0.seq_init.1": 1072,
+  "backbone.proc_event_blocks.0.seq_init.4": 1584,
+  "backbone.proc_memory_blocks.0.cross_attention.attention.out_proj": 2096,
+  "backbone.proc_memory_blocks.0.cross_attention.linear1": 2608,
+  "backbone.proc_memory_blocks.0.cross_attention.linear2": 3120,
+  "backbone.proc_memory_blocks.0.cross_attention.linear3": 3632,
+  "backbone.proc_memory_blocks.0.latent_attentions.0.attention.out_proj": 4144,
+  "backbone.proc_memory_blocks.0.latent_attentions.0.linear1": 4656,
+  "backbone.proc_memory_blocks.0.latent_attentions.0.linear2": 5168,
+  "backbone.proc_memory_blocks.0.latent_attentions.0.linear3": 5680,
+  "backbone.proc_memory_blocks.0.latent_attentions.1.attention.out_proj": 6192,
+  "backbone.proc_memory_blocks.0.latent_attentions.1.linear1": 6704,
+  "backbone.proc_memory_blocks.0.latent_attentions.1.linear2": 7216,
+  "backbone.proc_memory_blocks.0.latent_attentions.1.linear3": 7728,
+  "backbone.proc_embs_block.linear1": 8240,
+  "models_clf.0.linear_1": 8752,
+  "models_clf.0.linear_2": 9264,
+  "backbone.proc_memory_blocks.0.cross_attention.attention": 9392,
+  "backbone.proc_memory_blocks.0.latent_attentions.0.attention": 10928,
+  "backbone.proc_memory_blocks.0.latent_attentions.1.attention": 12464
+ },
+ "w_shape": {
+  "backbone.event_projection.seq_init.0": [
+   96,
+   144
+  ],
+  "backbone.preproc_block_events.seq_init.0": [
+   128,
+   160
+  ],
+  "backbone.proc_event_blocks.0.seq_init.1": [
+   128,
+   128
+  ],
+  "backbone.proc_event_blocks.0.seq_init.4": [
+   128,
+   128
+  ],
+  "backbone.proc_memory_blocks.0.cross_attention.attention.out_proj": [
+   128,
+   128
+  ],
+  "backbone.proc_memory_blocks.0.cross_attention.linear1": [
+   128,
+   128
+  ],
+  "backbone.proc_memory_blocks.0.cross_attention.linear2": [
+   128,
+   128
+  ],
+  "backbone.proc_memory_blocks.0.cross_attention.linear3": [
+   128,
+   128
+  ],
+  "backbone.proc_memory_blocks.0.latent_attentions.0.attention.out_proj": [
+   128,
+   128
+  ],
+  "backbone.proc_memory_blocks.0.latent_attentions.0.linear1": [
+   128,
+   128
+  ],
+  "backbone.proc_memory_blocks.0.latent_attentions.0.linear2": [
+   128,
+   128
+  ],
+  "backbone.proc_memory_blocks.0.latent_attentions.0.linear3": [
+   128,
+   128
+  ],
+  "backbone.proc_memory_blocks.0.latent_attentions.1.attention.out_proj": [
+   128,
+   128
+  ],
+  "backbone.proc_memory_blocks.0.latent_attentions.1.linear1": [
+   128,
+   128
+  ],
+  "backbone.proc_memory_blocks.0.latent_attentions.1.linear2": [
+   128,
+   128
+  ],
+  "backbone.proc_memory_blocks.0.latent_attentions.1.linear3": [
+   128,
+   128
+  ],
+  "backbone.proc_embs_block.linear1": [
+   128,
+   128
+  ],
+  "models_clf.0.linear_1": [
+   128,
+   128
+  ],
+  "models_clf.0.linear_2": [
+   10,
+   128
+  ],
+  "backbone.proc_memory_blocks.0.cross_attention.attention": [
+   384,
+   128
+  ],
+  "backbone.proc_memory_blocks.0.latent_attentions.0.attention": [
+   384,
+   128
+  ],
+  "backbone.proc_memory_blocks.0.latent_attentions.1.attention": [
+   384,
+   128
+  ]
+ },
+ "pb_base": {
+  "backbone.event_projection.seq_init.0": 0,
+  "backbone.preproc_block_events.seq_init.0": 97,
+  "backbone.proc_event_blocks.0.seq_init.1": 226,
+  "backbone.proc_event_blocks.0.seq_init.4": 355,
+  "backbone.proc_memory_blocks.0.cross_attention.attention.out_proj": 484,
+  "backbone.proc_memory_blocks.0.cross_attention.linear1": 613,
+  "backbone.proc_memory_blocks.0.cross_attention.linear2": 742,
+  "backbone.proc_memory_blocks.0.cross_attention.linear3": 871,
+  "backbone.proc_memory_blocks.0.latent_attentions.0.attention.out_proj": 1000,
+  "backbone.proc_memory_blocks.0.latent_attentions.0.linear1": 1129,
+  "backbone.proc_memory_blocks.0.latent_attentions.0.linear2": 1258,
+  "backbone.proc_memory_blocks.0.latent_attentions.0.linear3": 1387,
+  "backbone.proc_memory_blocks.0.latent_attentions.1.attention.out_proj": 1516,
+  "backbone.proc_memory_blocks.0.latent_attentions.1.linear1": 1645,
+  "backbone.proc_memory_blocks.0.latent_attentions.1.linear2": 1774,
+  "backbone.proc_memory_blocks.0.latent_attentions.1.linear3": 1903,
+  "backbone.proc_embs_block.linear1": 2032,
+  "models_clf.0.linear_1": 2161,
+  "models_clf.0.linear_2": 2290,
+  "backbone.proc_memory_blocks.0.cross_attention.attention": 2301,
+  "backbone.proc_memory_blocks.0.latent_attentions.0.attention": 2686,
+  "backbone.proc_memory_blocks.0.latent_attentions.1.attention": 3071
+ },
+ "pg_base": {
+  "backbone.proc_embs_block.layer_norm": 0,
+  "backbone.proc_memory_blocks.0.cross_attention.layer_norm_1": 128,
+  "backbone.proc_memory_blocks.0.cross_attention.layer_norm_2": 256,
+  "backbone.proc_memory_blocks.0.cross_attention.layer_norm_att": 384,
+  "backbone.proc_memory_blocks.0.cross_attention.layer_norm_x": 512,
+  "backbone.proc_memory_blocks.0.latent_attentions.0.layer_norm_1": 640,
+  "backbone.proc_memory_blocks.0.latent_attentions.0.layer_norm_2": 768,
+  "backbone.proc_memory_blocks.0.latent_attentions.0.layer_norm_att": 896,
+  "backbone.proc_memory_blocks.0.latent_attentions.0.layer_norm_x": 1024,
+  "backbone.proc_memory_blocks.0.latent_attentions.1.layer_norm_1": 1152,
+  "backbone.proc_memory_blocks.0.latent_attentions.1.layer_norm_2": 1280,
+  "backbone.proc_memory_blocks.0.latent_attentions.1.layer_norm_att": 1408,
+  "backbone.proc_memory_blocks.0.latent_attentions.1.layer_norm_x": 1536
+ },
+ "attn_pb": {
+  "backbone.proc_memory_blocks.0.cross_attention": {
+   "qk": [
+    3456,
+    1165286311,
+    32
+   ],
+   "av": [
+    3457,
+    1170898206,
+    37
+   ]
+  },
+  "backbone.proc_memory_blocks.0.latent_attentions.0": {
+   "qk": [
+    3458,
+    1457637920,
+    32
+   ],
+   "av": [
+    3459,
+    1205976553,
+    37
+   ]
+  },
+  "backbone.proc_memory_blocks.0.latent_attentions.1": {
+   "qk": [
+    3460,
+    1328161171,
+    32
+   ],
+   "av": [
+    3461,
+    1158058060,
+    37
+   ]
+  }
+ },
+ "ln_pb": {
+  "backbone.proc_embs_block.layer_norm": 3462,
+  "backbone.proc_memory_blocks.0.cross_attention.layer_norm_x": 3463,
+  "backbone.proc_memory_blocks.0.cross_attention.layer_norm_1": 3464,
+  "backbone.proc_memory_blocks.0.cross_attention.layer_norm_att": 3465,
+  "backbone.proc_memory_blocks.0.cross_attention.layer_norm_2": 3466,
+  "backbone.proc_memory_blocks.0.latent_attentions.0.layer_norm_x": 3467,
+  "backbone.proc_memory_blocks.0.latent_attentions.0.layer_norm_1": 3468,
+  "backbone.proc_memory_blocks.0.latent_attentions.0.layer_norm_att": 3469,
+  "backbone.proc_memory_blocks.0.latent_attentions.0.layer_norm_2": 3470,
+  "backbone.proc_memory_blocks.0.latent_attentions.1.layer_norm_x": 3471,
+  "backbone.proc_memory_blocks.0.latent_attentions.1.layer_norm_1": 3472,
+  "backbone.proc_memory_blocks.0.latent_attentions.1.layer_norm_att": 3473,
+  "backbone.proc_memory_blocks.0.latent_attentions.1.layer_norm_2": 3474
+ },
+ "ln_shift": {
+  "backbone.proc_embs_block.layer_norm": 37,
+  "backbone.proc_memory_blocks.0.cross_attention.layer_norm_x": 38,
+  "backbone.proc_memory_blocks.0.cross_attention.layer_norm_1": 37,
+  "backbone.proc_memory_blocks.0.cross_attention.layer_norm_att": 37,
+  "backbone.proc_memory_blocks.0.cross_attention.layer_norm_2": 38,
+  "backbone.proc_memory_blocks.0.latent_attentions.0.layer_norm_x": 37,
+  "backbone.proc_memory_blocks.0.latent_attentions.0.layer_norm_1": 37,
+  "backbone.proc_memory_blocks.0.latent_attentions.0.layer_norm_att": 37,
+  "backbone.proc_memory_blocks.0.latent_attentions.0.layer_norm_2": 38,
+  "backbone.proc_memory_blocks.0.latent_attentions.1.layer_norm_x": 37,
+  "backbone.proc_memory_blocks.0.latent_attentions.1.layer_norm_1": 37,
+  "backbone.proc_memory_blocks.0.latent_attentions.1.layer_norm_att": 37,
+  "backbone.proc_memory_blocks.0.latent_attentions.1.layer_norm_2": 38
+ },
+ "ln_target": {
+  "backbone.proc_embs_block.layer_norm": 0.04070091247558594,
+  "backbone.proc_memory_blocks.0.cross_attention.layer_norm_x": 0.06583404541015625,
+  "backbone.proc_memory_blocks.0.cross_attention.layer_norm_1": 0.04330635070800781,
+  "backbone.proc_memory_blocks.0.cross_attention.layer_norm_att": 0.04224967956542969,
+  "backbone.proc_memory_blocks.0.cross_attention.layer_norm_2": 0.0717926025390625,
+  "backbone.proc_memory_blocks.0.latent_attentions.0.layer_norm_x": 0.04100608825683594,
+  "backbone.proc_memory_blocks.0.latent_attentions.0.layer_norm_1": 0.044551849365234375,
+  "backbone.proc_memory_blocks.0.latent_attentions.0.layer_norm_att": 0.04145050048828125,
+  "backbone.proc_memory_blocks.0.latent_attentions.0.layer_norm_2": 0.07099533081054688,
+  "backbone.proc_memory_blocks.0.latent_attentions.1.layer_norm_x": 0.042072296142578125,
+  "backbone.proc_memory_blocks.0.latent_attentions.1.layer_norm_1": 0.04683494567871094,
+  "backbone.proc_memory_blocks.0.latent_attentions.1.layer_norm_att": 0.044376373291015625,
+  "backbone.proc_memory_blocks.0.latent_attentions.1.layer_norm_2": 0.0715484619140625
+ },
+ "ln_xsh": {
+  "backbone.proc_embs_block.layer_norm": -2,
+  "backbone.proc_memory_blocks.0.cross_attention.layer_norm_x": 2,
+  "backbone.proc_memory_blocks.0.cross_attention.layer_norm_1": 2,
+  "backbone.proc_memory_blocks.0.cross_attention.layer_norm_att": 2,
+  "backbone.proc_memory_blocks.0.cross_attention.layer_norm_2": 2,
+  "backbone.proc_memory_blocks.0.latent_attentions.0.layer_norm_x": 2,
+  "backbone.proc_memory_blocks.0.latent_attentions.0.layer_norm_1": 2,
+  "backbone.proc_memory_blocks.0.latent_attentions.0.layer_norm_att": 2,
+  "backbone.proc_memory_blocks.0.latent_attentions.0.layer_norm_2": 2,
+  "backbone.proc_memory_blocks.0.latent_attentions.1.layer_norm_x": 2,
+  "backbone.proc_memory_blocks.0.latent_attentions.1.layer_norm_1": 2,
+  "backbone.proc_memory_blocks.0.latent_attentions.1.layer_norm_att": 2,
+  "backbone.proc_memory_blocks.0.latent_attentions.1.layer_norm_2": 2
+ },
+ "gelu_shift": {
+  "backbone.event_projection.seq_init.0": 38,
+  "backbone.preproc_block_events.seq_init.0": 37,
+  "backbone.proc_event_blocks.0.seq_init.1": 30,
+  "backbone.proc_event_blocks.0.seq_init.4": 0,
+  "backbone.proc_memory_blocks.0.cross_attention.attention.out_proj": 0,
+  "backbone.proc_memory_blocks.0.cross_attention.linear1": 0,
+  "backbone.proc_memory_blocks.0.cross_attention.linear2": 37,
+  "backbone.proc_memory_blocks.0.cross_attention.linear3": 0,
+  "backbone.proc_memory_blocks.0.latent_attentions.0.attention.out_proj": 0,
+  "backbone.proc_memory_blocks.0.latent_attentions.0.linear1": 0,
+  "backbone.proc_memory_blocks.0.latent_attentions.0.linear2": 37,
+  "backbone.proc_memory_blocks.0.latent_attentions.0.linear3": 0,
+  "backbone.proc_memory_blocks.0.latent_attentions.1.attention.out_proj": 0,
+  "backbone.proc_memory_blocks.0.latent_attentions.1.linear1": 0,
+  "backbone.proc_memory_blocks.0.latent_attentions.1.linear2": 37,
+  "backbone.proc_memory_blocks.0.latent_attentions.1.linear3": 0,
+  "backbone.proc_embs_block.linear1": 37,
+  "models_clf.0.linear_1": 30,
+  "models_clf.0.linear_2": 0,
+  "backbone.proc_memory_blocks.0.cross_attention.attention": 0,
+  "backbone.proc_memory_blocks.0.latent_attentions.0.attention": 0,
+  "backbone.proc_memory_blocks.0.latent_attentions.1.attention": 0
+ },
+ "gelu_mult": {
+  "backbone.event_projection.seq_init.0": 1584453395,
+  "backbone.preproc_block_events.seq_init.0": 1746729489,
+  "backbone.proc_event_blocks.0.seq_init.1": 1907756668,
+  "backbone.proc_event_blocks.0.seq_init.4": 1,
+  "backbone.proc_memory_blocks.0.cross_attention.attention.out_proj": 1,
+  "backbone.proc_memory_blocks.0.cross_attention.linear1": 1,
+  "backbone.proc_memory_blocks.0.cross_attention.linear2": 1789551502,
+  "backbone.proc_memory_blocks.0.cross_attention.linear3": 1,
+  "backbone.proc_memory_blocks.0.latent_attentions.0.attention.out_proj": 1,
+  "backbone.proc_memory_blocks.0.latent_attentions.0.linear1": 1,
+  "backbone.proc_memory_blocks.0.latent_attentions.0.linear2": 1477962366,
+  "backbone.proc_memory_blocks.0.latent_attentions.0.linear3": 1,
+  "backbone.proc_memory_blocks.0.latent_attentions.1.attention.out_proj": 1,
+  "backbone.proc_memory_blocks.0.latent_attentions.1.linear1": 1,
+  "backbone.proc_memory_blocks.0.latent_attentions.1.linear2": 1461691334,
+  "backbone.proc_memory_blocks.0.latent_attentions.1.linear3": 1,
+  "backbone.proc_embs_block.linear1": 1521252343,
+  "models_clf.0.linear_1": 1113304845,
+  "models_clf.0.linear_2": 1,
+  "backbone.proc_memory_blocks.0.cross_attention.attention": 1,
+  "backbone.proc_memory_blocks.0.latent_attentions.0.attention": 1,
+  "backbone.proc_memory_blocks.0.latent_attentions.1.attention": 1
+ },
+ "gelu_target": {
+  "backbone.event_projection.seq_init.0": 0.08470916748046875,
+  "backbone.preproc_block_events.seq_init.0": 0.03841972351074219,
+  "backbone.proc_event_blocks.0.seq_init.1": 0.020563125610351562,
+  "backbone.proc_memory_blocks.0.cross_attention.linear2": 0.03750038146972656,
+  "backbone.proc_memory_blocks.0.latent_attentions.0.linear2": 0.045406341552734375,
+  "backbone.proc_memory_blocks.0.latent_attentions.1.linear2": 0.04591178894042969,
+  "backbone.proc_embs_block.linear1": 0.06214332580566406,
+  "models_clf.0.linear_1": 0.11533355712890625
+ },
+ "gelu_raw16": [
+  "backbone.proc_memory_blocks.0.cross_attention.linear1",
+  "backbone.proc_memory_blocks.0.latent_attentions.0.linear1",
+  "backbone.proc_memory_blocks.0.latent_attentions.1.linear1"
+ ],
+ "req2": [
+  "backbone.proc_event_blocks.0.seq_init.1",
+  "models_clf.0.linear_1"
+ ],
+ "mean_layer": "backbone.proc_embs_block.linear1",
+ "input_steps": {
+  "backbone.event_projection.seq_init.0": 0.03014659881591797,
+  "backbone.preproc_block_events.seq_init.0": 0.08470916748046875,
+  "backbone.proc_event_blocks.0.seq_init.1": 0.03841972351074219,
+  "backbone.proc_event_blocks.0.seq_init.4": 0.020563125610351562,
+  "backbone.proc_memory_blocks.0.cross_attention.attention.out_proj": 0.0576171875,
+  "backbone.proc_memory_blocks.0.cross_attention.linear1": 0.04224967956542969,
+  "backbone.proc_memory_blocks.0.cross_attention.linear2": 0.0717926025390625,
+  "backbone.proc_memory_blocks.0.cross_attention.linear3": 0.03750038146972656,
+  "backbone.proc_memory_blocks.0.latent_attentions.0.attention.out_proj": 0.030933380126953125,
+  "backbone.proc_memory_blocks.0.latent_attentions.0.linear1": 0.04145050048828125,
+  "backbone.proc_memory_blocks.0.latent_attentions.0.linear2": 0.07099533081054688,
+  "backbone.proc_memory_blocks.0.latent_attentions.0.linear3": 0.045406341552734375,
+  "backbone.proc_memory_blocks.0.latent_attentions.1.attention.out_proj": 0.039997100830078125,
+  "backbone.proc_memory_blocks.0.latent_attentions.1.linear1": 0.044376373291015625,
+  "backbone.proc_memory_blocks.0.latent_attentions.1.linear2": 0.0715484619140625,
+  "backbone.proc_memory_blocks.0.latent_attentions.1.linear3": 0.04591178894042969,
+  "backbone.proc_embs_block.linear1": 0.04070091247558594,
+  "models_clf.0.linear_1": 0.06214332580566406,
+  "models_clf.0.linear_2": 0.11533355712890625
+ },
+ "shifts": {
+  "backbone.event_projection.seq_init.0": 33,
+  "backbone.preproc_block_events.seq_init.0": 31,
+  "backbone.proc_event_blocks.0.seq_init.1": 39,
+  "backbone.proc_event_blocks.0.seq_init.4": 39,
+  "backbone.proc_memory_blocks.0.cross_attention.attention.out_proj": null,
+  "backbone.proc_memory_blocks.0.cross_attention.linear1": 33,
+  "backbone.proc_memory_blocks.0.cross_attention.linear2": 32,
+  "backbone.proc_memory_blocks.0.cross_attention.linear3": null,
+  "backbone.proc_memory_blocks.0.latent_attentions.0.attention.out_proj": null,
+  "backbone.proc_memory_blocks.0.latent_attentions.0.linear1": 33,
+  "backbone.proc_memory_blocks.0.latent_attentions.0.linear2": 32,
+  "backbone.proc_memory_blocks.0.latent_attentions.0.linear3": null,
+  "backbone.proc_memory_blocks.0.latent_attentions.1.attention.out_proj": null,
+  "backbone.proc_memory_blocks.0.latent_attentions.1.linear1": 33,
+  "backbone.proc_memory_blocks.0.latent_attentions.1.linear2": 33,
+  "backbone.proc_memory_blocks.0.latent_attentions.1.linear3": null,
+  "backbone.proc_embs_block.linear1": 40,
+  "models_clf.0.linear_1": 40,
+  "models_clf.0.linear_2": 42,
+  "backbone.proc_memory_blocks.0.cross_attention.attention": 39,
+  "backbone.proc_memory_blocks.0.latent_attentions.0.attention": 40,
+  "backbone.proc_memory_blocks.0.latent_attentions.1.attention": 40
+ },
+ "in_proj_bands": {
+  "backbone.proc_memory_blocks.0.cross_attention.attention": [
+   {
+    "name": "Q",
+    "rows": [
+     0,
+     128
+    ],
+    "input_step": 0.05388832092285156
+   },
+   {
+    "name": "K",
+    "rows": [
+     128,
+     256
+    ],
+    "input_step": 0.05562782287597656
+   },
+   {
+    "name": "V",
+    "rows": [
+     256,
+     384
+    ],
+    "input_step": 0.06233978271484375
+   }
+  ],
+  "backbone.proc_memory_blocks.0.latent_attentions.0.attention": [
+   {
+    "name": "Q",
+    "rows": [
+     0,
+     128
+    ],
+    "input_step": 0.06372833251953125
+   },
+   {
+    "name": "K",
+    "rows": [
+     128,
+     256
+    ],
+    "input_step": 0.05883979797363281
+   },
+   {
+    "name": "V",
+    "rows": [
+     256,
+     384
+    ],
+    "input_step": 0.03447151184082031
+   }
+  ],
+  "backbone.proc_memory_blocks.0.latent_attentions.1.attention": [
+   {
+    "name": "Q",
+    "rows": [
+     0,
+     128
+    ],
+    "input_step": 0.060047149658203125
+   },
+   {
+    "name": "K",
+    "rows": [
+     128,
+     256
+    ],
+    "input_step": 0.0569000244140625
+   },
+   {
+    "name": "V",
+    "rows": [
+     256,
+     384
+    ],
+    "input_step": 0.0428009033203125
+   }
+  ]
+ },
+ "bkv": {
+  "file": "bkv.bin",
+  "words": 24,
+  "order": "[block][k,v][head], lane = head_dim"
+ },
+ "latent_init": {
+  "file": "latinit.bin",
+  "shape": [
+   96,
+   128
+  ],
+  "words": 384
+ },
+ "pos_encoding": {
+  "shape": [
+   21,
+   21,
+   64
+  ],
+  "step": 0.08470916748046875,
+  "table_step": 0.010073184967041016,
+  "file": "posenc.int8.bin",
+  "pl_table": {
+   "file": "posmem.bin",
+   "rows": 441,
+   "feat": 64
+  }
+ },
+ "input_step": 0.03014659881591797
+}

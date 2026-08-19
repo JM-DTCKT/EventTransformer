@@ -1,0 +1,67 @@
+# -----------------------------------------------------------------------------
+# EvT (DVS128 제스처) FPGA 가속기 — 생성물은 추적하지 않습니다.
+# RTL · TB · TCL · SW · 메모리 이미지 · 골든 벡터는 추적합니다.
+# -----------------------------------------------------------------------------
+
+# --- Vivado 빌드 (build.tcl 로 재생성, 프로젝트 하나가 1.7 GB) ---
+build*/
+*.dcp
+*.bit
+*.ltx
+*.hwdef
+*.xsa
+.Xil/
+vivado*.jou
+vivado*.log
+*.backup.jou
+*.backup.log
+*.str
+*.pb
+.gen/
+.runs/
+.cache/
+.hw/
+.ip_user_files/
+
+# --- Synopsys VCS / Verdi (run_vcs.sh 산출물) ---
+tb/build/
+csrc/
+csrc_*/
+simv
+simv_*
+*.daidir/
+*.vdb/
+ucli.key
+vc_hdrs.h
+.vlogan*
+AN.DB/
+DVEfiles/
+verdiLog/
+novas.conf
+novas.rc
+*.fsdb
+*.vpd
+*.vcd
+*.wlf
+*.saif
+
+# --- 보드 페이로드 (sw/export_board_evt.py 로 재생성, 225 MB) ---
+#     amem_x 88M · amem_pin 97M · amem_pos 39M — GitHub 100MB 한도 초과
+data/board/*.bin
+
+# --- 보드 배포 묶음 (board/make_bundle.sh 로 재생성) ---
+*.tar.gz
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ipynb_checkpoints/
+
+# --- 에디터 / OS ---
+*~
+*.swp
+*.swo
+.DS_Store
+.vscode/
+.idea/
