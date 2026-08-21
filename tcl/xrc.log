@@ -1,0 +1,11 @@
+Thu Aug 20 16:44:18 2026: Server was asked to start on port: '45071'
+Thu Aug 20 16:44:18 2026: Server is using token UUID: 'e37193d4-1a3e-4651-9281-f8dfedc07f57'
+Thu Aug 20 16:44:18 2026: Attempting to start server on port '45071'
+Thu Aug 20 16:44:18 2026: XRC main fifo: created main fifo '/tmp/xrcmaine37193d4-1a3e-4651-9281-f8dfedc07f57', fd read = 11
+Thu Aug 20 16:44:18 2026: Running Rule Check Server
+Thu Aug 20 16:44:18 2026: Version 1.6.1
+Thu Aug 20 16:44:19 2026: Rule Check Server: Accepted socket connection from client
+Thu Aug 20 16:44:19 2026: EXCHANGE_TOKEN received, server token: e37193d4-1a3e-4651-9281-f8dfedc07f57, passed token: e37193d4-1a3e-4651-9281-f8dfedc07f57
+Thu Aug 20 17:29:32 2026: STOP_SERVER received, server token: e37193d4-1a3e-4651-9281-f8dfedc07f57, passed token: e37193d4-1a3e-4651-9281-f8dfedc07f57
+Thu Aug 20 17:29:32 2026: Socket received request to stop server.
+Thu Aug 20 17:29:32 2026: SERVER: destructor for server bound to port 45071

@@ -10,7 +10,7 @@ module tb_ln_wrap;
   wire [N*8-1:0] od;
   LayerNorm_Ev #(.N(N), .E(E), .AW(AW)) dut (
     .clk(clk), .rst(rst), .start(start), .done(done), .M(M),
-    .a_base(14'd0), .in_shift(6'sd0),
+    .a_base(14'd0), .in_shift(6'sd0), .in_q411(1'b0),
     .rd_en(rd_en), .rd_addr(rd_addr), .rd_data(rd_data),
     .p_addr(p_addr), .p_gamma(16'sd16384), .p_beta(16'sd0),   // gamma=1, beta=0
     .mult(32'sd1048576), .shift(6'd20),                        // x1 (Q4.11→그대로)

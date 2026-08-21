@@ -96,9 +96,9 @@ module EvT_Engine #(
     output wire [AW_S-1:0]      dbg_step,
 
     // ---- 실행 파라미터 ----
-    input  wire [AW_S-1:0]      n_body,        // 타임스텝당 step 수
-    input  wire [AW_S-1:0]      n_tail,        // 끝에 한 번 도는 step 수
-    input  wire [5:0]           n_time,        // 타임스텝 T
+    input  wire [AW_S-1:0]      n_body,        // 전처리 + Attention step 수
+    input  wire [AW_S-1:0]      n_tail,        // Classifier step 수
+    input  wire [5:0]           n_time,        // 타임스텝 T (Time-window)
     input  wire [31:0]          eps,           // LayerNorm eps (fp32 비트)
 
     // ---- 타임스텝 입력 요청 ----
@@ -526,23 +526,14 @@ module EvT_Engine #(
     wire [AW_A-1:0]  la_rd_addr;
 
     // ---- 입력 포맷 : bf16 이거나, Q4.11 **정수 코드** ----
-    // `layer_norm_2` 만 앞이 `linear1` 의 raw16 출력이라 정수입니다. bf16 은
-    // 지수만 빼면 되므로(정규화된 값의 가수는 그대로) 곱셈이 없습니다 —
-    // 2^-11 을 곱한 것과 **비트 단위로 같습니다.** 코드가 0 이면 지수도 0 이라
-    // 건드리면 안 됩니다.
-    wire [N*16-1:0] ln_rd_data;
-    genvar lc;
-    generate
-        for (lc = 0; lc < N; lc = lc + 1) begin : LNCONV
-            wire [15:0] c_bf;
-            Int32_To_Bf16 #(.IN_W(16)) u_lc (
-                .din(ar_data[lc*16 +: 16]), .bf16(c_bf));
-            wire [15:0] c_q411 = (c_bf[14:7] == 8'd0) ? 16'd0
-                               : {c_bf[15], c_bf[14:7] - 8'd11, c_bf[6:0]};
-            assign ln_rd_data[lc*16 +: 16] =
-                   q_flag2[0] ? c_q411 : ar_data[lc*16 +: 16];
-        end
-    endgenerate
+    // `layer_norm_2` 만 앞이 `linear1` 의 raw16 출력이라 정수입니다.
+    //
+    // 예전에는 여기서 레인마다 `Int32_To_Bf16` 으로 bf16 을 만들어 넣었습니다.
+    // 그러면 코어 안의 `bf16_to_fix` 와 합쳐져 **정규화 → 역정규화** 배럴 시프터
+    // 두 개가 한 사이클에 직렬로 놓입니다 (A_Mem BRAM -> x_p 8.475 ns).
+    // 지금은 코어가 `Q411_To_Fix` / `bf16_to_fix` 를 **병렬**로 두고 `in_q411` 로
+    // 고르므로, 엔진은 A_Mem 을 **그대로** 넘기고 포맷 비트만 알려 줍니다.
+    // 264 샘플 정확도는 양쪽 동일합니다 (오답 샘플 번호까지 같음).
 
     // 행타일 반복은 **래퍼가** 합니다 — 코어의 3단 Tile 파이프라인이 겹치려면
     // 타일을 끊지 않고 연달아 밀어야 하기 때문입니다. 그래서 엔진의 `ln_mt`
@@ -550,7 +541,8 @@ module EvT_Engine #(
     LayerNorm_Ev #(.N(N), .E(E), .DIM_W(DIM_W), .AW(AW_A), .XSW(6)) u_ln (
         .clk(clk), .rst(rst), .start(ln_start), .done(ln_done),
         .M(q_M), .a_base(q_AIN), .in_shift($signed(q_gsh)),
-        .rd_en(la_rd_en), .rd_addr(la_rd_addr), .rd_data(ln_rd_data),
+        .rd_en(la_rd_en), .rd_addr(la_rd_addr), .rd_data(ar_data),
+        .in_q411(q_flag2[0]),
         .p_addr(ln_paddr), .p_gamma(pg_gamma), .p_beta(pg_beta),
         .mult(pb_mult_q), .shift(q_sh),
         .out_valid(ln_ov), .out_mt(ln_mt_o), .out_k(ln_k), .out_data(ln_out));
@@ -610,9 +602,9 @@ module EvT_Engine #(
     genvar rg;
     generate
         for (rg = 0; rg < N; rg = rg + 1) begin : RESLANE
-            wire signed [15:0] ra_c = rs_a[rg*16 +: 16];
-            wire signed [15:0] rb_c = ar_data[rg*16 +: 16];
-            wire signed [31:0] rq_acc = $signed(ra_c) * $signed({1'b0, q_PB})
+            wire signed [15:0] ra_c = rs_a[rg*16 +: 16]; // 피연산자 A
+            wire signed [15:0] rb_c = ar_data[rg*16 +: 16]; // 피연산자 B (From A_Mem)
+            wire signed [31:0] rq_acc = $signed(ra_c) * $signed({1'b0, q_PB}) // q_PB, q_OSTR : dequant scale factor
                                       + $signed(rb_c) * $signed({1'b0, q_OSTR});
             wire [15:0] rq_bf_raw;
             Int32_To_Bf16 #(.IN_W(32)) u_rqb (.din(rq_acc), .bf16(rq_bf_raw));
@@ -827,7 +819,7 @@ module EvT_Engine #(
                 // 이 타임스텝의 X/PIN 이 채워지기를 기다립니다
                 S_TLOAD: begin
                     tok_req <= 1'b1;
-                    if (tok_ack) begin
+                    if (tok_ack) begin // PS에서 write 완료
                         tok_req <= 1'b0;
                         n_tok   <= tok_rd_n;
                         st      <= S_FETCH;

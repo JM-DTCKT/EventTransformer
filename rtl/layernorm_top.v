@@ -107,6 +107,8 @@ module layernorm_top #(
     output                       in_ready,
     input       [LANE*16-1:0]    in_col,     // BF16 x LANE (행 r = in_col[r*16 +: 16])
     input  signed [XSW-1:0]      in_shift,   // 이 Tile 의 고정소수점 창 이동 (첫 beat 에서 래치)
+    input                        in_q411,    // 이 Tile 의 입력 포맷 : 1=Q4.11 코드, 0=bf16
+                                             //   (첫 beat 에서 래치, in_shift 와 같은 규약)
     // ---- 출력 : 매 clk 한 열(LANE원소), D 회 ----
     output reg                   out_valid,
     output reg  [LANE*OW-1:0]    out_col,    // signed Q4.11 x LANE
@@ -187,6 +189,7 @@ module layernorm_top #(
     reg  signed [SXW-1:0] sum_x  [0:NB-1][0:LANE-1];   // sum X   (= mu),  S1 -> S2,**S3**
     reg  [SQW-1:0]        sum_x2  [0:NB2-1][0:LANE-1];  // sum X*X,          S1 -> S2 뿐
     reg  signed [XSW-1:0] xshift_slot   [0:NB-1];             // Tile 별 고정소수점 창
+    reg                   q411_slot     [0:NB-1];             // Tile 별 입력 포맷 (S3 에서도 씀)
     // sum_x2 는 S2 에서 소비가 끝나므로 수명이 S1+S2 = 166 clk (< 2P) -> 슬롯 2개면 된다.
     // 슬롯 수가 다르므로 mod-2 전용 포인터를 따로 돌린다 (slot_recv/slot_stat 와 같은 시점에 토글).
     reg  x2_wslot, x2_rslot;
@@ -201,15 +204,29 @@ module layernorm_top #(
 
     // 첫 beat 에서는 포트값을, 이후에는 래치된 값을 쓴다
     wire signed [XSW-1:0] xshift_cur = recv_first ? in_shift : xshift_slot[slot_recv];
+    wire                  q411_cur   = recv_first ? in_q411  : q411_slot[slot_recv];
 
     wire signed [IW-1:0]  x_cvt     [0:LANE-1];
     wire [LANE-1:0]       x_cvt_ovf;
     wire [SQW-1:0]        x_cvt_sq_p [0:LANE-1];   // x_p 기준 (1단 늦음)
     generate
         for (gl = 0; gl < LANE; gl = gl + 1) begin : g_rx
+            // 입력 포맷 두 갈래를 **병렬**로 변환하고 마지막에 고릅니다.
+            //   예전에는 `EvT_Engine` 이 `Int32_To_Bf16` 으로 Q4.11 을 bf16 으로
+            //   올려서 넣었고, 그러면 정규화(LZC+좌시프트) 와 역정규화(우시프트)
+            //   가 한 사이클에 **직렬**로 놓였습니다 — A_Mem BRAM -> x_p 8.475 ns
+            //   (150 MHz 에서 -2.208 ns) 의 원인입니다.  각자 Q(IW-1-IF).IF 까지
+            //   가서 mux 로 합치면 깊이가 절반이 됩니다.
+            wire signed [IW-1:0] xc_bf, xc_q4;
+            wire                 ov_bf, ov_q4;
             bf16_to_fix #(.IW(IW), .IF(IF), .XSW(XSW)) u_cvt (
                 .bf(in_col[gl*16 +: 16]), .xsh(xshift_cur),
-                .x(x_cvt[gl]), .ovf(x_cvt_ovf[gl]));
+                .x(xc_bf), .ovf(ov_bf));
+            Q411_To_Fix #(.IW(IW), .IF(IF), .QF(11), .XSW(XSW)) u_cvt_q (
+                .code(in_col[gl*16 +: 16]), .xsh(xshift_cur),
+                .x(xc_q4), .ovf(ov_q4));
+            assign x_cvt[gl]     = q411_cur ? xc_q4 : xc_bf;
+            assign x_cvt_ovf[gl] = q411_cur ? ov_q4 : ov_bf;
             // X*X : X 가 대칭포화(|X| <= 2^23-1)라 곱은 항상 2^46 미만 -> 정확
             //  **등록된 x_p 를 쓴다** — DSP48 의 A/B 입력 레지스터로 흡수되어
             //  곱셈이 파이프라인 한 단을 통째로 차지하게 된다.
@@ -224,8 +241,10 @@ module layernorm_top #(
             slot_recv <= {NBW{1'b0}};
             x2_wslot   <= 1'b0;
             for (i = 0; i < NB; i = i + 1) xshift_slot[i] <= {XSW{1'b0}};
+            for (i = 0; i < NB; i = i + 1) q411_slot[i]   <= 1'b0;
         end else if (recv_hs) begin
             if (recv_first) xshift_slot[slot_recv] <= in_shift;
+            if (recv_first) q411_slot[slot_recv]   <= in_q411;
             recv_col <= recv_col + 1'b1;
             if (recv_last) begin
                 recv_col   <= {DLOG{1'b0}};
@@ -418,10 +437,17 @@ module layernorm_top #(
     generate
         for (gl = 0; gl < LANE; gl = gl + 1) begin : g_norm
             // ---- B1 : 재변환 + mu 뺄셈 ------------------------------------
-            wire signed [IW-1:0]  xo;
+            // xbuf 는 **원본 포맷 그대로** 담으므로 S3 도 같은 분기가 필요합니다.
+            wire signed [IW-1:0]  xo_bf, xo_q4;
+            wire                  ovb, ovq;
             bf16_to_fix #(.IW(IW), .IF(IF), .XSW(XSW)) u_cvt (
                 .bf(sram_rd[gl*16 +: 16]), .xsh(xshift_slot[slot_norm]),
-                .x(xo), .ovf(xo_ovf[gl]));
+                .x(xo_bf), .ovf(ovb));
+            Q411_To_Fix #(.IW(IW), .IF(IF), .QF(11), .XSW(XSW)) u_cvt_q (
+                .code(sram_rd[gl*16 +: 16]), .xsh(xshift_slot[slot_norm]),
+                .x(xo_q4), .ovf(ovq));
+            wire signed [IW-1:0]  xo = q411_slot[slot_norm] ? xo_q4 : xo_bf;
+            assign xo_ovf[gl] = q411_slot[slot_norm] ? ovq : ovb;
             // d = x - mu 를 Q(MUF) 로 맞춘다 : (X << DLOG) - SX
             wire signed [DDW-1:0] x_aligned = {{(DDW-IW-DLOG){xo[IW-1]}}, xo, {DLOG{1'b0}}};
             wire signed [DDW-1:0] mu_aligned  = {{(DDW-SXW){sum_x[slot_norm][gl][SXW-1]}},

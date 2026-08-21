@@ -44,6 +44,7 @@ module LayerNorm_Ev #(
     input  wire [DIM_W-1:0]     M,          // 행 수 (32 의 배수가 아니어도 됨)
     input  wire [AW-1:0]        a_base,
     input  wire signed [XSW-1:0] in_shift,
+    input  wire                  in_q411,    // 1 = rd_data 가 Q4.11 정수 코드, 0 = bf16
 
     // A_Mem 읽기 (bf16 x N)
     output wire                 rd_en,
@@ -129,7 +130,7 @@ module LayerNorm_Ev #(
     u_core (
         .clk(clk), .rst_n(~rst),
         .in_valid(rd_v), .in_ready(core_iready),
-        .in_col(rd_data), .in_shift(in_shift),
+        .in_col(rd_data), .in_shift(in_shift), .in_q411(in_q411),
         .out_valid(core_ov), .out_col(core_ocol), .out_last(core_olast),
         .ovf());
 
