@@ -15,7 +15,7 @@
 // -----------------------------------------------------------------------------
 `timescale 1ns/1ps
 module tb_evt_t;
-  localparam N=32, AW_A=14, AW_W=14, AW_S=8, DIM_W=16;
+  localparam N=32, AW_A=13, AW_W=14, AW_S=8, DIM_W=16;
   localparam TTM = 4;                       // 최악치 타일 수 (TOK_MAX=128)
   localparam T = 20, EXP_CLASS = 9;
   localparam R_X=0, R_PIDX=576, R_PIN=580, R_LATV=2756,

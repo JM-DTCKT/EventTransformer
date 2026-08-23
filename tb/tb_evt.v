@@ -21,7 +21,7 @@
 // -----------------------------------------------------------------------------
 `timescale 1ns/1ps
 module tb_evt;
-  localparam N=32, AW_A=14, AW_W=14, AW_S=8, DIM_W=16;
+  localparam N=32, AW_A=13, AW_W=14, AW_S=8, DIM_W=16;
   localparam NTOK = 52, TT = 2, QT = 3, HD = 32, HEADS = 4;
   localparam KSTR = 160, VSTR = 129;          // head 간 간격 (schedule_evt.py)
   // 영역 베이스 — `data/schedule.json` 과 한 벌

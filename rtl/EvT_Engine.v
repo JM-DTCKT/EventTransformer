@@ -77,7 +77,12 @@ module EvT_Engine #(
     parameter HD     = 32,
     parameter TOKMAX = 128,
     parameter AW_W   = 14,       // W_Mem 워드 주소폭 (14,000 워드)
-    parameter AW_A   = 14,       // A_Mem  (8,261 워드)
+    // A_Mem 실사용은 `schedule.json` 의 a_words = 7,649 워드입니다 (마지막 영역
+    // FFN base 7,265 + 384).  2^13 = 8,192 이므로 13비트로 충분하고, 여유는
+    // 543 워드(7 %) 입니다 — 영역을 더 늘릴 때 `schedule_evt.py` 에서 상한을
+    // 확인하십시오.  14 였을 때는 BRAM 깊이가 16,384 라 절반이 놀았고,
+    // 깊이 캐스케이드도 4단이라 읽기에 1.691 ns 가 들었습니다 (2단이면 1.187).
+    parameter AW_A   = 13,       // A_Mem  (7,649 워드 사용)
     parameter AW_PB  = 10,       // PB_Mem (860 워드)
     parameter AW_PG  = 8,        // PG_Mem (208 워드)
     parameter AW_S   = 8,        // Step_Mem (155 워드)
@@ -408,7 +413,8 @@ module EvT_Engine #(
     //   3단이 됐습니다 (`Requant_Int.v` 머리말 참조). 여기 숫자를 같이 안 고치면
     //   쓰기 주소가 데이터보다 빨라 **한 컬럼씩 밀려 저장**됩니다.
     // (`fpga_nl` 에서 여기를 뭉뚱그려 첫 워드가 안 써지는 버그가 있었습니다)
-    localparam CP_LAT_B = 1, CP_LAT_S = 3, CP_LAT_G = 9, CP_LAT_R = 6;
+    // CP_LAT_B : bf16 은 `Requant_Bf16` 이 곱 뒤를 끊어 **2단** 입니다 (예전 1단).
+    localparam CP_LAT_B = 2, CP_LAT_S = 3, CP_LAT_G = 9, CP_LAT_R = 6;
     localparam CP_LAT_MAX = CP_LAT_G;
     reg [DIM_W-1:0] nq [0:CP_LAT_MAX-1];
     reg [DIM_W-1:0] mq [0:CP_LAT_MAX-1];
@@ -606,8 +612,16 @@ module EvT_Engine #(
             wire signed [15:0] rb_c = ar_data[rg*16 +: 16]; // 피연산자 B (From A_Mem)
             wire signed [31:0] rq_acc = $signed(ra_c) * $signed({1'b0, q_PB}) // q_PB, q_OSTR : dequant scale factor
                                       + $signed(rb_c) * $signed({1'b0, q_OSTR});
+            // 곱·덧셈 뒤에서 한 단 끊습니다.  예전에는 아래 `rq_d1`/`rq_d2` 로
+            // **뒤에서** 두 단을 늦췄는데, 그러면 `ar_data → 곱셈2+덧셈 → 32b LZC
+            // ·정규화 → 지수` 가 통째로 ph3 한 사이클에 들어갑니다 (150 MHz 에서
+            // 최악 경로였습니다).  단수(2단)와 ph5 쓰기 시점은 그대로이고 레지스터
+            // 위치만 앞으로 옮긴 것이라 `Fp32_Add`(2단) 와의 정렬이 안 깨집니다.
+            reg signed [31:0] rq_acc_q;
+            always @(posedge clk) rq_acc_q <= rq_acc;
+
             wire [15:0] rq_bf_raw;
-            Int32_To_Bf16 #(.IN_W(32)) u_rqb (.din(rq_acc), .bf16(rq_bf_raw));
+            Int32_To_Bf16 #(.IN_W(32)) u_rqb (.din(rq_acc_q), .bf16(rq_bf_raw));
             wire [15:0] rq_bf = (rq_bf_raw[14:7] == 8'd0) ? 16'd0
                               : {rq_bf_raw[15], rq_bf_raw[14:7] - RSH[7:0],
                                  rq_bf_raw[6:0]};
@@ -620,11 +634,11 @@ module EvT_Engine #(
                            .out_valid(), .y(sf));
             wire [15:0] sb;
             Fp32_To_Bf16 u_rc (.f(sf), .log2e(6'd0), .y(sb));
-            // 정수 경로는 조합이라 ph3 에 확정됩니다. bf16 경로(Fp32_Add 2단)와
-            // 쓰기 시점(ph5)을 맞추기 위해 두 단 늦춥니다.
-            reg [15:0] rq_d1, rq_d2;
-            always @(posedge clk) begin rq_d1 <= rq_bf; rq_d2 <= rq_d1; end
-            assign rs_sum[rg*16 +: 16] = res_q ? rq_d2 : sb;
+            // 정수 경로는 ph3(곱·덧셈) + ph4(정규화) 로 2단입니다. bf16 경로
+            // (Fp32_Add 2단)와 쓰기 시점(ph5)이 그대로 맞습니다.
+            reg [15:0] rq_d1;
+            always @(posedge clk) rq_d1 <= rq_bf;
+            assign rs_sum[rg*16 +: 16] = res_q ? rq_d1 : sb;
         end
     endgenerate
 
@@ -651,7 +665,14 @@ module EvT_Engine #(
                 mn_lane_sum = mn_lane_sum + $signed(ar_data[mz*16 +: 16]);
     end
     wire signed [47:0] mn_prod = $signed(mn_acc) * $signed(g_mult_q);
-    wire signed [47:0] mn_rnd  = mn_prod + (48'sd1 <<< (q_gsh - 1));
+    // 곱 뒤에서 한 단 끊습니다 (DSP48E2 의 P 레지스터로 흡수).  예전에는
+    // `mn_acc → 곱(DSP 2개) → 48b 반올림 가산 → 가변 시프트 → 포화 → A_Mem 쓰기`
+    // 가 통째로 ph2 한 사이클이라 150 MHz 의 최악 경로였습니다 (6.837 ns).
+    // 페이즈를 하나 늘려(ph3) 쓰기를 한 칸 미룹니다 — 특징당 1사이클 증가라
+    // 전체 165만 사이클에서 128 사이클(0.008 %) 뿐입니다.
+    reg  signed [47:0] mn_prod_q;
+    always @(posedge clk) mn_prod_q <= mn_prod;
+    wire signed [47:0] mn_rnd  = mn_prod_q + (48'sd1 <<< (q_gsh - 1));
     wire signed [47:0] mn_sh   = mn_rnd >>> q_gsh;
     wire signed [7:0]  mn_out  = (mn_sh >  127) ?  8'sd127
                                : (mn_sh < -128) ? -8'sd128 : mn_sh[7:0];
@@ -758,7 +779,7 @@ module EvT_Engine #(
                 K_MEAN: begin
                     ar_en   = mn_run;
                     ar_addr = q_AIN + mn_mt * q_K[AW_A-1:0] + mn_k[AW_A-1:0];
-                    if (mn_run && mn_ph == 2'd2) begin
+                    if (mn_run && mn_ph == 2'd3) begin
                         a_we_en   = 1'b1;
                         a_we_addr = q_AOUT + mn_k[AW_A-1:0];
                         a_we_data = {{(N-1)*16{1'b0}}, {{8{mn_out[7]}}, mn_out}};
@@ -914,6 +935,9 @@ module EvT_Engine #(
                             mn_acc <= mn_acc + mn_lane_sum;
                             if (mn_mt == ln_mt_last) mn_ph <= 2'd2;
                             else begin mn_mt <= mn_mt + 1'b1; mn_ph <= 2'd0; end
+                        end else if (mn_ph == 2'd2) begin
+                            // 최종 mn_acc 의 곱이 mn_prod_q 에 잡히는 사이클
+                            mn_ph <= 2'd3;
                         end else begin
                             mn_ph <= 2'd0; mn_mt <= 0; mn_acc <= 0;
                             if (mn_k == q_K - 1) begin

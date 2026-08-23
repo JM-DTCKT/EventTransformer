@@ -65,3 +65,6 @@ __pycache__/
 .DS_Store
 .vscode/
 .idea/
+
+# --- Vitis / Eclipse 워크스페이스 (SDK가 재생성, 174 MB) ---
+workspace/

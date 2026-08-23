@@ -54,7 +54,7 @@ module Evt_Accel #(
     parameter PSUM_W = 32,
     parameter DIM_W  = 16,
     parameter AW_W   = 14,
-    parameter AW_A   = 14,
+    parameter AW_A   = 13,       // A_Mem 깊이 2^13 = 8,192 (실사용 7,649)
     parameter AW_PB  = 10,
     parameter AW_PG  = 8,
     parameter AW_S   = 8,

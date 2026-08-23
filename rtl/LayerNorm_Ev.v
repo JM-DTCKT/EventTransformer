@@ -94,6 +94,8 @@ module LayerNorm_Ev #(
     assign rd_addr_w = a_base + rmt * E[AW-1:0] + rk[AW-1:0];
 
     reg stall_err;
+    reg [N*16-1:0] rd_data_q;
+    reg            rd_v_q;
     // `rrun` 은 **마지막 주소를 낸 순간** 내려가는데 `done` 은 출력이 5단 뒤라
     // 아직 0 입니다. 그 사이에 `start` 가 계속 1 이면 같은 step 이 **다시
     // 시작**합니다 (399 열이 나왔습니다). 한 번 걸면 `start` 가 내려갈 때까지
@@ -102,11 +104,20 @@ module LayerNorm_Ev #(
     always @(posedge clk) begin
         if (rst) begin
             rmt <= 0; rk <= 0; rrun <= 1'b0; rd_v <= 1'b0; stall_err <= 1'b0;
+            rd_v_q <= 1'b0;
             armed <= 1'b0;
         end else begin
             if (!start) armed <= 1'b0;
             rd_v <= rd_en_w;                     // A_Mem 1사이클 뒤 데이터
-            if (rd_v && !core_iready) stall_err <= 1'b1;   // 있으면 안 되는 일
+            // ---- 코어 입력 파이프 한 단 ----
+            // A_Mem BRAM 출력 → (깊이 캐스케이드 + 팬아웃 98 배선) → 코어의
+            // `bf16_to_fix`/`Q411_To_Fix` → 첫 파이프 레지스터가 한 사이클이라
+            // 150 MHz 에서 7.246 ns 였습니다.  여기서 끊으면 BRAM·배선(2.7 ns)과
+            // 포맷 변환(4.5 ns)이 갈립니다.  값은 안 바뀌고 LN step 당 1사이클만
+            // 늘어납니다 (13 step x 20 타임스텝 = 241 사이클/샘플, 0.015 %).
+            rd_v_q    <= rd_v;
+            rd_data_q <= rd_data;
+            if (rd_v_q && !core_iready) stall_err <= 1'b1;  // 있으면 안 되는 일
 
             if (start && !armed) begin
                 rmt <= 0; rk <= 0; rrun <= 1'b1; armed <= 1'b1;
@@ -129,8 +140,8 @@ module LayerNorm_Ev #(
     layernorm_top #(.LANE(N), .D(E), .DLOG(7), .XSW(XSW), .SRAM_LAT(1), .NB(3))
     u_core (
         .clk(clk), .rst_n(~rst),
-        .in_valid(rd_v), .in_ready(core_iready),
-        .in_col(rd_data), .in_shift(in_shift), .in_q411(in_q411),
+        .in_valid(rd_v_q), .in_ready(core_iready),
+        .in_col(rd_data_q), .in_shift(in_shift), .in_q411(in_q411),
         .out_valid(core_ov), .out_col(core_ocol), .out_last(core_olast),
         .ovf());
 
