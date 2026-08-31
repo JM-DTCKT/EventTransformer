@@ -14,10 +14,7 @@ module tb_evt_compile;
   reg dbg_rd_en=0; reg [AW_A-1:0] dbg_rd_addr=0; wire [N*16-1:0] dbg_rd_data;
 
   EvT_Engine #(.N(N), .AW_A(AW_A), .AW_W(AW_W), .AW_S(AW_S),
-               .GELU_LUT_FILE("../../nl_export/lut/gelu.hex"),
-               .EXP_LUT_FILE ("../../nl_export/lut/exp.hex"),
-               .RCP_LUT_FILE ("../../nl_export/lut/recip.hex"),
-               .RSQRT_LUT_FILE("../../nl_export/lut/rsqrt.hex")) dut (
+               .GELU_LUT_FILE("../../nl_export/lut/gelu.hex")) dut (
     .clk(clk), .rst(rst), .start(start), .done(done), .busy(busy),
     .dbg_state(dbg_state), .dbg_step(dbg_step),
     .n_body(n_body), .n_tail(n_tail), .n_time(n_time), .eps(eps),

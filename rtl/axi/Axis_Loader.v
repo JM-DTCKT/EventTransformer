@@ -1,31 +1,31 @@
 // -----------------------------------------------------------------------------
-// Axis_Loader_Nl : AXI-Stream(128b) → 온칩 메모리 순차 적재 (목적지마다 폭이 다름)
+// Axis_Loader : AXI-Stream(128b) → 온칩 메모리 순차 적재
 //
-// `fpga/Axis_Loader` 는 메모리 폭이 하나(256b)라 워드당 비트 수가 파라미터로
-// 고정이었습니다. 여기는 **A_Mem 만 512b** 이고 나머지는 256b 입니다:
+// `fpga_nl/Axis_Loader_Nl` 과 같은 일을 하되 **목적지가 하나 늘었습니다** —
+// step 프로그램(Step_Mem)도 DMA 로 넣습니다. `fpga_nl` 은 step 이 12개뿐이라
+// AXI-Lite 레지스터 파일에 담았지만, 여기는 **122 step x 32바이트 = 3.9 KB** 라
+// 레지스터로 넣으면 쓰기가 976번입니다.
 //
 //   sel 0 W_Mem   256b → 2 beat/word
-//   sel 1 A_Mem   512b → 4 beat/word      ← 32레인 x 16b (int8/bf16 공용)
-//   sel 2 PB_Mem  256b → 2 beat/word
-//   sel 3 PG_Mem  256b → 2 beat/word
+//   sel 1 A_Mem   512b → 4 beat/word      ← 32레인 x 16b (int8/bf16/Q4.11 공용)
+//   sel 2 PB_Mem  256b → 2 beat
+//   sel 3 PG_Mem  256b → 2 beat
+//   sel 4 Step_Mem 256b → 2 beat
+//   sel 5 POS 표   512b → 4 beat      ← 21x21 행 x 64특징 (Pos_Gather 안)
 //
-// 그래서 워드당 비트 수를 **arm 시점의 sel 로 결정**합니다. 그 외에는 원본과
-// 같습니다 — 스트림 바이트 순서가 곧 메모리 이미지이고, 재배치는 전부
-// `sw/pack_nl.py` 가 미리 해 둡니다.
-//
-// 256b 목적지일 때 상위 256b 는 그대로 흘려보냅니다 (FFN_Engine 이 하위만 씀).
-// tready 는 항상 1 — 목적지가 BRAM 이고 2~4비트당 1워드라 백프레셔가 없습니다.
+// 스트림 바이트 순서가 곧 메모리 이미지입니다 — 재배치는 전부 `sw/pack_evt.py`
+// 와 `sw/schedule_evt.py` 가 미리 해 둡니다. tready 는 항상 1 (목적지가 BRAM).
 // -----------------------------------------------------------------------------
-module Axis_Loader_Nl #(
+module Axis_Loader #(
     parameter SW = 128,          // 스트림 폭
     parameter DW = 512,          // 가장 넓은 메모리 (A_Mem)
-    parameter AW = 13            // 가장 큰 메모리의 워드 주소폭 (W_Mem)
+    parameter AW = 14            // 가장 큰 메모리의 워드 주소폭
 )(
     input  wire            clk,
     input  wire            rst,
 
     input  wire            arm,           // 1클럭 펄스: sel/base 를 잡고 카운터 리셋
-    input  wire [1:0]      arm_sel,
+    input  wire [2:0]      arm_sel,
     input  wire [AW-1:0]   arm_base,
 
     input  wire            s_tvalid,
@@ -34,11 +34,12 @@ module Axis_Loader_Nl #(
     input  wire            s_tlast,
 
     output reg             ld_we,
-    output reg  [1:0]      ld_sel,
+    output reg  [2:0]      ld_sel,
     output reg  [AW-1:0]   ld_addr,
     output reg  [DW-1:0]   ld_data,
 
-    output reg  [AW-1:0]   words_written
+    output reg  [AW-1:0]   words_written,
+    output wire            busy
 );
     assign s_tready = 1'b1;
 
@@ -46,12 +47,15 @@ module Axis_Loader_Nl #(
     reg [1:0]    phase;
     reg [AW-1:0] wptr;
     reg [DW-1:0] sh;
+    reg          armed;
+
+    assign busy = armed;
 
     always @(posedge clk) begin
         if (rst) begin
-            ld_we <= 1'b0; ld_sel <= 2'd0; ld_addr <= {AW{1'b0}};
+            ld_we <= 1'b0; ld_sel <= 3'd0; ld_addr <= {AW{1'b0}};
             ld_data <= {DW{1'b0}}; phase <= 2'd0; wptr <= {AW{1'b0}};
-            last_beat <= 2'd1; words_written <= {AW{1'b0}};
+            last_beat <= 2'd1; words_written <= {AW{1'b0}}; armed <= 1'b0;
         end else begin
             ld_we <= 1'b0;
 
@@ -59,8 +63,10 @@ module Axis_Loader_Nl #(
                 ld_sel        <= arm_sel;
                 wptr          <= arm_base;
                 phase         <= 2'd0;
-                last_beat     <= (arm_sel == 2'd1) ? 2'd3 : 2'd1;
+                // A_Mem(1) 과 POS 표(5) 만 512b — 나머지는 256b
+                last_beat     <= (arm_sel == 3'd1 || arm_sel == 3'd5) ? 2'd3 : 2'd1;
                 words_written <= {AW{1'b0}};
+                armed         <= 1'b1;
             end else if (s_tvalid) begin
                 // 하위 비트가 먼저 옵니다 — 오른쪽으로 밀어 넣습니다.
                 sh <= {s_tdata, sh[DW-1:SW]};
@@ -79,7 +85,10 @@ module Axis_Loader_Nl #(
                 end
             end
 
-            if (s_tvalid && s_tlast) phase <= 2'd0;   // 워드 경계가 안 맞으면 버림
+            if (s_tvalid && s_tlast) begin
+                phase <= 2'd0;          // 워드 경계가 안 맞으면 버립니다
+                armed <= 1'b0;
+            end
         end
     end
 endmodule

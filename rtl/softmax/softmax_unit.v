@@ -1,5 +1,5 @@
 // ============================================================================
-//  softmax_top.v    --  32행 Tile 단위 T-축 softmax  (Q6.9 in / signed Q1.14 out)
+//  softmax_unit.v    --  32행 Tile 단위 T-축 softmax  (Q6.9 in / signed Q1.14 out)
 // ----------------------------------------------------------------------------
 //  attention 의 QK^T 결과 (Tile_M x T) 에 대해 **T 축(키 축)** 으로 softmax 한다.
 //  Tensor Core 출력을 **열 단위(32원소)** 로 받아 32 x T Tile 을 모으고,
@@ -72,7 +72,7 @@
 // ============================================================================
 `timescale 1ns/1ps
 
-module softmax_top #(
+module softmax_unit #(
     parameter integer Tile_M = 32,   // Tile 행 수 (= Tensor Core 타일 행 수)
     parameter integer TMAX   = 324,  // 최대 T (정규화 축 길이)
     parameter integer DW     = 16,   // 입력 원소 폭 (signed Q6.9)
@@ -212,7 +212,7 @@ module softmax_top #(
     // **뱅크 차원을 주소로 펴 둡니다.** `[0:1][0:TMAX-1]` 처럼 2차원으로 두면
     // Vivado 가 3D-RAM 으로 보고 BRAM 추론을 포기해 **FF 132,096개**로 깔립니다
     // (Synth 8-11357). 그러면 배선이 혼잡도 6 으로 실패합니다.
-    // `layernorm_top` 의 `xbuf [0:NB*D-1]` 과 같은 형태입니다.
+    // `layernorm_unit` 의 `xbuf [0:NB*D-1]` 과 같은 형태입니다.
     // 주소를 `{뱅크, 열}` 로 이으므로 깊이는 2^(TW+1) 입니다 (TMAX 가 2의
     // 거듭제곱이 아니면 남는 자리가 생기지만 BRAM 한 벌 안이라 무해합니다).
     reg [Tile_M*DW-1:0] xbuf [0:(2<<TW)-1];     // 입력 Tile
@@ -425,9 +425,9 @@ module softmax_top #(
 
     // ---- 파라미터 정합성 체크 (합성 무관) ---------------------------------
     initial begin
-        if (SH_OFF < 1)   $display("ERROR: softmax_top RF(%0d) must be > OF(%0d)", RF, OF);
-        if (SW < EF + TW) $display("ERROR: softmax_top SW too small");
-        if (EW != EF+1)   $display("ERROR: softmax_top EW must be EF+1");
-        if (RW != RF+1)   $display("ERROR: softmax_top RW must be RF+1");
+        if (SH_OFF < 1)   $display("ERROR: softmax_unit RF(%0d) must be > OF(%0d)", RF, OF);
+        if (SW < EF + TW) $display("ERROR: softmax_unit SW too small");
+        if (EW != EF+1)   $display("ERROR: softmax_unit EW must be EF+1");
+        if (RW != RF+1)   $display("ERROR: softmax_unit RW must be RF+1");
     end
 endmodule

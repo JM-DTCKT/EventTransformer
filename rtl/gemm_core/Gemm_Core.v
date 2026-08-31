@@ -1,5 +1,5 @@
 // -----------------------------------------------------------------------------
-// Gemm_Core_Ev : EvT 용 GEMM 코어 — C = A · B  (output-stationary, 32x32 systolic)
+// Gemm_Core : EvT 용 GEMM 코어 — C = A · B  (output-stationary, 32x32 systolic)
 //
 // `fpga_nl/Gemm_Core16` 과 **연산은 완전히 동일**합니다. 딱 하나가 다릅니다:
 // B 피연산자의 출처를 코어가 정하지 않고 **주소만 내보냅니다.**
@@ -33,17 +33,17 @@
 // ## 부호
 //
 // ③의 A 는 softmax 출력 uint8 [0,127] 입니다. 이 구간에서는 int8 해석과 값이
-// 같으므로 `PE_OS`(signed x signed)를 그대로 씁니다 — 별도 unsigned 곱셈기가
+// 같으므로 `PE_OS_Pp`(signed x signed)를 그대로 씁니다 — 별도 unsigned 곱셈기가
 // 필요 없습니다.
 //
 // ## M > 32
 //
-// 토큰 최대 123(4타일), latent 96(3타일)이라 행 타일링이 필수입니다. `Tile_Ctrl`
-// 이 이미 `mt` 를 내므로 코어는 손댈 게 없고, **소비자가 `col_mt` 로 행 타일을
+// 토큰 최대 123(4타일), latent 96(3타일)이라 행 타일링이 필수입니다. 아래 순서기
+// 가 이미 `mt` 를 내므로 코어는 손댈 게 없고, **소비자가 `col_mt` 로 행 타일을
 // 구분해 되쓰기만** 하면 됩니다 (MLP 프로젝트에서 argmax 가 이걸 안 해서 M>32 를
 // 못 썼던 것이지, 코어의 한계가 아니었습니다).
 // -----------------------------------------------------------------------------
-module Gemm_Core_Ev #(
+module Gemm_Core #(
     parameter N      = 32,
     parameter ACT_W  = 8,
     parameter PSUM_W = 32,
@@ -131,10 +131,10 @@ module Gemm_Core_Ev #(
     // `mt_prev`/`nt_prev`(직전 타일)을 쓰고, 마지막 타일을 위해 꼬리에서 주기를
     // 한 번 더 돕니다.
     //
-    // ## `Tile_Ctrl` 을 안 씁니다
+    // ## 공용 타일 순서기를 안 씁니다
     //
-    // `../../fpga/rtl/Tile_Ctrl.v` 는 공유 파일이고 `CLR→STREAM→RD→NEXT` 라
-    // 타일이 겹칠 수 없습니다. 여기서만 쓰는 순서기를 직접 둡니다 (공유 파일 무변경).
+    // 예전 공용 순서기는 `CLR→STREAM→RD→NEXT` 라 타일이 겹칠 수 없습니다.
+    // 여기서만 쓰는 순서기를 직접 둡니다.
     // =========================================================================
     wire [DIM_W-1:0] num_mt  = (M    + N - 1) / N;
     wire [DIM_W-1:0] num_nt  = (Nout + N - 1) / N;
@@ -207,7 +207,7 @@ module Gemm_Core_Ev #(
                         all_done_r <= 1'b1; sstate <= S_DONE;
                     end
                 end
-                // `all_done` 규약은 `Tile_Ctrl` 과 같습니다 — start 가 내려갈 때까지 유지
+                // `all_done` 은 start 가 내려갈 때까지 유지하는 규약입니다
                 S_DONE: if (!start) sstate <= S_IDLE;
             endcase
         end

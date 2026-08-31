@@ -1,5 +1,5 @@
 // -----------------------------------------------------------------------------
-// Softmax_Attn : attention softmax — **`SOFTMAX/softmax_top` 래퍼**
+// softmax_top : attention softmax — **`SOFTMAX/softmax_unit` 래퍼**
 //
 // 엔진 쪽 인터페이스(start/C/done, in_valid/in_data, out_valid/out_c/out_data)는
 // 예전 판과 **한 글자도 다르지 않습니다.** `EvT_Engine` 은 이 파일이 바뀐 줄
@@ -29,13 +29,11 @@
 //     기본값 SM_MULT=16253, SM_SH=21 이 그 비율입니다 (상대오차 3e-6).
 //     y 는 [0,1] 이라 부호가 안 서고, y=1 이어도 code=127 이라 포화도 없습니다.
 // -----------------------------------------------------------------------------
-module Softmax_Attn #(
+module softmax_top #(
     parameter N        = 32,        // 레인 = 쿼리
     parameter CMAX     = 128,       // 최대 클래스 수 = Lk 상한
     parameter SM_MULT  = 16253,     // Q1.14 → uint8 (softmax_scale 의 역수)
-    parameter SM_SH    = 21,
-    parameter EXP_FILE = "exp.hex", // (예전 판 호환용 — 새 코어는 .vh 를 씁니다)
-    parameter RCP_FILE = "recip.hex"
+    parameter SM_SH    = 21
 )(
     input  wire              clk,
     input  wire              rst,
@@ -78,7 +76,7 @@ module Softmax_Attn #(
     wire              core_ovalid, core_olast;
     wire [N*16-1:0]   core_ocol;
 
-    softmax_top #(.Tile_M(N), .TMAX(CMAX), .DW(16), .IF(9),
+    softmax_unit #(.Tile_M(N), .TMAX(CMAX), .DW(16), .IF(9),
                   .OW(16), .OF(14), .EW(17), .EF(16), .RW(18), .RF(17),
                   .BRAM_LAT(1)) u_core (
         .clk(clk), .rst_n(~rst),

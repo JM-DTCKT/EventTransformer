@@ -10,7 +10,7 @@ module tb_colpost_ev;
   reg in_valid=0, raw16=0, req2=0;
   reg [N*PSUM_W-1:0] acc=0;
   wire out_valid; wire [N*16-1:0] out_data, out_q69;
-  Col_Post_Ev #(.N(N), .ACT_W(ACT_W), .PSUM_W(PSUM_W),
+  Format_Cast_Act #(.N(N), .ACT_W(ACT_W), .PSUM_W(PSUM_W),
                 .GELU_LUT_FILE("../../nl_export/lut/gelu.hex")) dut (
     .clk(clk), .rst(rst), .consumer(consumer), .bias(bias), .mult(mult),
     .shift(shift), .g_mult(g_mult), .g_shift(g_shift),

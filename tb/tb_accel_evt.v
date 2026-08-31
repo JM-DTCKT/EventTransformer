@@ -42,9 +42,7 @@ module tb_accel_evt;
   wire        m_tvalid, m_tlast;
   wire [SW-1:0] m_tdata;
 
-  Evt_Accel #(.EXP_LUT_FILE("../../nl_export/lut/exp.hex"),
-              .RCP_LUT_FILE("../../nl_export/lut/recip.hex"),
-              .RSQRT_LUT_FILE("../../nl_export/lut/rsqrt.hex")) dut (
+  top dut (
     .aclk(aclk), .aresetn(aresetn),
     .s_axi_awaddr(awaddr), .s_axi_awprot(3'd0), .s_axi_awvalid(awvalid),
     .s_axi_awready(awready), .s_axi_wdata(wdata), .s_axi_wstrb(4'hF),

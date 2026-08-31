@@ -1,6 +1,8 @@
 // -----------------------------------------------------------------------------
-// Col_Post_Ev : GEMM 컬럼(32레인 INT32) → 소비자 포맷  (EvT 판)
-// GEMM 출력을 consumer에 따라 format casting
+// Format_Cast_Act : GEMM 컬럼(32레인 INT32)을 소비자 포맷으로 캐스팅하고
+//                   활성함수(ReLU / GELU)를 적용한다.
+//   bias 덧셈 + 역양자화·재양자화(스케일 변경) + 포맷 변환 + 활성함수를
+//   한 파이프라인에 융합 — 추가 사이클 없이 GEMM 출력에 붙어 흐른다.
 
 // `fpga_nl/Col_Post` 에 **활성함수 분기**를 더한 것입니다. EvT 는 int8 소비자
 // 앞에 ReLU 가 붙는 자리가 있습니다:
@@ -19,7 +21,7 @@
 //   Q411 (1)  requant → Q4.11 → GELU → requant → int8              A_Mem 하위 8b
 //             raw16=1 이면 마지막 재양자화를 건너뛰고 Q4.11 16b 그대로         A_Mem 16b
 //   BF16 (2)  bf16( (acc+b) · step[n] )                            A_Mem 16b
-//   Q69  (3)  requant → Q6.9                                       Softmax_Attn 로 직결
+//   Q69  (3)  requant → Q6.9                                       softmax_top 로 직결
 //
 // ## in_proj 은 여기서 특별대우가 없습니다
 //
@@ -48,7 +50,7 @@
 // `Requant_Int` 가 2단 → **3단** 이 되면서(100 MHz 를 맞추려 프리애더를 끊음)
 // 전부 한 단씩 늘었습니다. 바꿀 때 `EvT_Engine` 의 `CP_LAT_*` 도 같이 봐야 합니다.
 // -----------------------------------------------------------------------------
-module Col_Post_Ev #(
+module Format_Cast_Act #(
     parameter N       = 32,
     parameter ACT_W   = 8,
     parameter PSUM_W  = 32,

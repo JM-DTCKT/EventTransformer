@@ -1,5 +1,5 @@
 // -----------------------------------------------------------------------------
-// tb_gemm_ev : Gemm_Core_Ev 를 attention 두 용법으로 — **실제 EvT 데이터** 검증
+// tb_gemm_ev : Gemm_Core 를 attention 두 용법으로 — **실제 EvT 데이터** 검증
 //
 // Linear 용법은 `fpga/`·`fpga_nl` 이 이미 보드까지 검증했으므로, 여기서는 이 코어의
 // **새 기능**만 봅니다: B 피연산자가 W_Mem 이 아니라 A_Mem 에서 오는 두 경우.
@@ -45,7 +45,7 @@ module tb_gemm_ev;
   wire [DIM_W-1:0]     col_n, col_mt;
   wire [N-1:0]         col_row_en;
 
-  Gemm_Core_Ev #(.N(N), .ACT_W(ACT_W), .PSUM_W(PSUM_W), .DIM_W(DIM_W),
+  Gemm_Core #(.N(N), .ACT_W(ACT_W), .PSUM_W(PSUM_W), .DIM_W(DIM_W),
                  .AW_A(AW_A), .AW_B(AW_B)) dut (
     .clk(clk), .rst(rst), .start(start), .all_done(all_done),
     .M(M), .K(K), .Nout(Nout), .a_base(a_base), .b_base(b_base),
@@ -108,7 +108,7 @@ module tb_gemm_ev;
 
     // unisim 의 **GSR 은 100 ns 까지 모든 프리미티브를 리셋에 붙들어 둡니다**
     // (`glbl.v`). 그 전에 DSP48E2 가 곱하기 시작하면 MREG/PREG 가 안 걸려
-    // **첫 k 가 조용히 사라집니다.** 예전 코어는 `Tile_Ctrl` 의 CLR 상태 한 칸
+    // **첫 k 가 조용히 사라집니다.** 예전 코어는 순서기의 CLR 상태 한 칸
     // 덕에 우연히 105 ns 부터 곱해서 안 걸렸을 뿐입니다 — 타일 파이프라인은
     // 한 사이클 일찍 시작합니다. 보드에 GSR 은 없으니 TB 쪽을 맞춥니다.
     repeat (16) @(posedge clk); rst = 0; @(posedge clk);

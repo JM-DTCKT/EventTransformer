@@ -28,9 +28,7 @@ module tb_softmax_attn;
   wire [7:0]       out_c;
   wire [N*8-1:0]   out_data;
 
-  Softmax_Attn #(.N(N), .CMAX(CMAX),
-                 .EXP_FILE("../../nl_export/lut/exp.hex"),
-                 .RCP_FILE("../../nl_export/lut/recip.hex")) dut (
+  softmax_top #(.N(N), .CMAX(CMAX)) dut (
     .clk(clk), .rst(rst), .start(start), .C(C), .done(done),
     .in_valid(in_valid), .in_data(in_data),
     .out_valid(out_valid), .out_c(out_c), .out_data(out_data));

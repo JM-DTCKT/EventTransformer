@@ -1,5 +1,5 @@
 // ============================================================================
-//  layernorm_top.v  --  32행 Tile 단위 D축 LayerNorm  (BF16 in / signed Q4.11 out)
+//  layernorm_unit.v  --  32행 Tile 단위 D축 LayerNorm  (BF16 in / signed Q4.11 out)
 // ----------------------------------------------------------------------------
 //  EvT 의 nn.LayerNorm([embed_dim]) 을 그대로 구현한다.  정규화 축은 **마지막
 //  차원(embed_dim = D = 128)** 이고, 토큰(latent embedding) 96개가 "몇 번
@@ -78,7 +78,7 @@
 // ============================================================================
 `timescale 1ns/1ps
 
-module layernorm_top #(
+module layernorm_unit #(
     parameter integer LANE   = 32,   // Tile 행 수 (= Tensor Core 타일 행 수)
     parameter integer D      = 128,  // 정규화 축 길이 (= embed_dim, 2^DLOG)
     parameter integer DLOG   = 7,    // log2(D)
@@ -202,15 +202,43 @@ module layernorm_top #(
     // recv_done 은 **누산 파이프라인 끝**에서 낸다 (아래 RXP 단 참조).
     // 변환→제곱→누산을 한 사이클에 두면 100 MHz 에서 -3.1 ns 로 실패한다.
 
-    // 첫 beat 에서는 포트값을, 이후에는 래치된 값을 쓴다
+    // 첫 열에서는 입력값을, 이후에는 저장된 값을 쓴다
     wire signed [XSW-1:0] xshift_cur = recv_first ? in_shift : xshift_slot[slot_recv];
     wire                  q411_cur   = recv_first ? in_q411  : q411_slot[slot_recv];
+
+    // ------------------------------------------------------------------
+    //  xsh / q411 을 **레인 그룹별로 복제한 레지스터**로 넘긴다
+    // ------------------------------------------------------------------
+    //  `xshift_cur` 는 64개 변환기(32레인 x 2종)에 뿌려져 `recv_first` 팬아웃이
+    //  163 까지 올라갔다.  187.5 MHz 에서 `recv_col -> recv_first -> mux ->
+    //  변환기` 가 최악 경로였다 (5.600 ns, 그중 배선이 65 %).
+    //
+    //  `in_shift`(= EvT_Engine 의 `q_gsh`) 와 `in_q411`(= `q_flag2[0]`) 는
+    //  **step 내내 고정**이고 `xshift_slot[]` 도 그 값을 담은 것이라, 먹스의 두
+    //  갈래가 항상 같은 값이다.  따라서 한 사이클 늦춰도 값이 안 바뀐다
+    //  (첫 beat 도 안전 : q_gsh 는 S_DEC 에서 정해져 S_GCONST 3 사이클 뒤에야
+    //   ln_start 가 뜬다).
+    //
+    //  그룹마다 사본을 두면 배치기가 각 사본을 자기 8레인 근처에 놓아 배선이
+    //  짧아진다.  DONT_TOUCH 가 없으면 합성이 다시 하나로 합쳐버린다.
+    localparam integer NG  = 4;                 // 8 레인씩 4 그룹
+    localparam integer GSZ = LANE / NG;
+    (* DONT_TOUCH = "yes" *) reg signed [XSW-1:0] xsh_g [0:NG-1];
+    (* DONT_TOUCH = "yes" *) reg                  q4_g  [0:NG-1];
+    integer gi;
+    always @(posedge clk) begin
+        for (gi = 0; gi < NG; gi = gi + 1) begin
+            xsh_g[gi] <= xshift_cur;
+            q4_g[gi]  <= q411_cur;
+        end
+    end
 
     wire signed [IW-1:0]  x_cvt     [0:LANE-1];
     wire [LANE-1:0]       x_cvt_ovf;
     wire [SQW-1:0]        x_cvt_sq_p [0:LANE-1];   // x_p 기준 (1단 늦음)
     generate
         for (gl = 0; gl < LANE; gl = gl + 1) begin : g_rx
+            localparam integer G = gl / GSZ;      // 이 레인이 속한 그룹
             // 입력 포맷 두 갈래를 **병렬**로 변환하고 마지막에 고릅니다.
             //   예전에는 `EvT_Engine` 이 `Int32_To_Bf16` 으로 Q4.11 을 bf16 으로
             //   올려서 넣었고, 그러면 정규화(LZC+좌시프트) 와 역정규화(우시프트)
@@ -220,13 +248,13 @@ module layernorm_top #(
             wire signed [IW-1:0] xc_bf, xc_q4;
             wire                 ov_bf, ov_q4;
             bf16_to_fix #(.IW(IW), .IF(IF), .XSW(XSW)) u_cvt (
-                .bf(in_col[gl*16 +: 16]), .xsh(xshift_cur),
+                .bf(in_col[gl*16 +: 16]), .xsh(xsh_g[G]),
                 .x(xc_bf), .ovf(ov_bf));
             Q411_To_Fix #(.IW(IW), .IF(IF), .QF(11), .XSW(XSW)) u_cvt_q (
-                .code(in_col[gl*16 +: 16]), .xsh(xshift_cur),
+                .code(in_col[gl*16 +: 16]), .xsh(xsh_g[G]),
                 .x(xc_q4), .ovf(ov_q4));
-            assign x_cvt[gl]     = q411_cur ? xc_q4 : xc_bf;
-            assign x_cvt_ovf[gl] = q411_cur ? ov_q4 : ov_bf;
+            assign x_cvt[gl]     = q4_g[G] ? xc_q4 : xc_bf;
+            assign x_cvt_ovf[gl] = q4_g[G] ? ov_q4 : ov_bf;
             // X*X : X 가 대칭포화(|X| <= 2^23-1)라 곱은 항상 2^46 미만 -> 정확
             //  **등록된 x_p 를 쓴다** — DSP48 의 A/B 입력 레지스터로 흡수되어
             //  곱셈이 파이프라인 한 단을 통째로 차지하게 된다.
@@ -528,17 +556,17 @@ module layernorm_top #(
     // ---- 파라미터 정합성 체크 (합성 무관) ---------------------------------
     initial begin
         if (D != (1 << DLOG))
-            $display("ERROR: layernorm_top D(%0d) must be 2^DLOG(%0d)", D, DLOG);
+            $display("ERROR: layernorm_unit D(%0d) must be 2^DLOG(%0d)", D, DLOG);
         if (NB < 3 || NB > (1 << NBW))
-            $display("ERROR: layernorm_top NB(%0d) must be 3..%0d (버퍼 점유 > 2P)",
+            $display("ERROR: layernorm_unit NB(%0d) must be 3..%0d (버퍼 점유 > 2P)",
                      NB, (1 << NBW));
         if (RW != RF+1)
-            $display("ERROR: layernorm_top RW(%0d) must be RF+1", RW);
+            $display("ERROR: layernorm_unit RW(%0d) must be RF+1", RW);
         if (YSH < 1)
-            $display("ERROR: layernorm_top DSF+RF must be > OF");
+            $display("ERROR: layernorm_unit DSF+RF must be > OF");
         if (VF % 2 != 0)
-            $display("ERROR: layernorm_top VF(%0d) must be even", VF);
+            $display("ERROR: layernorm_unit VF(%0d) must be even", VF);
         if (LANE != (1 << MW))
-            $display("ERROR: layernorm_top LANE(%0d) must be 2^%0d", LANE, MW);
+            $display("ERROR: layernorm_unit LANE(%0d) must be 2^%0d", LANE, MW);
     end
 endmodule

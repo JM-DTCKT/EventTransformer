@@ -40,7 +40,7 @@ EvT 는 타임스텝 하나가 **step 40개 남짓**이고 attention 3블록 x h
 
 ## softmax 가 GEMM 을 끊는 이유
 
-`Tile_Ctrl` 은 `for mt { for nt }` 라 행 타일이 바깥입니다. QK GEMM 전체가 ~880
+GEMM 타일 순서는 `for mt { for nt }` 라 행 타일이 바깥입니다. QK GEMM 전체가 ~880
 사이클인데 `Softmax_Attn` 은 행 타일 하나에 ~4·N·Lk (Lk=53 이면 6,800) 사이클이라,
 GEMM 이 다음 행 타일로 넘어가는 동안 softmax 는 아직 첫 타일을 처리 중입니다.
 그래서 **행 타일마다 GEMM → softmax → AV 를 끊어** 돌립니다 (M=32 로 호출).

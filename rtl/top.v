@@ -2,7 +2,7 @@
 // Evt_Accel : 보드 최상위 — AXI4-Lite(제어) + AXI-Stream(데이터) 래퍼
 //
 //   PS ─HPM0─ AXI-Lite ──→ 제어/상태/타임스텝 핸드셰이크/결과
-//   PS ─HP0─ AXI DMA ─MM2S(128b)─→ S_AXIS ─→ Axis_Loader_Ev ─→ W/A/PB/PG/Step
+//   PS ─HP0─ AXI DMA ─MM2S(128b)─→ S_AXIS ─→ Axis_Loader ─→ W/A/PB/PG/Step
 //                     ←─S2MM(128b)─ M_AXIS ←─ Axis_Dump ←──── A_Mem
 //
 // `fpga_nl/Nl_Accel` 과 다른 점 셋:
@@ -48,7 +48,7 @@
 //                        → TOK_N 쓰기 → TOK_ACK }
 //             STATUS.done 대기 → RES_CLASS 읽기
 // =============================================================================
-module Evt_Accel #(
+module top #(
     parameter N      = 32,
     parameter ACT_W  = 8,
     parameter PSUM_W = 32,
@@ -60,9 +60,6 @@ module Evt_Accel #(
     parameter AW_S   = 8,
     parameter SW     = 128,
     parameter GELU_LUT_FILE  = "gelu.hex",
-    parameter EXP_LUT_FILE   = "exp.hex",
-    parameter RCP_LUT_FILE   = "recip.hex",
-    parameter RSQRT_LUT_FILE = "rsqrt.hex",
     parameter C_S_AXI_ADDR_WIDTH = 12,
     parameter C_S_AXI_DATA_WIDTH = 32
 )(
@@ -141,7 +138,7 @@ module Evt_Accel #(
     always @(posedge aclk) begin
         if (rst) begin
             awready_r <= 1'b0; wready_r <= 1'b0; bvalid_r <= 1'b0;
-            r_n_body <= 8'd117; r_n_tail <= 8'd5; r_n_time <= 6'd20;
+            r_n_body <= 8'd118; r_n_tail <= 8'd5; r_n_time <= 6'd20;
             r_load_sel <= 3'd0; r_load_base <= {AW_W{1'b0}};
             r_eps <= 32'h3727c5ac;                  // 1e-5 (골든과 같은 비트)
             r_dump_base <= {AW_A{1'b0}}; r_dump_len <= {(AW_A+1){1'b0}};
@@ -201,9 +198,7 @@ module Evt_Accel #(
 
     EvT_Engine #(.N(N), .ACT_W(ACT_W), .PSUM_W(PSUM_W), .DIM_W(DIM_W),
                  .AW_W(AW_W), .AW_A(AW_A), .AW_PB(AW_PB), .AW_PG(AW_PG),
-                 .AW_S(AW_S), .GELU_LUT_FILE(GELU_LUT_FILE),
-                 .EXP_LUT_FILE(EXP_LUT_FILE), .RCP_LUT_FILE(RCP_LUT_FILE),
-                 .RSQRT_LUT_FILE(RSQRT_LUT_FILE)) u_eng (
+                 .AW_S(AW_S), .GELU_LUT_FILE(GELU_LUT_FILE)) u_eng (
         .clk(aclk), .rst(rst),
         .start(r_start), .done(eng_done), .busy(eng_busy),
         .dbg_state(eng_state), .dbg_step(eng_step),
@@ -219,7 +214,7 @@ module Evt_Accel #(
     // =========================================================================
     // 로더 / 덤프
     // =========================================================================
-    Axis_Loader_Ev #(.SW(SW), .DW(N*16), .AW(AW_W)) u_ld (
+    Axis_Loader #(.SW(SW), .DW(N*16), .AW(AW_W)) u_ld (
         .clk(aclk), .rst(rst),
         .arm(r_arm), .arm_sel(r_load_sel), .arm_base(r_load_base),
         .s_tvalid(s_axis_tvalid), .s_tready(s_axis_tready),

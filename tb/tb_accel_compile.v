@@ -1,12 +1,10 @@
-// tb_accel_compile : Evt_Accel 엘라보레이션 확인 (기능 검증은 tb_accel_evt)
+// tb_accel_compile : top 엘라보레이션 확인 (기능 검증은 tb_accel_evt)
 `timescale 1ns/1ps
 module tb_accel_compile;
   reg aclk=0, aresetn=0; always #5 aclk=~aclk;
   wire [31:0] rdata; wire awr, wr, bv, arr, rv;
   wire sr, mv; wire [127:0] md; wire [15:0] mk; wire ml;
-  Evt_Accel #(.EXP_LUT_FILE("../../nl_export/lut/exp.hex"),
-              .RCP_LUT_FILE("../../nl_export/lut/recip.hex"),
-              .RSQRT_LUT_FILE("../../nl_export/lut/rsqrt.hex")) dut (
+  top dut (
     .aclk(aclk), .aresetn(aresetn),
     .s_axi_awaddr(12'd0), .s_axi_awprot(3'd0), .s_axi_awvalid(1'b0),
     .s_axi_awready(awr), .s_axi_wdata(32'd0), .s_axi_wstrb(4'hF),

@@ -59,9 +59,9 @@ module Fp32_Add (
     wire        s_big = a_big ? sa : sb,   s_sml = a_big ? sb : sa;
     wire [7:0]  e_big = a_big ? ea : eb,   e_sml = a_big ? eb : ea;
     wire [22:0] m_big = a_big ? ma : mb,   m_sml = a_big ? mb : ma;
-    wire        z_sml = a_big ? b_zero : a_zero;
+    wire        z_sml = a_big ? b_zero : a_zero;  // 작은 수가 0인지 나타내는 bit
 
-    // 24비트 유효숫자를 3비트(G,R,S) 자리만큼 올려 27비트로
+    // 24비트 유효숫자를 3비트(Guard,Round,Sticky) 자리만큼 올려 27비트로, 
     wire [26:0] sig_big = {1'b1, m_big, 3'b000};
     wire [26:0] sig_sml = z_sml ? 27'd0 : {1'b1, m_sml, 3'b000};
 
@@ -77,7 +77,7 @@ module Fp32_Add (
             sticky = |sig_sml;
         end else begin
             sml_sh = sig_sml >> d;
-            sticky = |(sig_sml & ((27'd1 << d) - 27'd1));
+            sticky = |(sig_sml & ((27'd1 << d) - 27'd1)); // 밀려난 하위 d bit 중 하나라도 1이 있는지 나타내는 bit
         end
     end
     wire [26:0] sml_al = sml_sh | {26'd0, sticky};

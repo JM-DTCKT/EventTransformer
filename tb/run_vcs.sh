@@ -14,8 +14,8 @@ rm -rf "$BUILD/simv_$TB" "$BUILD/simv_$TB.daidir"
 echo ">> compile $TB"
 # EVT_PROF=1 ./run_vcs.sh tb_evt  -> 끝에 step 별 사이클 표를 찍습니다
 vcs -full64 -sverilog -timescale=1ns/1ps -notice ${EVT_PROF:++define+EVT_PROF} \
-    -y "$U" +libext+.v +incdir+"${U}_dr" +incdir+. +incdir+../rtl \
-    $TB.v ../rtl/*.v "$XILINX_VIVADO/data/verilog/src/glbl.v" \
+    -y "$U" +libext+.v +incdir+"${U}_dr" +incdir+. +incdir+../rtl +incdir+../rtl/gelu +incdir+../rtl/softmax +incdir+../rtl/rsqrt \
+    $TB.v ../rtl/*.v ../rtl/*/*.v "$XILINX_VIVADO/data/verilog/src/glbl.v" \
     -top $TB -top glbl -Mdir="$BUILD/csrc_$TB" -o "$BUILD/simv_$TB" \
     -l "$BUILD/$TB.comp.log" > /dev/null 2>&1
 [ -x "$BUILD/simv_$TB" ] || { echo "  [COMPILE FAIL]"; grep -A4 "Error-" "$BUILD/$TB.comp.log"|head -20; exit 1; }

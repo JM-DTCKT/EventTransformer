@@ -54,7 +54,9 @@ set_property board_part $BOARD [current_project]
 
 # rtl/ 안의 심볼릭 링크는 glob 이 그대로 따라갑니다 (Gelu/Bf16/LayerNorm/Softmax/
 # Requant/Mac_OS 의 실체 파일). 공용 모듈을 복사하지 않는 이유입니다.
-add_files -norecurse [glob $rtl/*.v]
+# rtl/ 은 모듈별 하위 디렉토리로 정리돼 있습니다 (core/ axi/ gemm_core/ …).
+# 최상위 top.v 와 하위 디렉토리를 모두 훑습니다.
+add_files -norecurse [concat [glob -nocomplain $rtl/*.v] [glob -nocomplain $rtl/*/*.v]]
 
 # LUT 초기화 파일 — 반드시 프로젝트 안에 있어야 $readmemh 가 찾습니다
 # `$readmemh` LUT 은 더 이상 없습니다 — 새 softmax/LayerNorm 코어는 상수를
@@ -65,7 +67,7 @@ add_files -norecurse [glob $rtl/*.v]
 #   gelu_lut   PWL GELU 의 base/delta 64쌍
 #   exp2/recip 새 softmax 코어 (`SOFTMAX/`)
 #   rsqrt      새 LayerNorm 코어 (`LAYERNORM/`)
-foreach vh {gelu_lut.vh exp2_lut.vh recip_lut.vh rsqrt_lut.vh} {
+foreach vh {gelu/gelu_lut.vh softmax/exp2_lut.vh softmax/recip_lut.vh rsqrt/rsqrt_lut.vh} {
     if {![file exists $rtl/$vh]} { error ">>> rtl/$vh 없음" }
     add_files -norecurse -fileset sources_1 $rtl/$vh
     set_property file_type {Verilog Header} [get_files $rtl/$vh]
@@ -119,7 +121,7 @@ set_property -dict [list \
     CONFIG.c_s2mm_burst_size         {16} \
 ] [get_bd_cells axi_dma_0]
 
-create_bd_cell -type module -reference Evt_Accel evt_accel_0
+create_bd_cell -type module -reference top evt_accel_0
 puts "\n>>> evt_accel_0 추론된 인터페이스:"
 foreach ip [get_bd_intf_pins evt_accel_0/*] {
     puts [format "      %-28s %s" [get_property NAME $ip] [get_property VLNV $ip]]
@@ -183,6 +185,11 @@ if {$STAGE eq "bd"} { puts "\n>>> BD 까지 완료"; return }
 # =============================================================================
 # 3. 합성
 # =============================================================================
+# 합성 단계 리타이밍 — 조합 로직을 가로질러 레지스터를 옮긴다. 우리가 손으로
+# 6곳에 한 파이프라이닝의 자동화판이다.  배치를 모르므로 배선 지배 경로에는
+# 직접 효과가 없지만, 넷리스트가 바뀌어 배치 결과 자체가 달라진다.
+set_property STEPS.SYNTH_DESIGN.ARGS.RETIMING true [get_runs synth_1]
+
 launch_runs synth_1 -jobs $NJOBS
 wait_on_run synth_1
 if {[get_property PROGRESS [get_runs synth_1]] != "100%"} {

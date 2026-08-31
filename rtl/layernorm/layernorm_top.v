@@ -1,5 +1,5 @@
 // -----------------------------------------------------------------------------
-// LayerNorm_Ev : `LAYERNORM/layernorm_top` 래퍼 — A_Mem 읽기 + affine + 재양자화
+// layernorm_top : `LAYERNORM/layernorm_unit` 래퍼 — A_Mem 읽기 + affine + 재양자화
 //
 // 새 코어는 **정규화만** 합니다 (BF16 열 in → signed Q4.11 열 out). EvT 가
 // 필요로 하는 나머지 셋을 여기서 붙입니다:
@@ -29,7 +29,7 @@
 //
 // (여유 1비트. `schedule_evt.py` 가 manifest 에서 계산해 GSH 필드로 실어 옵니다.)
 // -----------------------------------------------------------------------------
-module LayerNorm_Ev #(
+module layernorm_top #(
     parameter N      = 32,          // 레인 = 행
     parameter E      = 128,         // 정규화 축 (컴파일타임 — 코어 D)
     parameter DIM_W  = 16,
@@ -137,7 +137,7 @@ module LayerNorm_Ev #(
     wire            core_ov, core_olast;
     wire [N*16-1:0] core_ocol;
 
-    layernorm_top #(.LANE(N), .D(E), .DLOG(7), .XSW(XSW), .SRAM_LAT(1), .NB(3))
+    layernorm_unit #(.LANE(N), .D(E), .DLOG(7), .XSW(XSW), .SRAM_LAT(1), .NB(3))
     u_core (
         .clk(clk), .rst_n(~rst),
         .in_valid(rd_v_q), .in_ready(core_iready),

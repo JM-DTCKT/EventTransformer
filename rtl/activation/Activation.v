@@ -19,7 +19,7 @@
 // 없습니다 — `ReLU/ReLU.v` 와 같은 회로이고, 그 등가성은 `ReLU/tb_relu_fused` 가
 // RTL 로, `linear_script/quantize.py` 가 실제 망 10,000장으로 증명했습니다.
 // (여기서는 packed 버스로 다시 썼습니다 — 원본은 unpacked 배열 포트라 이식성이
-//  떨어져 `PE_Array_Flat` 과 같은 이유로 재작성했습니다.)
+//  떨어집니다.)
 //
 // ## 포화와의 순서 — ReLU 는 정확, 나머지는 근사
 //

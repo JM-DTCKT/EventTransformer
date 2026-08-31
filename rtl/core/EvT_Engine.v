@@ -86,10 +86,7 @@ module EvT_Engine #(
     parameter AW_PB  = 10,       // PB_Mem (860 워드)
     parameter AW_PG  = 8,        // PG_Mem (208 워드)
     parameter AW_S   = 8,        // Step_Mem (155 워드)
-    parameter GELU_LUT_FILE  = "gelu.hex",
-    parameter EXP_LUT_FILE   = "exp.hex",
-    parameter RCP_LUT_FILE   = "recip.hex",
-    parameter RSQRT_LUT_FILE = "rsqrt.hex"
+    parameter GELU_LUT_FILE  = "gelu.hex"
 )(
     input  wire                 clk,
     input  wire                 rst,
@@ -257,7 +254,7 @@ module EvT_Engine #(
     // 상수를 레지스터로 받아 BRAM+먹스와 재양자화를 갈라 놓습니다.
     // 컬럼도 한 단 더 늦춰 정렬을 맞추므로 사이클 비용은 타일당 1 입니다.
     // **팬아웃을 잘라 둡니다.** 이 상수 하나가 Col_Post 32레인 x 2개 = DSP 64개,
-    // LayerNorm_Ev 의 requant, 그리고 ARGMAX 의 64비트 곱을 동시에 먹습니다.
+    // layernorm_top 의 requant, 그리고 ARGMAX 의 64비트 곱을 동시에 먹습니다.
     // 복제하지 않으면 칩 전역으로 뻗은 배선이 u_cp 경로를 -0.811 ns 로 끌어내립니다
     // (ZU9EG -2 실측). 상수라 복제 비용은 FF 몇 개뿐입니다.
     (* max_fanout = 16 *)
@@ -286,8 +283,8 @@ module EvT_Engine #(
     // =========================================================================
     reg                  gm_start;
     wire                 gm_done, col_v, col_first, col_last;
-    wire [N*PSUM_W-1:0]  col_d;
-    wire [DIM_W-1:0]     col_n, col_mt;
+    wire [N*PSUM_W-1:0]  col_d; // 한 column의 data
+    wire [DIM_W-1:0]     col_n, col_mt; // col_n : column idx, col_mt : 행타일 번호
     wire [N-1:0]         col_re;
     wire                 ga_rd_en, gb_rd_en;
     wire [AW_A-1:0]      ga_rd_addr;
@@ -374,7 +371,7 @@ module EvT_Engine #(
     assign w_rd_en   = gb_rd_en && !b_from_a;
     assign w_rd_addr = gb_rd_addr;
 
-    Gemm_Core_Ev #(.N(N), .ACT_W(ACT_W), .PSUM_W(PSUM_W), .DIM_W(DIM_W),
+    Gemm_Core #(.N(N), .ACT_W(ACT_W), .PSUM_W(PSUM_W), .DIM_W(DIM_W),
                    .AW_A(AW_A), .AW_B(AW_W)) u_gemm (
         .clk(clk), .rst(rst), .start(gm_start), .all_done(gm_done),
         .M(q_M), .K(q_K), .Nout(q_NOUT), .a_base(q_AIN), .b_base(q_BIN),
@@ -389,7 +386,7 @@ module EvT_Engine #(
 
     wire                cp_v;
     wire [N*16-1:0]     cp_d, cp_q69;
-    Col_Post_Ev #(.N(N), .ACT_W(ACT_W), .PSUM_W(PSUM_W),
+    Format_Cast_Act #(.N(N), .ACT_W(ACT_W), .PSUM_W(PSUM_W),
                   .GELU_LUT_FILE(GELU_LUT_FILE)) u_cp (
         .clk(clk), .rst(rst), .consumer(q_cons),
         .bias(pb_bias_q), .mult(pb_mult_q), .shift(q_sh),
@@ -406,16 +403,10 @@ module EvT_Engine #(
         col_mt_d <= col_mt;  col_mt_d2 <= col_mt_d;
     end
 
-    // Col_Post 지연만큼 쓰기 주소를 늦춥니다. **소비자마다 다릅니다** —
-    //   Requant_Bf16 1단 / Requant_Int **3단** / Q4.11 은 **9단**
-    //   (Q4.11 = requant 3 + gelu_pwl 3 + requant 3)
-    //   Requant_Int 는 원래 2단이었지만 100 MHz 를 맞추려 프리애더를 끊어
-    //   3단이 됐습니다 (`Requant_Int.v` 머리말 참조). 여기 숫자를 같이 안 고치면
-    //   쓰기 주소가 데이터보다 빨라 **한 컬럼씩 밀려 저장**됩니다.
-    // (`fpga_nl` 에서 여기를 뭉뚱그려 첫 워드가 안 써지는 버그가 있었습니다)
-    // CP_LAT_B : bf16 은 `Requant_Bf16` 이 곱 뒤를 끊어 **2단** 입니다 (예전 1단).
+    // Col_Post 지연만큼 쓰기 주소를 늦춥니다. **소비자마다 다릅니다** —.
     localparam CP_LAT_B = 2, CP_LAT_S = 3, CP_LAT_G = 9, CP_LAT_R = 6;
     localparam CP_LAT_MAX = CP_LAT_G;
+    
     reg [DIM_W-1:0] nq [0:CP_LAT_MAX-1];
     reg [DIM_W-1:0] mq [0:CP_LAT_MAX-1];
     integer zn;
@@ -433,6 +424,28 @@ module EvT_Engine #(
                            : (q_cons == C_BF16) ? mq[CP_LAT_B-1]
                            : q_flag2[3]         ? mq[CP_LAT_R-1]
                            :                      mq[CP_LAT_S-1];
+
+    // A_Mem 쓰기 주소를 **한 사이클 앞당겨** 레지스터에 담습니다. 위 4:1 먹스와
+    // 주소 곱셈(DSP 2개 캐스케이드)이 A_Mem 주소 디코드까지 한 사이클에 붙어 있어
+    // 187.5 MHz 의 최악 경로였습니다 (`q_flag2[3] → … → ADDRARDADDR`, 5.578 ns).
+    // 탭을 한 칸 당겨(`-2`) 레지스터 한 단을 상쇄하므로 **주소가 유효한 사이클은
+    // 그대로**입니다 — `a_we_en`/`a_we_data` 는 손대지 않고 총 사이클도 안 변합니다.
+    // 네 경로 모두 CP_LAT >= 2 라 당길 여유가 있습니다 (최소 CP_LAT_B=2 → nq[0]).
+    // `cp_n`/`cp_mt` 는 전치 드레인이 **그 컬럼이 나온 순간** 잡아야 하므로 그대로 둡니다.
+    wire [DIM_W-1:0] cp_n_e = (q_cons == C_Q411) ? nq[CP_LAT_G-2]
+                            : (q_cons == C_BF16) ? nq[CP_LAT_B-2]
+                            : q_flag2[3]         ? nq[CP_LAT_R-2]
+                            :                      nq[CP_LAT_S-2];
+    wire [DIM_W-1:0] cp_mt_e = (q_cons == C_Q411) ? mq[CP_LAT_G-2]
+                             : (q_cons == C_BF16) ? mq[CP_LAT_B-2]
+                             : q_flag2[3]         ? mq[CP_LAT_R-2]
+                             :                      mq[CP_LAT_S-2];
+    reg [AW_A-1:0] gm_addr_q;
+    always @(posedge clk)
+        gm_addr_q <= q_flag[1]
+                   ? (q_AOUT + (cp_n_e[DIM_W-1:5] * q_OSTR[AW_A-1:0])
+                             + (cp_mt_e << 5) + cp_n_e[4:0])
+                   : (q_AOUT + cp_mt_e * q_OSTR + cp_n_e[AW_A-1:0]);
 
     // Col_Post 파이프라인이 **비었는지** 봅니다. `gm_done` 은 시스톨릭 배열이
     // 다 쏟은 시점이라, 뒤에 붙은 requant/GELU 단(최대 9)이 아직 값을 들고 있을
@@ -544,7 +557,7 @@ module EvT_Engine #(
     // 행타일 반복은 **래퍼가** 합니다 — 코어의 3단 Tile 파이프라인이 겹치려면
     // 타일을 끊지 않고 연달아 밀어야 하기 때문입니다. 그래서 엔진의 `ln_mt`
     // 루프가 없어졌습니다 (예전 코어는 타일마다 start 를 다시 걸었습니다).
-    LayerNorm_Ev #(.N(N), .E(E), .DIM_W(DIM_W), .AW(AW_A), .XSW(6)) u_ln (
+    layernorm_top #(.N(N), .E(E), .DIM_W(DIM_W), .AW(AW_A), .XSW(6)) u_ln (
         .clk(clk), .rst(rst), .start(ln_start), .done(ln_done),
         .M(q_M), .a_base(q_AIN), .in_shift($signed(q_gsh)),
         .rd_en(la_rd_en), .rd_addr(la_rd_addr), .rd_data(ar_data),
@@ -564,8 +577,7 @@ module EvT_Engine #(
     wire [7:0]      sm_c;
     wire [N*8-1:0]  sm_out;
 
-    Softmax_Attn #(.N(N), .CMAX(TOKMAX+1),
-                   .EXP_FILE(EXP_LUT_FILE), .RCP_FILE(RCP_LUT_FILE)) u_sm (
+    softmax_top #(.N(N), .CMAX(TOKMAX+1)) u_sm (
         .clk(clk), .rst(rst), .start(sm_start), .C(q_NOUT[7:0]), .done(sm_done),
         .in_valid(sm_iv), .in_data(sm_id),
         .out_valid(sm_ov), .out_c(sm_c), .out_data(sm_out));
@@ -588,6 +600,7 @@ module EvT_Engine #(
     reg [DIM_W-1:0]  rs_k;
     reg [2:0]        rs_ph;
     reg [N*16-1:0]   rs_a;
+    reg [N*16-1:0]   rs_b;   // 포트 B 로 읽은 두번째 피연산자
     wire [N*16-1:0]  rs_sum;
     // 두 피연산자가 **정수 코드**이고 스케일이 서로 다른 자리가 하나 있습니다 —
     // `proc_events` 의 `x = seq_init(x) + x_input`. seq_init 출력은 ReLU 앞 int8
@@ -609,13 +622,13 @@ module EvT_Engine #(
     generate
         for (rg = 0; rg < N; rg = rg + 1) begin : RESLANE
             wire signed [15:0] ra_c = rs_a[rg*16 +: 16]; // 피연산자 A
-            wire signed [15:0] rb_c = ar_data[rg*16 +: 16]; // 피연산자 B (From A_Mem)
+            wire signed [15:0] rb_c = rs_b[rg*16 +: 16]; // 피연산자 B (A_Mem 포트 B, ph1 래치)
             wire signed [31:0] rq_acc = $signed(ra_c) * $signed({1'b0, q_PB}) // q_PB, q_OSTR : dequant scale factor
                                       + $signed(rb_c) * $signed({1'b0, q_OSTR});
             // 곱·덧셈 뒤에서 한 단 끊습니다.  예전에는 아래 `rq_d1`/`rq_d2` 로
             // **뒤에서** 두 단을 늦췄는데, 그러면 `ar_data → 곱셈2+덧셈 → 32b LZC
-            // ·정규화 → 지수` 가 통째로 ph3 한 사이클에 들어갑니다 (150 MHz 에서
-            // 최악 경로였습니다).  단수(2단)와 ph5 쓰기 시점은 그대로이고 레지스터
+            // ·정규화 → 지수` 가 통째로 한 사이클에 들어갑니다 (150 MHz 에서
+            // 최악 경로였습니다).  단수(2단)와 쓰기 시점은 그대로이고 레지스터
             // 위치만 앞으로 옮긴 것이라 `Fp32_Add`(2단) 와의 정렬이 안 깨집니다.
             reg signed [31:0] rq_acc_q;
             always @(posedge clk) rq_acc_q <= rq_acc;
@@ -627,10 +640,13 @@ module EvT_Engine #(
                                  rq_bf_raw[6:0]};
 
             wire [31:0] sf;
+            // 두 피연산자 모두 ph1 에 래치된 레지스터입니다. 예전에는 `.b` 가
+            // `ar_data`(BRAM 출력) 직결이라 `BRAM → FP 정렬 배럴시프터 → sum1`
+            // 이 한 사이클에 들어갔습니다 (187.5 MHz 최악 경로, 5.712 ns).
             Fp32_Add u_ra (.clk(clk), .rst(rst),
-                           .in_valid(rs_run && rs_ph == 3'd3 && !res_q),
+                           .in_valid(rs_run && rs_ph == 3'd2 && !res_q),
                            .a({rs_a[rg*16 +: 16], 16'd0}),
-                           .b({ar_data[rg*16 +: 16], 16'd0}),
+                           .b({rs_b[rg*16 +: 16], 16'd0}),
                            .out_valid(), .y(sf));
             wire [15:0] sb;
             Fp32_To_Bf16 u_rc (.f(sf), .log2e(6'd0), .y(sb));
@@ -653,16 +669,23 @@ module EvT_Engine #(
     // =========================================================================
     reg  [DIM_W-1:0] mn_k;
     reg  [5:0]       mn_mt;
-    reg  [1:0]       mn_ph;
+    reg  [2:0]       mn_ph;
     reg              mn_run;
     reg signed [15:0] mn_acc;
     integer mz;
+    // A_Mem BRAM 출력을 **레지스터로 받은 뒤** 더합니다. 예전에는
+    // `BRAM -> 32입력 덧셈트리(CARRY8 5개) -> mn_acc` 가 한 사이클이라
+    // 187.5 MHz 의 최악 경로였습니다 (5.857 ns).  RESLANE 과 같은 처방입니다.
+    // MEAN 은 tail 에서 샘플당 1회(1,024 사이클, 전체의 0.06 %)라 위상을
+    // 하나 늘려도 **+384 사이클(0.024 %)** 뿐입니다.
+    reg [N*16-1:0]    mn_d;
+    always @(posedge clk) mn_d <= ar_data;
     reg signed [15:0] mn_lane_sum;
     always @* begin                        // 32레인 int8 합 (유효 행만)
         mn_lane_sum = 16'sd0;
         for (mz = 0; mz < N; mz = mz + 1)
             if (mn_mt * N + mz < q_M)
-                mn_lane_sum = mn_lane_sum + $signed(ar_data[mz*16 +: 16]);
+                mn_lane_sum = mn_lane_sum + $signed(mn_d[mz*16 +: 16]);
     end
     wire signed [47:0] mn_prod = $signed(mn_acc) * $signed(g_mult_q);
     // 곱 뒤에서 한 단 끊습니다 (DSP48E2 의 P 레지스터로 흡수).  예전에는
@@ -684,6 +707,23 @@ module EvT_Engine #(
     wire signed [PSUM_W-1:0] am_acc = $signed(col_d_d2[PSUM_W-1:0])
                                     + $signed(pb_bias_q);
     wire signed [63:0]       am_val = am_acc * $signed(pb_mult_q);
+    // 곱셈 뒤에서 한 단 끊습니다. 예전에는 `col_d_d2 → bias 덧셈 → DSP 2개
+    // 캐스케이드 → **64비트 비교** → am_best 의 CE` 가 통째로 한 사이클이라
+    // 187.5 MHz 의 최악 경로였습니다 (5.707 ns).  ARGMAX 는 샘플당 한 번뿐이라
+    // 한 사이클 늘어도 전체 사이클에는 사실상 영향이 없습니다.
+    reg  signed [63:0]       am_val_q;
+    reg  signed [PSUM_W-1:0] am_acc_q;
+    reg  [DIM_W-1:0]         am_n_q;
+    reg                      am_v_q;
+    always @(posedge clk) begin
+        if (rst) am_v_q <= 1'b0;
+        else begin
+            am_val_q <= am_val;
+            am_acc_q <= am_acc;
+            am_n_q   <= col_n_d2;
+            am_v_q   <= (q_kind == K_ARGMAX) && col_v_d2 && (col_n_d2 < q_NOUT);
+        end
+    end
     reg  signed [63:0]       am_best;
     reg                      am_any;
 
@@ -733,10 +773,8 @@ module EvT_Engine #(
                         a_we_en   = 1'b1;
                         // FLAG[13] head-major : AOUT + (n/32)*hstride + mt*32 + n%32
                         // 그 외        : AOUT + mt*NOUT + n
-                        a_we_addr = q_flag[1]
-                                  ? (q_AOUT + (cp_n[DIM_W-1:5] * q_OSTR[AW_A-1:0])
-                                            + (cp_mt << 5) + cp_n[4:0])
-                                  : (q_AOUT + cp_mt * q_OSTR + cp_n[AW_A-1:0]);
+                        // 위에서 한 사이클 앞서 계산해 둔 주소를 씁니다
+                        a_we_addr = gm_addr_q;
                         a_we_data = cp_d;
                     end
                 end
@@ -760,11 +798,15 @@ module EvT_Engine #(
                     end
                 end
                 K_RES: begin
+                    // 두 피연산자를 **동시에** 읽습니다. A_Mem 은 쓰기가 같고
+                    // 읽기만 독립인 미러 2벌인데, 포트 B(`u_amem1`)는 GEMM 만
+                    // 쓰고 RES 중에는 놀고 있었습니다. 순차 읽기(4위상)를
+                    // 병렬 읽기(2위상)로 바꿔 루프가 6 → 5 위상이 됩니다.
                     ar_en   = rs_run;
-                    ar_addr = (rs_ph <= 3'd1)
-                            ? (q_AIN  + rs_mt * q_K[AW_A-1:0] + rs_k[AW_A-1:0])
-                            : (q_AOUT + rs_mt * q_K[AW_A-1:0] + rs_k[AW_A-1:0]);
-                    if (rs_run && rs_ph == 3'd5) begin
+                    ar_addr = q_AIN  + rs_mt * q_K[AW_A-1:0] + rs_k[AW_A-1:0];
+                    br_en   = rs_run;
+                    br_addr = q_AOUT + rs_mt * q_K[AW_A-1:0] + rs_k[AW_A-1:0];
+                    if (rs_run && rs_ph == 3'd4) begin
                         a_we_en   = 1'b1;
                         a_we_addr = q_AOUT + rs_mt * q_K[AW_A-1:0]
                                   + rs_k[AW_A-1:0];
@@ -779,7 +821,7 @@ module EvT_Engine #(
                 K_MEAN: begin
                     ar_en   = mn_run;
                     ar_addr = q_AIN + mn_mt * q_K[AW_A-1:0] + mn_k[AW_A-1:0];
-                    if (mn_run && mn_ph == 2'd3) begin
+                    if (mn_run && mn_ph == 3'd4) begin
                         a_we_en   = 1'b1;
                         a_we_addr = q_AOUT + mn_k[AW_A-1:0];
                         a_we_data = {{(N-1)*16{1'b0}}, {{8{mn_out[7]}}, mn_out}};
@@ -821,12 +863,12 @@ module EvT_Engine #(
         end else begin
             // 코어 파이프라인이 마지막 타일을 비우며 컬럼을 더 낼 수 있어
             // **유효 범위 밖은 세지 않습니다** (안 막으면 클래스 10 이 나옵니다)
-            if (q_kind == K_ARGMAX && col_v_d2 && col_n_d2 < q_NOUT) begin
-                res_logits[col_n_d2[4:0]*PSUM_W +: PSUM_W] <= am_acc;
-                if (!am_any || am_val > am_best) begin
-                    am_best   <= am_val;
+            if (am_v_q) begin
+                res_logits[am_n_q[4:0]*PSUM_W +: PSUM_W] <= am_acc_q;
+                if (!am_any || am_val_q > am_best) begin
+                    am_best   <= am_val_q;
                     am_any    <= 1'b1;
-                    res_class <= col_n_d2[3:0];
+                    res_class <= am_n_q[3:0];
                 end
             end
             case (st)
@@ -902,8 +944,11 @@ module EvT_Engine #(
                         wait_ack <= 1'b1;
                     if (q_kind == K_RES) begin
                         rs_ph <= rs_ph + 1'b1;
-                        if (rs_ph == 3'd1) rs_a <= ar_data;
-                        if (rs_ph == 3'd5) begin
+                        if (rs_ph == 3'd1) begin
+                            rs_a <= ar_data;   // 포트 A
+                            rs_b <= br_data;   // 포트 B — 같은 사이클
+                        end
+                        if (rs_ph == 3'd4) begin
                             rs_ph <= 0;
                             if (rs_k == q_K - 1) begin
                                 rs_k <= 0;
@@ -926,20 +971,26 @@ module EvT_Engine #(
                         pos_start <= 1'b0; st <= S_NEXT;
                     end else if (q_kind == K_SMAX && sm_done && wait_ack) begin
                         sm_start <= 1'b0; st <= S_NEXT;
-                    end else if (q_kind == K_ARGMAX && gm_done && wait_ack) begin
+                    // `am_v_q` 가 아직 서 있으면 **마지막 컬럼이 미반영**입니다
+                    // (곱셈 뒤 레지스터를 넣어 한 단 늘었습니다).
+                    end else if (q_kind == K_ARGMAX && gm_done && wait_ack
+                                 && !am_v_q) begin
                         gm_start <= 1'b0; st <= S_NEXT;
                     end else if (q_kind == K_MEAN) begin
                         // 특징 하나당 : 타일마다 (주소 → 합), 그 뒤 재양자화 · 쓰기
-                        if (mn_ph == 2'd0) mn_ph <= 2'd1;
-                        else if (mn_ph == 2'd1) begin
+                        // ph0 주소 / ph1 BRAM 출력을 mn_d 에 수신 / ph2 누산
+                        // ph3 곱 확정 / ph4 재양자화·쓰기
+                        if (mn_ph == 3'd0) mn_ph <= 3'd1;
+                        else if (mn_ph == 3'd1) mn_ph <= 3'd2;
+                        else if (mn_ph == 3'd2) begin
                             mn_acc <= mn_acc + mn_lane_sum;
-                            if (mn_mt == ln_mt_last) mn_ph <= 2'd2;
-                            else begin mn_mt <= mn_mt + 1'b1; mn_ph <= 2'd0; end
-                        end else if (mn_ph == 2'd2) begin
+                            if (mn_mt == ln_mt_last) mn_ph <= 3'd3;
+                            else begin mn_mt <= mn_mt + 1'b1; mn_ph <= 3'd0; end
+                        end else if (mn_ph == 3'd3) begin
                             // 최종 mn_acc 의 곱이 mn_prod_q 에 잡히는 사이클
-                            mn_ph <= 2'd3;
+                            mn_ph <= 3'd4;
                         end else begin
-                            mn_ph <= 2'd0; mn_mt <= 0; mn_acc <= 0;
+                            mn_ph <= 3'd0; mn_mt <= 0; mn_acc <= 0;
                             if (mn_k == q_K - 1) begin
                                 mn_run <= 1'b0; st <= S_NEXT;
                             end else mn_k <= mn_k + 1'b1;

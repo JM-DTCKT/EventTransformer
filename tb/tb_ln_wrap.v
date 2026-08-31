@@ -1,4 +1,4 @@
-// tb_ln_wrap : LayerNorm_Ev 래퍼 단독 — 열 개수와 정규화 결과를 봅니다
+// tb_ln_wrap : layernorm_top 래퍼 단독 — 열 개수와 정규화 결과를 봅니다
 `timescale 1ns/1ps
 module tb_ln_wrap;
   localparam N=32, E=128, AW=14;
@@ -8,7 +8,7 @@ module tb_ln_wrap;
   wire rd_en; wire [AW-1:0] rd_addr; reg [N*16-1:0] rd_data;
   wire [15:0] p_addr; wire ov; wire [5:0] omt; wire [15:0] ok;
   wire [N*8-1:0] od;
-  LayerNorm_Ev #(.N(N), .E(E), .AW(AW)) dut (
+  layernorm_top #(.N(N), .E(E), .AW(AW)) dut (
     .clk(clk), .rst(rst), .start(start), .done(done), .M(M),
     .a_base(14'd0), .in_shift(6'sd0), .in_q411(1'b0),
     .rd_en(rd_en), .rd_addr(rd_addr), .rd_data(rd_data),
