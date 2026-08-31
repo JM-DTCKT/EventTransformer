@@ -67,7 +67,7 @@ add_files -norecurse [concat [glob -nocomplain $rtl/*.v] [glob -nocomplain $rtl/
 #   gelu_lut   PWL GELU 의 base/delta 64쌍
 #   exp2/recip 새 softmax 코어 (`SOFTMAX/`)
 #   rsqrt      새 LayerNorm 코어 (`LAYERNORM/`)
-foreach vh {gelu/gelu_lut.vh softmax/exp2_lut.vh softmax/recip_lut.vh rsqrt/rsqrt_lut.vh} {
+foreach vh {gelu/gelu_lut.vh softmax/exp2_lut.vh softmax/recip_lut.vh layernorm/rsqrt_lut.vh} {
     if {![file exists $rtl/$vh]} { error ">>> rtl/$vh 없음" }
     add_files -norecurse -fileset sources_1 $rtl/$vh
     set_property file_type {Verilog Header} [get_files $rtl/$vh]

@@ -1,33 +1,33 @@
 // -----------------------------------------------------------------------------
-// EvT_Engine : EvT(DVS128_10) 실행기 — step 프로그램을 순서대로 돌립니다
+// EvT_Engine : EvT(DVS128_10) 실행기 — inst 프로그램을 순서대로 돌립니다
 //
 // `fpga_nl/FFN_Engine` 과 역할은 같지만 규모가 다릅니다:
 //
 //                     FFN_Engine        EvT_Engine
-//   step 수           12                **타임스텝당 150 + 끝 5**
+//   inst 수           12                **타임스텝당 150 + 끝 5**
 //   재귀              없음              **타임스텝 T(≤20) 루프, latent 누적**
 //   attention         없음              **3블록 x head 4**
 //
-// step 이 150개라 `fpga_nl` 처럼 레지스터 파일에 못 담습니다. **Step_Mem(BRAM)**
+// inst 이 150개라 `fpga_nl` 처럼 레지스터 파일에 못 담습니다. **Inst_Mem(BRAM)**
 // 에 담고 하나씩 읽어 실행합니다. AXI-Stream 로더가 다른 메모리와 같은 방식으로
 // 채웁니다.
 //
-// ## step 프로그램은 정적입니다
+// ## inst 프로그램은 정적입니다
 //
 // `n_tok` 은 타임스텝마다 다릅니다(실측 16~123). 영역 크기를 `n_tok` 에 맞추면
 // 베이스가 매번 바뀌어 프로그램을 5,182벌 만들어야 합니다. 그래서 **모든 영역
 // stride 를 최악치(토큰 128)로 고정**했습니다(`sw/schedule_evt.py`). 그러면
 // 베이스가 전부 상수가 되고, `n_tok` 에 따라 바뀌는 것은 네 필드뿐입니다:
 //
-//   VAR[0]  M    <- n_tok        (토큰 행을 도는 step)
+//   VAR[0]  M    <- n_tok        (토큰 행을 도는 inst)
 //   VAR[1]  NOUT <- n_tok+1      (Q·Kᵀ 의 Nout = Lk)
 //   VAR[2]  K    <- n_tok+1      (attn·V 의 reduce = Lk)
 //   VAR[3]  C    <- n_tok+1      (softmax 의 클래스 수 = Lk)
 //
-// 발행 시점에 `n_tok` 레지스터로 채워 넣습니다. latent 쪽 step 은 `Lk = 96+1` 이
+// 발행 시점에 `n_tok` 레지스터로 채워 넣습니다. latent 쪽 inst 은 `Lk = 96+1` 이
 // 상수라 VAR 을 안 씁니다.
 //
-// ## step 워드 (256비트 = Step_Mem 한 워드)
+// ## inst 워드 (256비트 = Inst_Mem 한 워드)
 //
 //   [ 31: 0] KIND[3:0] CONS[5:4] ACT[7:6] VAR[11:8] FLAG[15:12]
 //            SHIFT[21:16] GSH[27:22] FLAG2[31:28]
@@ -62,8 +62,8 @@
 //
 // ## 검증 상태
 //
-// **아직 통합 TB 를 안 돌렸습니다.** `fpga_nl` 의 12 step 엔진에서도 위상·주소
-// 버그가 5개 나왔고, 여기는 step 이 150개입니다. `tb_evt` 로 tap 대조를 하기 전에는
+// **아직 통합 TB 를 안 돌렸습니다.** `fpga_nl` 의 12 inst 엔진에서도 위상·주소
+// 버그가 5개 나왔고, 여기는 inst 이 150개입니다. `tb_evt` 로 tap 대조를 하기 전에는
 // 동작한다고 볼 수 없습니다.
 // -----------------------------------------------------------------------------
 module EvT_Engine #(
@@ -85,7 +85,7 @@ module EvT_Engine #(
     parameter AW_A   = 13,       // A_Mem  (7,649 워드 사용)
     parameter AW_PB  = 10,       // PB_Mem (860 워드)
     parameter AW_PG  = 8,        // PG_Mem (208 워드)
-    parameter AW_S   = 8,        // Step_Mem (155 워드)
+    parameter AW_S   = 8,        // Inst_Mem (155 워드)
     parameter GELU_LUT_FILE  = "gelu.hex"
 )(
     input  wire                 clk,
@@ -98,8 +98,8 @@ module EvT_Engine #(
     output wire [AW_S-1:0]      dbg_step,
 
     // ---- 실행 파라미터 ----
-    input  wire [AW_S-1:0]      n_body,        // 전처리 + Attention step 수
-    input  wire [AW_S-1:0]      n_tail,        // Classifier step 수
+    input  wire [AW_S-1:0]      n_body,        // 전처리 + Attention inst 수
+    input  wire [AW_S-1:0]      n_tail,        // Classifier inst 수
     input  wire [5:0]           n_time,        // 타임스텝 T (Time-window)
     input  wire [31:0]          eps,           // LayerNorm eps (fp32 비트)
 
@@ -152,7 +152,7 @@ module EvT_Engine #(
                S_RUN=4'd4, S_WAIT=4'd5, S_NEXT=4'd6, S_TSTEP=4'd7, S_DONE=4'd8,
                S_TLOAD=4'd9;
     reg [3:0]        st;
-    reg [AW_S-1:0]   sp;              // step 포인터
+    reg [AW_S-1:0]   sp;              // inst 포인터
     reg [5:0]        ti;              // 타임스텝 인덱스
     reg              in_tail;
     reg [DIM_W-1:0]  n_tok;           // 이번 타임스텝의 토큰 수
@@ -163,7 +163,7 @@ module EvT_Engine #(
     assign tok_rd_idx = ti;
 
     // =========================================================================
-    // Step_Mem — step 하나 = 256비트 워드 하나
+    // Inst_Mem — inst 하나 = 256비트 워드 하나
     // =========================================================================
     wire [N*8-1:0] s_rd;
     reg  [AW_S-1:0] s_addr;
@@ -184,7 +184,7 @@ module EvT_Engine #(
     reg [15:0]       q_PB, q_OSTR;
     reg [3:0]        q_flag2;        // 워드0 [31:28]
     // LayerNorm 은 **한 번에 32행(레인)** 만 처리합니다 (특징 축 리덕션이라
-    // 레인이 곧 행). M 이 32를 넘으면 행타일 수만큼 다시 겁니다. step 을 타일마다
+    // 레인이 곧 행). M 이 32를 넘으면 행타일 수만큼 다시 겁니다. inst 을 타일마다
     // 쪼개면 프로그램이 n_tok 에 의존하게 되므로(최악 4벌) 엔진이 셉니다.
     // 하위 코어들의 `done` 은 **다음 start 까지 계속 1** 입니다. start 를 준
     // 사이클에 done 을 그대로 보면 **직전 완료를 이번 완료로 착각**합니다
@@ -234,7 +234,7 @@ module EvT_Engine #(
 
     assign dbg_rd_data = ar_data;
 
-    // PB_Mem : 채널 c 의 {mult|step, bias}
+    // PB_Mem : 채널 c 의 {mult|inst, bias}
     wire [AW_PB-1:0] pb_word;
     wire [N*8-1:0]   pb_rd;
     reg  [AW_PB+1:0] pb_idx;
@@ -309,13 +309,13 @@ module EvT_Engine #(
     // 각 head 영역 끝의 예약 칸에 호스트가 한 번 넣어 둡니다.
     //
     //   QK : B 워드의 레인 = 키. 키 n_tok 인 **레인 하나**만 바꿉니다.
-    //        bias_k 워드는 레인 = head_dim 이라 step 시작에 한 번 읽어 둡니다.
+    //        bias_k 워드는 레인 = head_dim 이라 inst 시작에 한 번 읽어 둡니다.
     //        주소는 `AOUT` — QK 는 메모리에 안 써서 그 칸이 놉니다.
     //   AV : B 워드 자체가 키 하나(레인 = head_dim). 키 n_tok 이면 **주소만**
     //        `OSTR` 이 가리키는 칸으로 돌립니다 (AV 는 행타일이 하나라 놉니다).
     //
     // K/V 영역은 블록 3개가 돌려 쓰므로 예약 칸을 그 안에 둘 수 없습니다 —
-    // 블록마다 bias 값이 다릅니다. 그래서 별도 영역(BKV)에 두고 주소를 step 이
+    // 블록마다 bias 값이 다릅니다. 그래서 별도 영역(BKV)에 두고 주소를 inst 이
     // 실어 옵니다.
 
     reg  [N*16-1:0] bk_word;                 // bias_k (레인 = head_dim)
@@ -324,7 +324,7 @@ module EvT_Engine #(
     wire            is_av    = has_bkv && (q_cons != C_Q69);
     wire [AW_A-1:0] b_off    = gb_rd_addr[AW_A-1:0] - q_BIN[AW_A-1:0];
     // bias 토큰은 **마지막 키** 입니다. cross 는 Lk = n_tok+1, latent 은 96+1 로
-    // 고정이라 `n_tok` 이 아니라 **그 step 의 Lk** 로 잡아야 합니다.
+    // 고정이라 `n_tok` 이 아니라 **그 inst 의 Lk** 로 잡아야 합니다.
     //   QK : 출력 열이 키라 Lk = q_NOUT      AV : reduce 가 키라 Lk = q_K
     wire [DIM_W-1:0] qk_key = q_NOUT - 1'b1;
     wire [DIM_W-1:0] av_key = q_K    - 1'b1;
@@ -380,7 +380,7 @@ module EvT_Engine #(
         .col_valid(col_v), .col_data(col_d), .col_n(col_n), .col_mt(col_mt),
         .col_first(col_first), .col_last(col_last), .col_row_en(col_re));
 
-    // GELU 뒤 int8 재양자화 곱수 — step 시작 시 한 번 읽어 둡니다
+    // GELU 뒤 int8 재양자화 곱수 — inst 시작 시 한 번 읽어 둡니다
     (* max_fanout = 16 *)
     reg signed [31:0] g_mult_q;
 
@@ -449,7 +449,7 @@ module EvT_Engine #(
 
     // Col_Post 파이프라인이 **비었는지** 봅니다. `gm_done` 은 시스톨릭 배열이
     // 다 쏟은 시점이라, 뒤에 붙은 requant/GELU 단(최대 9)이 아직 값을 들고 있을
-    // 수 있습니다. 그 상태로 step 을 넘기면 마지막 컬럼들이 **다음 step 의
+    // 수 있습니다. 그 상태로 inst 을 넘기면 마지막 컬럼들이 **다음 inst 의
     // AOUT/OSTR** 로 나갑니다 — 전치 드레인에서 이미 한 번 겪은 실패입니다.
     reg [CP_LAT_MAX-1:0] cp_pipe;
     always @(posedge clk) begin
@@ -584,7 +584,7 @@ module EvT_Engine #(
 
     // QK GEMM 의 Q6.9 컬럼을 메모리를 안 거치고 직결
     // **`sm_start` 로 한 번 더 막습니다.** `q_cons` 는 S_DEC 에서 바뀌는데 직전
-    // GEMM 의 Col_Post 파이프는 아직 비워지는 중이라, 그 잔여 컬럼이 새 step 의
+    // GEMM 의 Col_Post 파이프는 아직 비워지는 중이라, 그 잔여 컬럼이 새 inst 의
     // softmax 로 새어 들어갑니다. 그러면 길이가 확정되기 전에 첫 열이 들어가
     // **1열짜리 타일**이 만들어지고, 코어의 뱅크 포인터가 한 칸 어긋나
     // 이후 타일이 이전 길이로 나옵니다 (97 을 넣었는데 53 이 나왔습니다).
@@ -608,15 +608,15 @@ module EvT_Engine #(
     //
     // ## 왜 bf16 곱셈이 아니라 정수인가
     //
-    // 두 step 을 bf16 상수로 곱하면 상수 자체가 가수 8비트로 반올림돼 **비율이
+    // 두 inst 을 bf16 상수로 곱하면 상수 자체가 가수 8비트로 반올림돼 **비율이
     // 0.4 % 흔들립니다.** 결과는 bf16 한 칸(0.4 %)과 같은 크기라 절반이 어긋납니다.
-    // 대신 step 을 `round(step * 2^RSH)` 정수로 두고 정수로 더한 뒤 **한 번만**
+    // 대신 inst 을 `round(inst * 2^RSH)` 정수로 두고 정수로 더한 뒤 **한 번만**
     // bf16 으로 내리면, 반올림이 골든과 같은 자리에서 한 번만 일어납니다.
     // 지수에서 RSH 를 빼는 것은 2의 거듭제곱이라 가수를 건드리지 않습니다.
     //
     // 스케일을 1 근처로 되돌리는 이유는 LayerNorm 의 `eps` 때문입니다 — 임의
     // 스케일로 두면 분산에 더하는 eps 의 상대 크기가 달라집니다.
-    localparam RSH = 20;                       // step 상수의 소수 비트
+    localparam RSH = 20;                       // inst 상수의 소수 비트
     wire res_q = q_flag2[1];
     genvar rg;
     generate
@@ -739,7 +739,7 @@ module EvT_Engine #(
         if (st == S_IDLE) begin
             ar_en = dbg_rd_en; ar_addr = dbg_rd_addr;
         end else if (st == S_GCONST) begin
-            // QK step 시작에 bias_k 워드를 한 번 읽어 둡니다 (GELU 곱수와 같이)
+            // QK inst 시작에 bias_k 워드를 한 번 읽어 둡니다 (GELU 곱수와 같이)
             ar_en = 1'b1; ar_addr = q_AOUT[AW_A-1:0];
         end else begin
             case (q_kind)
@@ -836,7 +836,7 @@ module EvT_Engine #(
     always @* begin
         // GELU 뒤 재양자화 곱수는 그 레이어 채널 뒤(PB + NOUT)에 있습니다
         // attention 의 QK/AV 는 채널별이 아니라 **블록당 스칼라 하나**입니다
-        // (FLAG2[2] 가 서 있는 step 이 정확히 그 둘입니다).
+        // (FLAG2[2] 가 서 있는 inst 이 정확히 그 둘입니다).
         //   ARGMAX 도 **채널별**입니다 — 골든이 `argmax(acc[c]*M[c])` 이고
         //   acc 에 채널 바이어스가 들어갑니다. `K_GEMM` 만 걸어 두면 10클래스가
         //   전부 채널 0 의 곱수를 써서 사실상 `argmax(acc[c])` 가 됩니다.
@@ -888,7 +888,7 @@ module EvT_Engine #(
                         st      <= S_FETCH;
                     end
                 end
-                // Step_Mem 읽기 1사이클
+                // Inst_Mem 읽기 1사이클
                 S_FETCH: begin
                     n_tok <= tok_rd_n;
                     st <= S_DEC;
@@ -957,13 +957,13 @@ module EvT_Engine #(
                                 end else rs_mt <= rs_mt + 1'b1;
                             end else rs_k <= rs_k + 1'b1;
                         end
-                    // 전치 드레인이 **다 쏟기 전에** step 을 넘기면 마지막
-                    // 워드들이 다음 step 의 AOUT/OSTR 로 나갑니다 (실측 256개 중
-                    // 23개가 다음 step 으로 넘어갔습니다).
+                    // 전치 드레인이 **다 쏟기 전에** inst 을 넘기면 마지막
+                    // 워드들이 다음 inst 의 AOUT/OSTR 로 나갑니다 (실측 256개 중
+                    // 23개가 다음 inst 으로 넘어갔습니다).
                     end else if (q_kind == K_GEMM && gm_done && wait_ack
                                  && !tr_run && !tr_arm && !tr_go && !cp_busy
                                  && (q_cons != C_Q69 || sm_done)) begin
-                        // Q6.9 소비자는 softmax 까지 **같은 step** 입니다
+                        // Q6.9 소비자는 softmax 까지 **같은 inst** 입니다
                         gm_start <= 1'b0; sm_start <= 1'b0; st <= S_NEXT;
                     end else if (q_kind == K_LN && ln_done && wait_ack) begin
                         ln_start <= 1'b0; st <= S_NEXT;
