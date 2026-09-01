@@ -68,3 +68,9 @@ __pycache__/
 
 # --- Vitis / Eclipse 워크스페이스 (SDK가 재생성, 174 MB) ---
 workspace/
+
+# --- VCS / Verdi 부산물 (tb_ex 실습) ---
+novas_dump.log
+ucli.key
+verdiLog/
+*.fsdb

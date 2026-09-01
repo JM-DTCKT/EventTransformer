@@ -603,14 +603,50 @@ module EvT_Engine #(
     end
 
     // =========================================================================
-    // RES : 잔차 덧셈 (A_Mem 두 워드를 동시에 읽어 더함)
+    // RES : 잔차 덧셈 — `AOUT[x] = AIN[x] + AOUT[x]`
+    //
+    // A_Mem 두 워드를 동시에 읽어(미러 2벌) 더하고 제자리에 씁니다.
+    //
+    // ## 5단 파이프라인 — 워드당 1사이클
+    //
+    //   S0  주소 발행                              rs_addr_a / rs_addr_b
+    //   S1  A_Mem 두 워드 도착 → 래치              rs_a / rs_b
+    //   S2  덧셈 투입      bf16 : Fp32_Add 1단  |  정수 : 곱·덧셈 → res_int_acc_q
+    //   S3                 bf16 : Fp32_Add 2단  |  정수 : Int32_To_Bf16 → res_int_bf_q
+    //   S4  결과 확정 → A_Mem 쓰기                 rs_sum
+    //
+    // 지연은 5사이클이지만 **매 사이클 새 워드를 발행**하므로 처리율은 1/사이클
+    // 입니다. 두 경로 모두 단수가 같도록 맞춰 두어 제어가 하나면 됩니다.
+    //
+    // 워드끼리는 서로 독립이라(x 마다 읽기 1회·쓰기 1회) 겹쳐 흘려도 안전합니다.
+    // 읽는 주소는 k, 쓰는 주소는 k-4 라 같은 사이클에 같은 칸을 건드리지 않습니다.
     // =========================================================================
-    reg              rs_run;
-    reg [DIM_W-1:0]  rs_k;
-    reg [2:0]        rs_ph;
-    reg [N*16-1:0]   rs_a;
-    reg [N*16-1:0]   rs_b;   // 포트 B 로 읽은 두번째 피연산자
+    reg              rs_run;                 // 발행 중 (마지막 워드를 내면 내려감)
+    reg [DIM_W-1:0]  rs_k;                   // 발행 중인 특징
+    reg [4:1]        rs_vld;                 // 단별 유효 — [1] 수신 … [4] 쓰기
+    reg [N*16-1:0]   rs_a, rs_b;             // S1 래치 (포트 A / 포트 B)
     wire [N*16-1:0]  rs_sum;
+
+    // [타이밍] 행타일 베이스를 **레지스터로 미리** 들고 있습니다. 매 사이클 경로에
+    // 남는 것은 덧셈 하나뿐입니다.
+    //
+    // `base + rs_mt*K + rs_k` 를 그대로 쓰면 `rs_mt` 곱셈(DSP 5단) → 덧셈 →
+    // A_Mem 깊이 캐스케이드의 ENBWREN 디코드가 한 사이클에 들어갑니다. 워드당
+    // 5사이클일 때는 `rs_k` 가 5사이클에 한 번만 바뀌어 여유가 있었지만, 매
+    // 사이클 발행하면 이 경로가 최악이 됩니다 (실측 WNS -0.171 ns).
+    //
+    // 베이스는 행타일이 바뀔 때만 갱신되고 증분이 정확히 K 라, 곱셈 없이
+    // **누적**으로 끝납니다 (`Gemm_Core` 의 `a_tile_base` 와 같은 처방).
+    reg  [AW_A-1:0]  rs_base_a, rs_base_b;
+    wire [AW_A-1:0]  rs_addr_a = rs_base_a + rs_k[AW_A-1:0];
+    wire [AW_A-1:0]  rs_addr_b = rs_base_b + rs_k[AW_A-1:0];
+    reg  [AW_A-1:0]  rs_wr_pipe [0:3];       // [0] 방금 발행 … [3] 4사이클 전
+    integer rs_stage;
+    always @(posedge clk) begin
+        rs_wr_pipe[0] <= rs_addr_b;
+        for (rs_stage = 1; rs_stage < 4; rs_stage = rs_stage + 1)
+            rs_wr_pipe[rs_stage] <= rs_wr_pipe[rs_stage-1];
+    end
     // 보통은 bf16 두 값을 더하지만(`res_is_int`=0), `proc_events` 의
     // `x = seq_init(x) + x_input` 한 자리만 **두 피연산자가 정수 코드이고 scale 이
     // 서로 다릅니다** (0.019991 vs 0.038420).
@@ -657,13 +693,13 @@ module EvT_Engine #(
             wire [15:0] res_fp_bf;
             Fp32_Add u_res_fp_add (
                 .clk(clk), .rst(rst),
-                .in_valid(rs_run && rs_ph == 3'd2 && !res_is_int),
+                .in_valid(rs_vld[2] && !res_is_int),
                 .a({res_a_lane, 16'd0}), .b({res_b_lane, 16'd0}),
                 .out_valid(), .y(res_fp_sum));
             Fp32_To_Bf16 u_res_fp_bf (.f(res_fp_sum), .log2e(6'd0), .y(res_fp_bf));
 
-            // 정수 경로는 ph3(곱·덧셈) + ph4(정규화) 로 2단이라 bf16 경로
-            // (Fp32_Add 2단)와 쓰기 시점(ph5)이 그대로 맞습니다.
+            // 정수 경로도 2단(S2 곱·덧셈 / S3 정규화)이라 bf16 경로(Fp32_Add 2단)와
+            // S4 에서 나란히 도착합니다 — 그래서 제어 루프가 하나면 됩니다.
             reg [15:0] res_int_bf_q;
             always @(posedge clk) res_int_bf_q <= res_int_bf;
 
@@ -824,16 +860,14 @@ module EvT_Engine #(
             end
 
             // ---------------- RES (잔차 덧셈) ----------------
-            // 두 피연산자를 **동시에** 읽습니다 (A_Mem 은 읽기만 독립인 미러 2벌).
-            // 순차 읽기였다면 루프가 위상 6개, 지금은 5개입니다.
+            // 매 사이클 두 워드를 읽으면서(S0) 4사이클 전 워드를 씁니다(S4).
+            // 읽기는 미러 2벌이라 두 포트가 독립이고, 쓰기는 두 벌에 같이 갑니다.
             OP_RES: begin
-                a_ra_en   = rs_run;
-                a_ra_addr = op_ain  + rs_mt * op_k[AW_A-1:0] + rs_k[AW_A-1:0];
-                a_rb_en   = rs_run;
-                a_rb_addr = op_aout + rs_mt * op_k[AW_A-1:0] + rs_k[AW_A-1:0];
-                if (rs_run && rs_ph == 3'd4) begin
+                a_ra_en   = rs_run;   a_ra_addr = rs_addr_a;
+                a_rb_en   = rs_run;   a_rb_addr = rs_addr_b;
+                if (rs_vld[4]) begin
                     a_we_en   = 1'b1;
-                    a_we_addr = op_aout + rs_mt * op_k[AW_A-1:0] + rs_k[AW_A-1:0];
+                    a_we_addr = rs_wr_pipe[3];     // 발행한 주소를 그대로 따라옴
                     a_we_data = rs_sum;
                 end
             end
@@ -891,7 +925,8 @@ module EvT_Engine #(
             // 유닛 기동
             gemm_start <= 1'b0;  ln_start <= 1'b0;  smax_start <= 1'b0;  pos_start <= 1'b0;
             // RES / MEAN 루프
-            rs_run     <= 1'b0;  rs_k     <= 0;  rs_ph   <= 0;  rs_mt    <= 6'd0;
+            rs_run     <= 1'b0;  rs_k     <= 0;  rs_vld  <= 4'd0;  rs_mt  <= 6'd0;
+            rs_base_a  <= {AW_A{1'b0}};  rs_base_b <= {AW_A{1'b0}};
             mean_run   <= 1'b0;  mean_k   <= 0;  mean_mt <= 0;  mean_ph  <= 0;  mean_acc <= 0;
             // 상수 / 결과
             rq_scale2_q  <= 0;    bias_k_word <= 0;
@@ -970,7 +1005,8 @@ module EvT_Engine #(
                         OP_SMAX:   smax_start <= 1'b1;
                         OP_POS:    pos_start  <= 1'b1;
                         OP_RES: begin
-                            rs_run   <= 1'b1;  rs_k   <= 0;  rs_ph   <= 0;  rs_mt <= 6'd0;
+                            rs_run   <= 1'b1;  rs_k   <= 0;  rs_vld <= 4'd0;  rs_mt <= 6'd0;
+                            rs_base_a <= op_ain;   rs_base_b <= op_aout;   // 행타일 0
                         end
                         OP_MEAN: begin
                             mean_run <= 1'b1;  mean_k <= 0;  mean_mt <= 0;
@@ -994,21 +1030,26 @@ module EvT_Engine #(
                         wait_ack <= 1'b1;
 
                     if (op_kind == OP_RES) begin
-                        // ph0 주소 / ph1 두 워드 수신 / ph2 덧셈 투입 / ph3~4 정규화·쓰기
-                        rs_ph <= rs_ph + 1'b1;
-                        if (rs_ph == 3'd1) begin
+                        // 파이프 유효를 한 칸씩 밀고, S1 에서 두 워드를 래치합니다
+                        rs_vld <= {rs_vld[3:1], rs_run};
+                        if (rs_vld[1]) begin
                             rs_a <= a_ra_data;              // 포트 A
                             rs_b <= a_rb_data;              // 포트 B — 같은 사이클
                         end
-                        if (rs_ph == 3'd4) begin
-                            rs_ph <= 0;
+
+                        // **매 사이클** 다음 워드로. 마지막을 발행하면 발행만 멈추고,
+                        // 파이프에 남은 4개가 다 써질 때까지 기다립니다.
+                        if (rs_run) begin
                             if (rs_k != op_k - 1)                rs_k  <= rs_k + 1'b1;
                             else begin
                                 rs_k <= 0;
-                                if (rs_mt != row_tile_last)      rs_mt <= rs_mt + 1'b1;
-                                else begin rs_run <= 1'b0;       state <= ST_NEXT; end
+                                if (rs_mt != row_tile_last) begin
+                                    rs_mt     <= rs_mt + 1'b1;
+                                    rs_base_a <= rs_base_a + op_k[AW_A-1:0];  // 곱셈 대신 누적
+                                    rs_base_b <= rs_base_b + op_k[AW_A-1:0];
+                                end else                         rs_run <= 1'b0;
                             end
-                        end
+                        end else if (!(|rs_vld)) state <= ST_NEXT;
 
                     end else if (op_kind == OP_MEAN) begin
                         // 특징 하나당 : 타일마다 (주소 → 합), 그 뒤 재양자화 · 쓰기
