@@ -38,12 +38,16 @@
 module Format_Cast_Act #(
     parameter N       = 32,
     parameter ACT_W   = 8,
-    parameter PSUM_W  = 32
+    parameter PSUM_W  = 32,
+    // 재양자화 상수를 몇 레인마다 다시 뜰지 (아래 "상수 복제" 참고)
+    parameter LANES_PER_COPY = 8
 )(
     input  wire                     clk,
     input  wire                     rst,
 
     input  wire [1:0]               fmt,   // 0 int8  1 Q4.11+GELU  2 bf16  3 Q6.9
+    // [타이밍] 아래 5개는 **레지스터를 거치지 않은 채** 받습니다. 여기서 레인
+    // 그룹마다 다시 뜨기 때문입니다 (`bias_l[]` 등, 아래 "상수 복제" 참고).
     input  wire signed [PSUM_W-1:0] bias,       // b_int[n]
     input  wire signed [PSUM_W-1:0] mult,       // M[n]  또는  scale(bf16, 하위 16b)
     input  wire [5:0]               shift,
@@ -78,9 +82,43 @@ module Format_Cast_Act #(
     Activation #(.DATA_W(ACT_W), .N(N)) u_act (
         .act_sel(act_sel), .act_parm(act_parm), .din(i8r_bus), .dout(i8a_bus));
 
+    // =========================================================================
+    // 상수 복제 — 재양자화 상수를 LANES_PER_COPY 레인마다 다시 뜹니다
+    //
+    // 엔진에서 한 번만 뜨면 그 플롭 하나가 32레인 x DSP 2계통으로 뻗어,
+    // `bias -> DSP 프리애더 -> 곱셈기 -> ALU` 앞에 배선 2.3 ns 가 붙습니다
+    // (실측 WNS -0.187 ns, LANE[20].u_bf 경로). CLB 96 % 라 `max_fanout` 복제
+    // 지시만으로는 복제본이 레인 근처에 자리를 못 잡습니다.
+    //
+    // 레인마다(32벌) 뜨면 배선은 가장 짧지만 FF 가 2,000개 넘게 늘어 오히려
+    // 혼잡을 키웁니다. 8레인당 1벌 = 4벌이면 팬아웃이 1/4 로 줄면서 FF 증가는
+    // 300개 아래입니다.
+    //
+    // 엔진의 플롭을 **여기로 옮긴 것**이라 bias/mult 의 지연은 그대로입니다
+    // (컬럼마다 바뀌는 값이라 한 사이클도 어긋나면 안 됩니다). shift 계열은
+    // 명령어 내내 상수라 한 단 늦어도 무해합니다.
+    // `dont_touch` 가 없으면 합성기가 복제본을 도로 하나로 합칩니다.
+    // =========================================================================
+    localparam NCOPY = (N + LANES_PER_COPY - 1) / LANES_PER_COPY;
+
+    (* dont_touch = "true" *) reg signed [PSUM_W-1:0] bias_l   [0:NCOPY-1];
+    (* dont_touch = "true" *) reg signed [PSUM_W-1:0] mult_l   [0:NCOPY-1];
+    (* dont_touch = "true" *) reg signed [PSUM_W-1:0] g_mult_l [0:NCOPY-1];
+    (* dont_touch = "true" *) reg        [5:0]        shift_l  [0:NCOPY-1];
+    (* dont_touch = "true" *) reg        [5:0]        g_shift_l[0:NCOPY-1];
+
+    integer c;
+    always @(posedge clk) begin
+        for (c = 0; c < NCOPY; c = c + 1) begin
+            bias_l  [c] <= bias;     mult_l   [c] <= mult;    shift_l[c] <= shift;
+            g_mult_l[c] <= g_mult;   g_shift_l[c] <= g_shift;
+        end
+    end
+
     genvar g;
     generate
         for (g = 0; g < N; g = g + 1) begin : LANE
+            localparam CP = g / LANES_PER_COPY;    // 이 레인이 쓸 복제본
             wire signed [PSUM_W-1:0] a = acc[g*PSUM_W +: PSUM_W];
 
             // ---- INT8 직행 (fmt 0) + 활성함수 ----
@@ -88,7 +126,7 @@ module Format_Cast_Act #(
             Requant_Int #(.ACC_W(PSUM_W), .MUL_W(PSUM_W), .SH_W(6), .OUT_W(ACT_W),
                           .PIPE_PRE(1), .UNSIGNED_OUT(0), .USE_BIAS(1), .BIAS_W(PSUM_W)) u_i8 (
                 .clk(clk), .rst(rst), .in_valid(in_valid && (fmt == FMT_INT8)),
-                .acc(a), .bias(bias), .mult(mult), .shift(shift),
+                .acc(a), .bias(bias_l[CP]), .mult(mult_l[CP]), .shift(shift_l[CP]),
                 .out_valid(v_i8[g]), .out(y_i8r));
 
             // 활성함수는 **32레인 버스 단위**라 루프 밖에서 한 번 겁니다.
@@ -101,7 +139,7 @@ module Format_Cast_Act #(
                           .PIPE_PRE(1), .UNSIGNED_OUT(0), .USE_BIAS(1), .BIAS_W(PSUM_W)) u_16 (
                 .clk(clk), .rst(rst),
                 .in_valid(in_valid && (is_q411 || (fmt == FMT_Q69))),
-                .acc(a), .bias(bias), .mult(mult), .shift(shift),
+                .acc(a), .bias(bias_l[CP]), .mult(mult_l[CP]), .shift(shift_l[CP]),
                 .out_valid(v_16[g]), .out(y_16));
 
             // ---- GELU (Q4.11 → Q4.11) → int8 ----
@@ -122,7 +160,7 @@ module Format_Cast_Act #(
                           .PIPE_PRE(1), .UNSIGNED_OUT(0), .USE_BIAS(0), .BIAS_W(PSUM_W)) u_g8 (
                 .clk(clk), .rst(rst),
                 .in_valid(is_q411 ? vg : (v_i8[g] && req2)),
-                .acc(r2_in), .bias({PSUM_W{1'b0}}), .mult(g_mult), .shift(g_shift),
+                .acc(r2_in), .bias({PSUM_W{1'b0}}), .mult(g_mult_l[CP]), .shift(g_shift_l[CP]),
                 .out_valid(v_g2[g]), .out(y_g8));
 
             // raw16 은 마지막 재양자화(3단)를 안 거치므로 그만큼 늦춰 지연을
@@ -136,11 +174,11 @@ module Format_Cast_Act #(
 
             // ---- bf16 : bias 를 먼저 더하고 scale 을 곱함 ----
             //   골든은 bf16(acc · s_x·s_w[c]) 이고 acc 에 b_int 가 이미 들어 있음
-            wire signed [PSUM_W:0] a_b = $signed(a) + $signed(bias);
+            wire signed [PSUM_W:0] a_b = $signed(a) + $signed(bias_l[CP]);
             wire [15:0]            y_bf;
             Requant_Bf16 #(.ACC_W(PSUM_W+1)) u_bf (
                 .clk(clk), .rst(rst), .in_valid(in_valid && is_bf16),
-                .acc(a_b), .scale(mult[15:0]),
+                .acc(a_b), .scale(mult_l[CP][15:0]),
                 .out_valid(v_bf[g]), .out(y_bf));
 
             // ---- 출력 먹싱 ----

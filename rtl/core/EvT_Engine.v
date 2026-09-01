@@ -258,9 +258,9 @@ module EvT_Engine #(
     // [타이밍] BRAM → 4:1 서브워드 먹스 → 누산기 덧셈 → Requant_Bf16 이 한
     // 사이클에 붙어 있었습니다. 상수를 레지스터로 받아 갈라 놓습니다 (컬럼도
     // 같이 늦추므로 사이클 비용은 타일당 1).
-    // `max_fanout` 은 **복제 지시**입니다 — 이 상수 하나를 Format_Cast_Act 32레인
-    // x2 = DSP 64개, LayerNorm_Top 의 requant, ARGMAX 의 64비트 곱이 동시에 먹어
-    // 배선이 칩 전역으로 뻗습니다. 상수라 복제 비용은 FF 몇 개뿐입니다.
+    // 남은 소비자는 LayerNorm_Top 의 requant 와 ARGMAX 뿐입니다 — Format_Cast_Act
+    // 는 8레인마다 직접 뜨므로(`bias_l[]`) 여기를 거치지 않습니다.
+    // `max_fanout` 은 **복제 지시**입니다. 상수라 복제 비용은 FF 몇 개뿐입니다.
     (* max_fanout = 16 *)
     reg signed [31:0] rq_scale_q, rq_bias_q;
     always @(posedge clk) begin
@@ -387,7 +387,10 @@ module EvT_Engine #(
     wire [N*16-1:0]     fca_data, fca_q69;
     Format_Cast_Act #(.N(N), .ACT_W(ACT_W), .PSUM_W(PSUM_W)) u_fca (
         .clk(clk), .rst(rst), .fmt(op_fmt),
-        .bias(rq_bias_q), .mult(rq_scale_q), .shift(op_shift),
+        // [타이밍] FCA 에는 **레지스터 전** 값을 넘깁니다. 8레인마다 자기 DSP
+        // 근처에서 다시 뜨므로(`Format_Cast_Act.bias_l[]`) 지연은 동일하고,
+        // `rq_*_q` 의 팬아웃에서 32레인 x2 계통이 통째로 빠집니다.
+        .bias(rq_bias), .mult(rq_scale), .shift(op_shift),
         .g_mult(rq_scale2_q), .g_shift(op_shift2),
         .act_sel(op_act), .act_parm(8'd0), .raw16(op_flag[3]), .req2(op_flag2[3]),
         .in_valid(col_valid_d2), .acc(col_data_d2),
