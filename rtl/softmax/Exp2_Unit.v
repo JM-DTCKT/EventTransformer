@@ -1,33 +1,38 @@
-// ============================================================================
-//  exp2_unit.v  --  exp(z) unit,  base-2 변환 + 소수부 PWL-LUT 방식
-// ----------------------------------------------------------------------------
-//  softmax 에서 exp 의 입력은 항상 z = x - max <= 0 이므로 exp(z) in (0, 1].
+// -----------------------------------------------------------------------------
+// Exp2_Unit : exp(z) unit,  base-2 변환 + 소수부 PWL-LUT 방식
 //
-//  [핵심 아이디어]  자연지수를 그대로 근사하지 않고 base-2 로 바꾼 뒤
-//                   "정수부는 시프트, 소수부만 LUT" 로 처리한다.
+// softmax 에서 exp 의 입력은 항상 z = x - max <= 0 이므로 exp(z) in (0, 1].
 //
-//     exp(z) = 2^(z * log2(e))            <- base-2 변환 (상수 1개 곱셈)
-//            = 2^(-u),        u = -z*log2(e) >= 0
-//            = 2^(-n) * 2^(-f),  n = floor(u) 정수부,  f = u - n in [0,1)
-//              └ 배럴 시프트 ┘  └ PWL-LUT ┘
+// ## 핵심 아이디어
 //
-//  LUT 는 f in [0,1) 의 g(f) = 2^-f in (0.5, 1] 하나만 담으면 되고, 동적범위가
-//  2배 이내라 128 세그먼트 선형보간으로 최대오차 6.4e-6 (1.7 LSB) 밖에 안 된다.
+// 자연지수를 그대로 근사하지 않고 base-2 로 바꾼 뒤 **정수부는 시프트,
+// 소수부만 LUT** 으로 처리한다.
 //
-//  [고정소수점 포맷]
-//     z : signed   Q7.9  (17b) = x - max,  범위 (-128, 0]
-//     u : unsigned Q5.9  (14b) = -z 를 16.0 으로 clamp
-//                                (z < -16 이면 exp(z) < 2^-23 -> e = 0 이라 무손실)
-//     t : unsigned Q5.20 (25b) = u * log2(e)   -> n = t[24:20], f = t[19:0]
-//     g : unsigned UQ1.GF      = 2^-f, PWL-LUT + 선형보간, 범위 [2^(GF-1), 2^GF]
-//     e : unsigned UQ1.EF      = g >> (n+1) 반올림,  GF = EF+1,  1.0 = 2^EF
+//    exp(z) = 2^(z * log2(e))            <- base-2 변환 (상수 1개 곱셈)
+//           = 2^(-u),        u = -z*log2(e) >= 0
+//           = 2^(-n) * 2^(-f),  n = floor(u) 정수부,  f = u - n in [0,1)
+//             └ 배럴 시프트 ┘  └ PWL-LUT ┘
 //
-//  [파이프라인]  4 stage, throughput 1 결과/clock
-//     S1 clamp/negate | S2 base-2 변환 & n/f 분리 | S3 LUT+보간 | S4 2^-n 시프트
-// ============================================================================
+// LUT 는 f in [0,1) 의 g(f) = 2^-f in (0.5, 1] 하나만 담으면 되고, 동적범위가
+// 2배 이내라 128 세그먼트 선형보간으로 최대오차 6.4e-6 (1.7 LSB) 밖에 안 된다.
+//
+// ## 고정소수점 포맷
+//
+//    z : signed   Q7.9  (17b) = x - max,  범위 (-128, 0]
+//    u : unsigned Q5.9  (14b) = -z 를 16.0 으로 clamp
+//                               (z < -16 이면 exp(z) < 2^-23 -> e = 0 이라 무손실)
+//    t : unsigned Q5.20 (25b) = u * log2(e)   -> n = t[24:20], f = t[19:0]
+//    g : unsigned UQ1.GF      = 2^-f, PWL-LUT + 선형보간, 범위 [2^(GF-1), 2^GF]
+//    e : unsigned UQ1.EF      = g >> (n+1) 반올림,  GF = EF+1,  1.0 = 2^EF
+//
+// ## 파이프라인
+//
+// 4 stage, throughput 1 결과/clock
+//    S1 clamp/negate | S2 base-2 변환 & n/f 분리 | S3 LUT+보간 | S4 2^-n 시프트
+// -----------------------------------------------------------------------------
 `timescale 1ns/1ps
 
-module exp2_unit #(
+module Exp2_Unit #(
     parameter integer ZW = 17,   // z 폭 (signed Q7.9)
     parameter integer ZF = 9,    // z 소수부 비트수
     parameter integer EW = 17,   // e 폭 (unsigned UQ1.16, = EF+1)
@@ -55,7 +60,7 @@ module exp2_unit #(
 
     // ---- PWL-LUT : exp_base_rom / exp_delta_rom + 폭 상수 EXP_BW / EXP_DW ----
     //      ROM 폭은 생성기가 실제 값 범위에 맞춰 최소화해 emit 한다.
-    `include "exp2_lut.vh"
+    `include "Exp2_Lut.vh"
 
     // ======================= Stage 1 : clamp / negate =======================
     //  u = min(-z, 16.0).  z < -16 은 clamp 해도 결과가 같으므로(e=0) t 폭을
@@ -122,9 +127,9 @@ module exp2_unit #(
     // 포맷 정합성 체크 : e 는 1.0(=2^EF) 을 담아야 하므로 EW = EF+1
     initial begin
         if (EW != EF+1)
-            $display("ERROR: exp2_unit EW(%0d) must be EF+1(%0d)", EW, EF+1);
+            $display("ERROR: Exp2_Unit EW(%0d) must be EF+1(%0d)", EW, EF+1);
         if (EXP_BW != GF+1)
-            $display("ERROR: exp2_lut.vh EXP_BW(%0d) != GF+1(%0d) — LUT 재생성 필요",
+            $display("ERROR: Exp2_Lut.vh EXP_BW(%0d) != GF+1(%0d) — LUT 재생성 필요",
                      EXP_BW, GF+1);
     end
 endmodule

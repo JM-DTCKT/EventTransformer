@@ -32,7 +32,7 @@ need=(
     "$XSA"
     sw/main_evt.c
     board/load_ddr.tcl
-    data/wmem.bin data/pbmem.bin data/pgmem.bin data/stepmem.bin
+    data/wmem.bin data/rqmem.bin data/afmem.bin data/instmem.bin
     data/latinit.bin data/bkv.bin data/posmem.bin
     data/board/amem_x.int16.bin data/board/amem_pidx.int16.bin
     data/board/board_index.int32.bin data/board/board_samples.int32.bin

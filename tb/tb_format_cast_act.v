@@ -1,18 +1,17 @@
-// tb_colpost_ev : 컴파일 + ReLU 분기 스모크. 정밀 검증은 tb_evt(통합) 에서.
+// tb_format_cast_act : 컴파일 + ReLU 분기 스모크. 정밀 검증은 tb_evt(통합) 에서.
 `timescale 1ns/1ps
-module tb_colpost_ev;
+module tb_format_cast_act;
   localparam N=32, ACT_W=8, PSUM_W=32;
   reg clk=0, rst=1; always #5 clk=~clk;
-  reg [1:0] consumer=0, act_sel=0;
+  reg [1:0] fmt=0, act_sel=0;
   reg [7:0] act_parm=0;
   reg signed [PSUM_W-1:0] bias=0, mult=0, g_mult=0;
   reg [5:0] shift=0, g_shift=0;
   reg in_valid=0, raw16=0, req2=0;
   reg [N*PSUM_W-1:0] acc=0;
   wire out_valid; wire [N*16-1:0] out_data, out_q69;
-  Format_Cast_Act #(.N(N), .ACT_W(ACT_W), .PSUM_W(PSUM_W),
-                .GELU_LUT_FILE("../../nl_export/lut/gelu.hex")) dut (
-    .clk(clk), .rst(rst), .consumer(consumer), .bias(bias), .mult(mult),
+  Format_Cast_Act #(.N(N), .ACT_W(ACT_W), .PSUM_W(PSUM_W)) dut (
+    .clk(clk), .rst(rst), .fmt(fmt), .bias(bias), .mult(mult),
     .shift(shift), .g_mult(g_mult), .g_shift(g_shift),
     .act_sel(act_sel), .act_parm(act_parm), .raw16(raw16), .req2(req2),
     .in_valid(in_valid), .acc(acc),
@@ -20,9 +19,9 @@ module tb_colpost_ev;
 
   integer errors=0, checks=0, i;
   reg signed [15:0] got;
-  task drive(input [1:0] cons, input [1:0] sel, input integer v);
+  task drive(input [1:0] f, input [1:0] sel, input integer v);
     begin
-      consumer=cons; act_sel=sel; mult=32'sd1<<20; shift=6'd20; bias=0;
+      fmt=f; act_sel=sel; mult=32'sd1<<20; shift=6'd20; bias=0;
       @(negedge clk); in_valid=1;
       for (i=0;i<N;i=i+1) acc[i*PSUM_W +: PSUM_W] = (i%2) ? v : -v;
       @(posedge clk); @(negedge clk); in_valid=0;
@@ -34,7 +33,7 @@ module tb_colpost_ev;
   endtask
 
   initial begin
-    $display("[tb_colpost_ev] 소비자 분기 + ReLU");
+    $display("[tb_format_cast_act] 소비자 분기 + ReLU");
     repeat(4) @(posedge clk); rst=0; @(posedge clk);
 
     drive(2'd0, 2'd0, 100);            // INT8, 활성 없음 → 음수 보존
@@ -62,8 +61,8 @@ module tb_colpost_ev;
     $display("  ReLU      lane0=%0d lane1=%0d  (기대 0, 100)",
              $signed(out_data[15:0]), $signed(out_data[31:16]));
 
-    if (errors==0) $display("=== tb_colpost_ev: %0d checks, TEST PASSED ===", checks);
-    else           $display("=== tb_colpost_ev: %0d/%0d failed, TEST FAILED ===", errors, checks);
+    if (errors==0) $display("=== tb_format_cast_act: %0d checks, TEST PASSED ===", checks);
+    else           $display("=== tb_format_cast_act: %0d/%0d failed, TEST FAILED ===", errors, checks);
     $finish;
   end
 endmodule

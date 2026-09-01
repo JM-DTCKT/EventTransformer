@@ -1,12 +1,12 @@
 // ============================================================================
-//  exp2_lut.vh -- exp 유닛 소수부 PWL LUT   (AUTO-GENERATED, do not hand-edit)
+//  Exp2_Lut.vh -- exp 유닛 소수부 PWL LUT   (AUTO-GENERATED, do not hand-edit)
 // ----------------------------------------------------------------------------
 //  g(f) = 2^-f ,  f in [0,1)  ->  g in (0.5, 1],  UQ1.17 로 저장
 //  128 세그먼트 균일분할, 세그먼트 내 위치 13b
 //     g = exp_base_rom[seg] + ((exp_delta_rom[seg]*frac + (1<<12)) >>> 13)
 //  ROM 폭은 실제 값 범위에 맞춰 최소화 : base 18b(unsigned), delta 11b(signed)
 //  최대 근사오차 = 1.019e-05  (= 1.34 LSB of 2^-17)
-//  * 세그먼트 수/EF 를 바꾸면 exp2_unit.v 의 SEGB 와 함께 재생성해야 한다.
+//  * 세그먼트 수/EF 를 바꾸면 Exp2_Unit.v 의 SEGB 와 함께 재생성해야 한다.
 // ============================================================================
 localparam integer EXP_BW = 18;   // base ROM 폭 (unsigned)
 localparam integer EXP_DW = 11;   // delta ROM 폭 (signed)

@@ -12,18 +12,18 @@
 #                             └─→ evt_accel_0 / s_axi      제어·핸드셰이크·결과
 #   PS ←─HP0(128b)─ smc_data ←┬── axi_dma_0 / M_AXI_MM2S
 #                             └── axi_dma_0 / M_AXI_S2MM
-#   axi_dma_0 / M_AXIS_MM2S(128b) ──→ evt_accel_0 / s_axis  W/A/PB/PG/Step 적재
+#   axi_dma_0 / M_AXIS_MM2S(128b) ──→ evt_accel_0 / s_axis  W/A/RQ/AF/INST 적재
 #   axi_dma_0 / S_AXIS_S2MM(128b) ←── evt_accel_0 / m_axis  A_Mem 덤프
 #
 # `fpga_nl` 과 다른 점:
 #
-#  1. **DMA 가 자주 돕니다.** step 프로그램은 한 번이지만 X/pos enc 는 타임스텝
+#  1. **DMA 가 자주 돕니다.** 명령어 프로그램은 한 번이지만 X/pos enc 는 타임스텝
 #     마다 들어갑니다 (샘플당 20번 x 2). 가장 큰 전송은 여전히 W_Mem 448 KB 한
 #     방이라 `c_sg_length_width` 는 26 그대로입니다.
 #  2. **LUT 이 4종**입니다 (gelu 는 이제 PWL 이라 `.vh` 로 들어가지만, exp/recip/
 #     rsqrt 는 여전히 `$readmemh`). 못 읽어도 **경고로 끝나므로** 합성 로그를
 #     검사합니다 — 0 으로 채워진 채 보드에 올라가면 softmax 가 전부 0 입니다.
-#  3. **`gelu_lut.vh`** 는 `\`include` 라 add_files 대신 include 경로가 필요합니다
+#  3. **`Gelu_Lut.vh`** 는 `\`include` 라 add_files 대신 include 경로가 필요합니다
 #     (`rtl/` 안에 같이 있으므로 자동으로 잡힙니다).
 # =============================================================================
 
@@ -55,7 +55,7 @@ set_property board_part $BOARD [current_project]
 # rtl/ 안의 심볼릭 링크는 glob 이 그대로 따라갑니다 (Gelu/Bf16/LayerNorm/Softmax/
 # Requant/Mac_OS 의 실체 파일). 공용 모듈을 복사하지 않는 이유입니다.
 # rtl/ 은 모듈별 하위 디렉토리로 정리돼 있습니다 (core/ axi/ gemm_core/ …).
-# 최상위 top.v 와 하위 디렉토리를 모두 훑습니다.
+# 최상위 Top.v 와 하위 디렉토리를 모두 훑습니다.
 add_files -norecurse [concat [glob -nocomplain $rtl/*.v] [glob -nocomplain $rtl/*/*.v]]
 
 # LUT 초기화 파일 — 반드시 프로젝트 안에 있어야 $readmemh 가 찾습니다
@@ -64,10 +64,10 @@ add_files -norecurse [concat [glob -nocomplain $rtl/*.v] [glob -nocomplain $rtl/
 #
 # 헤더는 **프로젝트에 넣고 파일 타입을 지정**해야 합니다 — glob *.v 로는 안
 # 잡히고, 없으면 create_bd_cell 이 통째로 실패합니다.
-#   gelu_lut   PWL GELU 의 base/delta 64쌍
+#   Gelu_Lut   PWL GELU 의 base/delta 64쌍
 #   exp2/recip 새 softmax 코어 (`SOFTMAX/`)
 #   rsqrt      새 LayerNorm 코어 (`LAYERNORM/`)
-foreach vh {gelu/gelu_lut.vh softmax/exp2_lut.vh softmax/recip_lut.vh layernorm/rsqrt_lut.vh} {
+foreach vh {gelu/Gelu_Lut.vh softmax/Exp2_Lut.vh softmax/Recip_Lut.vh layernorm/Rsqrt_Lut.vh} {
     if {![file exists $rtl/$vh]} { error ">>> rtl/$vh 없음" }
     add_files -norecurse -fileset sources_1 $rtl/$vh
     set_property file_type {Verilog Header} [get_files $rtl/$vh]
@@ -121,7 +121,7 @@ set_property -dict [list \
     CONFIG.c_s2mm_burst_size         {16} \
 ] [get_bd_cells axi_dma_0]
 
-create_bd_cell -type module -reference top evt_accel_0
+create_bd_cell -type module -reference Top evt_accel_0
 puts "\n>>> evt_accel_0 추론된 인터페이스:"
 foreach ip [get_bd_intf_pins evt_accel_0/*] {
     puts [format "      %-28s %s" [get_property NAME $ip] [get_property VLNV $ip]]
@@ -203,7 +203,7 @@ set slog $outd/$PROJ/$PROJ.runs/synth_1/runme.log
 if {[file exists $slog]} {
     set fh [open $slog r]; set txt [read $fh]; close $fh
     set bad 0
-    foreach f {gelu_lut.vh exp2_lut.vh recip_lut.vh rsqrt_lut.vh} {
+    foreach f {Gelu_Lut.vh Exp2_Lut.vh Recip_Lut.vh Rsqrt_Lut.vh} {
         if {[regexp "Cannot open include file.*$f" $txt] ||
             [regexp "$f.*not found" $txt]} {
             puts ">>> \[치명\] $f 를 못 읽었습니다"

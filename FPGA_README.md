@@ -21,8 +21,8 @@ DVS128 제스처 인식용 **EvT(Event Transformer)** 가속기입니다. attent
 
 | 파일 | 내용 |
 |---|---|
-| [`docs/evt_arch.png`](docs/evt_arch.png) | 전체 — 로컬 PC → DDR → PS → AXI → `Evt_Accel` → `EvT_Engine` 데이터패스 |
-| [`docs/evt_gemm_pingpong.png`](docs/evt_gemm_pingpong.png) | `Gemm_Core_Ev` 내부 — systolic 배열과 ping-pong 누산기 |
+| [`docs/evt_arch.png`](docs/evt_arch.png) | 전체 — 로컬 PC → DDR → PS → AXI → `Top` → `EvT_Engine` 데이터패스 |
+| [`docs/evt_gemm_pingpong.png`](docs/evt_gemm_pingpong.png) | `Gemm_Core` 내부 — systolic 배열과 ping-pong 누산기 |
 
 아래 mermaid 그림과 같은 내용이고, PNG 쪽이 주소·포맷까지 더 자세합니다.
 재생성은 [§12](#12-그림-재생성) 참고.
@@ -38,7 +38,7 @@ flowchart TB
     RDS["real_dvs_script/<br/>이벤트 전처리 · 토큰 · pos_idx"]
     QNT["quantization/<br/>PTQ w8a8 정수 골든"]
     SW["sw/pack_evt.py<br/>sw/schedule_evt.py<br/>sw/export_board_evt.py"]
-    BIN["*.bin — DDR 이미지<br/>wmem · pbmem · pgmem · stepmem<br/>posmem · latinit · bkv · amem_x · pidx"]
+    BIN["*.bin — DDR 이미지<br/>wmem · rqmem · afmem · instmem<br/>posmem · latinit · bkv · amem_x · pidx"]
     RDS --> SW
     QNT --> SW
     SW --> BIN
@@ -54,12 +54,12 @@ flowchart TB
     APU -.디스크립터.-> DMA
   end
 
-  subgraph PL["③ PL — Evt_Accel"]
+  subgraph PL["③ PL — Top"]
     direction TB
     AXIL["AXI4-Lite 레지스터 파일<br/>0xA001_0000"]
-    LDR["Axis_Loader_Ev<br/>sel 0~5"]
+    LDR["Axis_Loader<br/>sel 0~5"]
     DMP["Axis_Dump"]
-    ENG["EvT_Engine<br/>step 프로그램 실행기"]
+    ENG["EvT_Engine<br/>명령어 프로그램 실행기"]
     AXIL -.제어.-> ENG
     AXIL -.arm.-> LDR
     LDR --> ENG
@@ -77,8 +77,8 @@ flowchart TB
 
 | | 무엇이 오가나 |
 |---|---|
-| **AXI4-Lite** (HPM0, 32b) | `start` · `LOAD_SEL/BASE` · `N_TIME` · `TOK_N/TOK_ACK` ↔ `STATUS`(done·busy·**tok_req**·t) · `RES_CLASS` |
-| **AXI-Stream** (DMA, 128b) | 가중치·활성값·step 프로그램 적재(MM2S), A_Mem 덤프(S2MM) |
+| **AXI4-Lite** (HPM0, 32b) | `start` · `LOAD_SEL/BASE` · `N_TSTEP` · `TOK_N/TOK_ACK` ↔ `STATUS`(done·busy·**tok_req**·t) · `RES_CLASS` |
+| **AXI-Stream** (DMA, 128b) | 가중치·활성값·명령어 프로그램 적재(MM2S), A_Mem 덤프(S2MM) |
 
 ---
 
@@ -87,29 +87,39 @@ flowchart TB
 `rtl/` 을 열면 **절반이 심볼릭 링크**입니다. 이게 이 프로젝트의 구성 원칙입니다 —
 비선형 유닛과 공용 산술은 별도 리포에서 개발·검증하고 링크로 끌어옵니다.
 
-| 부류 | 파일 |
+모듈명·파일명은 **PascalCase_Snake** 로 통일돼 있고, 파일 하나에 모듈 하나입니다
+(`rtl/NAMING.md` §6). 디렉토리는 역할별입니다.
+
+| 디렉토리 | 파일 |
 |---|---|
-| **이 프로젝트 고유** (9) | `Evt_Accel.v` `EvT_Engine.v` `Gemm_Core_Ev.v` `Col_Post_Ev.v` `Pos_Gather.v` `Transpose32.v` `Axis_Loader_Ev.v` **`PE_Array_Pp.v` `PE_OS_Pp.v`** |
-| **래퍼** (2) | `Softmax_Attn.v` `LayerNorm_Ev.v` — 엔진 쪽 인터페이스는 고정, 속만 새 코어로 |
-| **링크 재사용** (22) | `Bram_Sdp` `PE_OS` `Skew_Buf` `Tile_Ctrl` → `../../fpga`<br/>`Requant_*` `LN_Affine` `Int32_To_Bf16` → `../../Requant`<br/>`Fp32_Add` `Fp32_To_Bf16` → `../../Bf16`<br/>`softmax_top` `exp2_unit` `recip_unit` → `../../SOFTMAX`<br/>`layernorm_top` `rsqrt_unit` `bf16_to_fix` → `../../layernorm`<br/>`gelu_pwl` `gelu_lut.vh` → `../../GELU` |
+| `rtl/` | `Top.v` — 보드 최상위 |
+| `rtl/core/` | `EvT_Engine.v` `Format_Cast_Act.v` `Pos_Gather.v` `Transpose32.v` `Bram_Sdp.v` |
+| `rtl/gemm_core/` | `Gemm_Core.v` `PE_Array.v` `PE_OS.v` `Skew_Buf.v` |
+| `rtl/axi/` | `Axis_Loader.v` `Axis_Dump.v` |
+| `rtl/layernorm/` | `LayerNorm_Top.v`(래퍼) `LayerNorm_Unit.v`(코어) `Rsqrt_Unit.v` `LayerNorm_Affine.v` `Rsqrt_Lut.vh` |
+| `rtl/softmax/` | `Softmax_Top.v`(래퍼) `Softmax_Unit.v`(코어) `Exp2_Unit.v` `Recip_Unit.v` `Exp2_Lut.vh` `Recip_Lut.vh` |
+| `rtl/gelu/` | `Gelu_Pwl.v` `Gelu_Lut.vh` |
+| `rtl/requant/` | `Requant_Int.v` `Requant_Bf16.v` |
+| `rtl/vector_alu/` | `Bf16_To_Fix.v` `Q411_To_Fix.v` `Int32_To_Bf16.v` `Fp32_Add.v` `Fp32_To_Bf16.v` |
+| `rtl/activation/` | `Activation.v` |
 
 ### 계층
 
 ```
-Evt_Accel                        보드 최상위 (AXI-Lite + AXI-Stream)
-├── Axis_Loader_Ev               DMA → 온칩 메모리 6종
+Top                        보드 최상위 (AXI-Lite + AXI-Stream)
+├── Axis_Loader                  DMA → 온칩 메모리 6종
 ├── Axis_Dump                    A_Mem → DMA
-└── EvT_Engine                   step 프로그램 실행기 (962줄)
-    ├── Bram_Sdp × 6             Step / W / A_Mem×2 / PB / PG
-    ├── Gemm_Core_Ev             32×32 systolic GEMM
+└── EvT_Engine                   명령어 프로그램 실행기
+    ├── Bram_Sdp × 6             Inst_Mem / W_Mem / A_Mem×2 / Requant_Mem / Affine_Mem
+    ├── Gemm_Core                32×32 systolic GEMM
     │   ├── Skew_Buf × 2         A/B 삼각 지연
-    │   └── PE_Array_Pp          ★ ping-pong mesh
-    │       └── PE_OS_Pp × 1024  DSP48E2 + shadow
-    ├── Col_Post_Ev              컬럼 → 소비자 포맷 4종
+    │   └── PE_Array           ★ ping-pong mesh
+    │       └── PE_OS × 1024     DSP48E2 + shadow
+    ├── Format_Cast_Act          컬럼 → 출력 포맷 4종
     │   ├── Activation · Requant_Int · Requant_Bf16
-    │   └── gelu_pwl
-    ├── LayerNorm_Ev  ──► layernorm_top · rsqrt_unit · bf16_to_fix · LN_Affine
-    ├── Softmax_Attn  ──► softmax_top · exp2_unit · recip_unit
+    │   └── Gelu_Pwl
+    ├── LayerNorm_Top ──► LayerNorm_Unit · Rsqrt_Unit · Bf16_To_Fix · LayerNorm_Affine
+    ├── Softmax_Top   ──► Softmax_Unit · Exp2_Unit · Recip_Unit
     ├── Transpose32              V 전용 corner-turn
     ├── Pos_Gather               pos enc 온칩 게더
     └── Int32_To_Bf16 · Fp32_Add · Fp32_To_Bf16    잔차 경로
@@ -134,11 +144,11 @@ RTL 에 재배치 회로가 하나도 없는 대신 파이썬이 전부 미리 �
 
 | 스크립트 | 읽는 것 | 만드는 것 |
 |---|---|---|
-| `sw/pack_evt.py` | `fpga_export/*.bin` + `manifest.json` | `wmem.bin` `pbmem.bin` `pgmem.bin` `posenc.int8.bin` `posmem.bin` `latinit.bin` `bkv.bin` |
-| `sw/schedule_evt.py` | 위 + manifest | `stepmem.bin` — 주소 계획 + step 122개 |
+| `sw/pack_evt.py` | `fpga_export/*.bin` + `manifest.json` | `wmem.bin` `rqmem.bin` `afmem.bin` `posenc.int8.bin` `posmem.bin` `latinit.bin` `bkv.bin` |
+| `sw/schedule_evt.py` | 위 + manifest | `instmem.bin` — 주소 계획 + 명령어 123개 |
 | `sw/export_board_evt.py` | `real_dvs_script/data/*` + `posenc.int8.bin` | `amem_x.int16.bin` `amem_pidx.int16.bin` `board_index/samples.int32.bin` |
 
-> `pack_evt.py` 를 다시 돌리면 PB 베이스가 밀리므로 **`schedule_evt.py` 도 반드시**
+> `pack_evt.py` 를 다시 돌리면 Requant_Mem 베이스가 밀리므로 **`schedule_evt.py` 도 반드시**
 > 다시 돌려야 합니다.
 
 ### 3.1 규칙은 하나입니다 — "워드 = 32레인"
@@ -230,7 +240,7 @@ PS 가 이걸 읽고 DMA 길이를 정합니다.
 
 ---
 
-### 예시 ③ bias·재양자화 곱수 → `pbmem.bin`
+### 예시 ③ bias·재양자화 곱수 → `rqmem.bin`
 
 **원본**: 레이어마다 `*.B.int32.bin`(bias, int32)과 `*.M.int32.bin`(곱수, int32),
 각각 출력채널 수만큼.
@@ -245,18 +255,18 @@ event_projection : ch0 (M,b) = (1035702804, -1026)
 **규칙**: 채널마다 `{mult 4B, bias 4B}` = 8 B, **4채널/워드**(32 B), 리틀엔디언.
 
 ```
-pbmem.bin 워드0 = 1492bb3d feffffff  b2cb4128 94f2ffff
+rqmem.bin 워드0 = 1492bb3d feffffff  b2cb4128 94f2ffff
                   └M[0]─┘ └b[0]──┘  └M[1]─┘ └b[1]──┘  … ch2, ch3
 ```
 
-**레이어 채널 뒤에 한 칸이 더 붙습니다.** 엔진이 step 시작(`S_GCONST`)에 `PB + NOUT`
+**레이어 채널 뒤에 한 칸이 더 붙습니다.** 엔진이 명령어 시작(`ST_CONST`)에 `RQ_BASE + NOUT`
 을 한 번 읽는데, 레이어를 빈틈없이 붙이면 그 자리가 **다음 레이어의 채널 0** 이 됩니다.
 통합 TB 에서 결과가 −128 로 포화해 드러난 실제 버그라, 모든 레이어 뒤에 한 칸씩 둡니다.
 그 칸에는 GELU 뒤 int8 재양자화 곱수가 들어갑니다.
 
 ---
 
-### 예시 ④ LayerNorm gamma/beta → `pgmem.bin`
+### 예시 ④ LayerNorm gamma/beta → `afmem.bin`
 
 **원본**: `*.layer_norm.weight.int16.bin`(gamma, **Q1.14**), `*.bias.int16.bin`(beta, **Q4.11**).
 
@@ -268,11 +278,11 @@ proc_embs_block.layer_norm : gamma[:4] = [18059, 17570, 18025, 16826]   (Q1.14 �
 **규칙**: 특징마다 `{gamma 2B, beta 2B}` = 4 B, **8특징/워드**(32 B).
 
 ```
-pgmem.bin 워드0 = 8b46 dbff  a244 3800  6946 6a00  ba41 3c00 …
+afmem.bin 워드0 = 8b46 dbff  a244 3800  6946 6a00  ba41 3c00 …
                   └γ0┘ └β0┘  └γ1┘ └β1┘  └γ2┘ └β2┘  └γ3┘ └β3┘
 ```
 
-> LayerNorm 만 메모리를 **둘** 씁니다 — PG(gamma/beta, 특징별)와 PB(재양자화 스칼라 하나).
+> LayerNorm 만 메모리를 **둘** 씁니다 — Affine_Mem(gamma/beta, 특징별)과 Requant_Mem(재양자화 스칼라 하나).
 
 ---
 
@@ -280,11 +290,11 @@ pgmem.bin 워드0 = 8b46 dbff  a244 3800  6946 6a00  ba41 3c00 …
 
 여기만 **값을 손댑니다.** 나머지는 순수 재배치인데 pos 표는 격자를 옮겨야 합니다.
 
-**원본**: `pos_encoding` 표 `(21, 21, 64)` int8, 자기 step `0.0100732`.
+**원본**: `pos_encoding` 표 `(21, 21, 64)` int8, 자기 scale `0.0100732`.
 
 문제는 A_Mem 한 행이 `preproc` 의 입력 벡터 160 개 전부(= projection 96 + pos 64)이고,
-**GEMM 은 입력 step 이 하나**라는 것입니다. 골든도 `cat([gelu_out, pos_embs])` 를 통째로
-`preproc` 의 입력 step 으로 양자화합니다. 그래서 소비자 격자로 옮겨 담습니다:
+**GEMM 은 입력 scale 이 하나**라는 것입니다. 골든도 `cat([gelu_out, pos_embs])` 를 통째로
+`preproc` 의 입력 scale 로 양자화합니다. 그래서 소비자 격자로 옮겨 담습니다:
 
 ```
 code_hw = round(code_tbl * 0.0100732 / 0.0847092)      비율 0.1189
@@ -363,7 +373,7 @@ head 마다 워드 하나인 이유는 attention 이 **head-major** 로 저장�
 
 ---
 
-### 예시 ⑧ 실행 스케줄 → `stepmem.bin`
+### 예시 ⑧ 실행 스케줄 → `instmem.bin`
 
 `schedule_evt.py` 가 **주소 계획과 실행 순서를 먼저 확정**하고 그걸 256b 워드로 굽습니다.
 RTL 은 이 표를 실행만 합니다.
@@ -389,31 +399,31 @@ RTL 은 이 표를 실행만 합니다.
 | `FFN` | 7,265 | 384 | 블록 내 FFN 중간 int8 |
 | **합계** | | **7,649** | A_Mem 8,261 워드 이내 |
 
-**step 워드 인코딩** — 8 × 32b = 256b, 리틀엔디언:
+**명령어 워드 인코딩** — 8 × 32b = 256b, 리틀엔디언:
 
 ```
-w0  KIND[3:0] CONS[5:4] ACT[7:6] VAR[11:8] FLAG[15:12] SHIFT[21:16] GSH[27:22] FLAG2[31:28]
+w0  KIND[3:0] FMT[5:4] ACT[7:6] VAR[11:8] FLAG[15:12] SHIFT[21:16] SHIFT2[27:22] FLAG2[31:28]
 w1  M      w2  K      w3  NOUT
 w4  AIN    w5  BIN    w6  AOUT
-w7  PB[15:0] | OSTR[31:16]
+w7  RQ_BASE[15:0] | OSTR[31:16]
 ```
 
-**step 0 — `pos_gather`** (`stepmem.bin` 을 디코드한 실제 값):
+**명령어 0 — `pos_gather`** (`instmem.bin` 을 디코드한 실제 값):
 
 ```
 w0 = 0x00000106
-     KIND=6(POS)  CONS=0  ACT=0  VAR=0b0001  FLAG=0  SHIFT=0  GSH=0  FLAG2=0
+     KIND=6(POS)  FMT=0  ACT=0  VAR=0b0001  FLAG=0  SHIFT=0  SHIFT2=0  FLAG2=0
 M=123  K=64  NOUT=64   AIN=576(PIDX)  AOUT=580(PIN)  OSTR=160
 ```
 
 `VAR[0]=1` 이므로 **`M` 은 발행 시점에 `n_tok` 으로 덮어써집니다.** 파일의 123 은
 최악치 자리표시이고 실제로는 52·49·46… 이 들어갑니다.
 
-**step 1 — `event_projection`**:
+**명령어 1 — `event_projection`**:
 
 ```
 w0 = 0x09a10110
-     KIND=0(GEMM)  CONS=1(Q4.11→GELU→int8)  VAR=0b0001  SHIFT=33  GSH=38
+     KIND=0(GEMM)  FMT=1(Q4.11→GELU→int8)  VAR=0b0001  SHIFT=33  SHIFT2=38
 M=123  K=144  NOUT=96   AIN=0(X)  BIN=0(W_Mem)  AOUT=580(PIN)  OSTR=160
 ```
 
@@ -422,7 +432,7 @@ M=123  K=144  NOUT=96   AIN=0(X)  BIN=0(W_Mem)  AOUT=580(PIN)  OSTR=160
 "projection 96 + pos 64" 를 한 벡터로 잇는 장치입니다.
 
 ```
-stepmem.bin = 3,936 B / 32 = 123 워드   (본체 118 + 꼬리 5)
+instmem.bin = 3,936 B / 32 = 123 워드   (본체 118 + 꼬리 5)
 ```
 
 > **stride 를 최악치로 고정한 이유** — 영역 크기를 `n_tok` 에 맞추면 베이스가 매번
@@ -474,7 +484,7 @@ pos 이미지를 대체한 것입니다.
 52 49 46 51 40 24 18 26 28 36 45 44 36 37 30 29 28 27 21 28
 ```
 
-step 프로그램은 이 20 타임스텝 내내 **한 글자도 안 바뀝니다.** `VAR` 비트가
+명령어 프로그램은 이 20 타임스텝 내내 **한 글자도 안 바뀝니다.** `VAR` 비트가
 `M`/`NOUT`/`K`/`C` 를 발행 시점에 이 값으로 채울 뿐입니다.
 
 ---
@@ -491,13 +501,13 @@ step 프로그램은 이 20 타임스텝 내내 **한 글자도 안 바뀝니다
 | `N` `E` `LATENT` `HEADS` `HEAD_DIM` `N_CLASS` `T_MAX` `TOK_MAX` | 32 / 128 / 96 / 4 / 32 / 10 / 20 / 128 |
 | `words` | `{w: 14000, pb: 869, pg: 208}` — 각 메모리가 쓴 워드 수 |
 | `w_base` `w_shape` | 레이어 → W_Mem 시작 워드 / `[Eo, Ei]`<br/>`event_projection: 0, [96,144]` → `preproc: 432, [128,160]` |
-| `pb_base` `pg_base` `attn_pb` `ln_pb` | 레이어 → PB/PG 시작 |
+| `rq_base` `af_base` `attn_rq` `ln_rq` | 레이어 → Requant_Mem / Affine_Mem 시작 |
 | `gelu_mult` `gelu_shift` `ln_shift` `ln_xsh` | 재양자화 상수, LayerNorm 고정소수점 창 |
-| `pos_encoding` | `{shape, step, table_step, file, pl_table}` — 예시 ⑤ 의 비율이 여기 |
-| `input_steps` `shifts` `in_proj_bands` | 격자 정보 (TB 골든 생성용) |
+| `pos_encoding` | `{shape, scale, table_scale, file, pl_table}` — 예시 ⑤ 의 비율이 여기 |
+| `input_scales` `shifts` `in_proj_bands` | 격자 정보 (TB 골든 생성용) |
 
 `schedule_evt.py` 가 이걸 읽어 주소를 정하고, `export_board_evt.py` 가 `pos_encoding`
-을, `golden_steps.py` 가 격자를 씁니다.
+을, `golden_insts.py` 가 격자를 씁니다.
 
 **`schedule.json`** (`schedule_evt.py` 가 생성) — "무엇을 어떤 순서로":
 
@@ -507,7 +517,7 @@ step 프로그램은 이 20 타임스텝 내내 **한 글자도 안 바뀝니다
 | `regions` | A_Mem 영역 표 (위 §예시 ⑧) |
 | `a_words` | 7,649 — A_Mem 사용량 |
 | `n_body` `n_tail` | **118 / 5** |
-| `steps` `tail` | step 하나하나의 dict — `stepmem.bin` 의 사람이 읽는 판 |
+| `insts` `tail` | 명령어 하나하나의 dict — `instmem.bin` 의 사람이 읽는 판 |
 
 `steps[i]` 는 인코딩 전 원본이라 디버깅에 씁니다:
 
@@ -515,11 +525,11 @@ step 프로그램은 이 20 타임스텝 내내 **한 글자도 안 바뀝니다
 {"kind": 0, "name": "event_projection",
  "layer": "backbone.event_projection.seq_init.0",
  "M": 123, "K": 144, "NOUT": 96, "AIN": 0, "BIN": 0, "AOUT": 580,
- "CONS": 1, "SHIFT": 33, "GSH": 38, "OSTR": 160, "VAR": 1,
+ "FMT": 1, "SHIFT": 33, "SHIFT2": 38, "OSTR": 160, "VAR": 1,
  "note": "144→96, Q4.11→GELU→int8. PIN 앞쪽 96워드에 씀 (stride 160)"}
 ```
 
-> `STATUS[13:6]` 이 현재 step 번호를 줍니다. 보드가 멈추면 그 번호로 `schedule.json`
+> `STATUS[13:6]` 이 현재 명령어 번호를 줍니다. 보드가 멈추면 그 번호로 `schedule.json`
 > 의 `steps[n]` 을 찾아 **어느 레이어에서 섰는지** 바로 압니다.
 
 ---
@@ -528,7 +538,7 @@ step 프로그램은 이 20 타임스텝 내내 **한 글자도 안 바뀝니다
 
 | DDR 주소 | 파일 |
 |---|---|
-| `0x1000_0000` ~ `0x1015_0000` | `wmem` `pbmem` `pgmem` `stepmem` `latinit` `bkv` `posmem` |
+| `0x1000_0000` ~ `0x1015_0000` | `wmem` `rqmem` `afmem` `instmem` `latinit` `bkv` `posmem` |
 | `0x2000_0000` | `amem_x.int16.bin` |
 | `0x3000_0000` | `amem_pidx.int16.bin` |
 | `0x4000_0000` / `0x4010_0000` | `board_index` / `board_samples` |
@@ -562,9 +572,9 @@ step 프로그램은 이 20 타임스텝 내내 **한 글자도 안 바뀝니다
 | DDR 주소 | 내용 |
 |---|---|
 | `0x1000_0000` | `wmem.bin` 14,000 × 32B |
-| `0x1010_0000` | `pbmem.bin` 869 |
-| `0x1011_0000` | `pgmem.bin` 208 |
-| `0x1012_0000` | `stepmem.bin` 123 × 32B |
+| `0x1010_0000` | `rqmem.bin` 869 |
+| `0x1011_0000` | `afmem.bin` 208 |
+| `0x1012_0000` | `instmem.bin` 123 × 32B |
 | `0x1013_0000` | `latinit.bin` 384 × 64B |
 | `0x1014_0000` | `bkv.bin` 24 × 64B |
 | `0x1015_0000` | `posmem.bin` 441 × 64B → **PL BRAM** |
@@ -573,9 +583,9 @@ step 프로그램은 이 20 타임스텝 내내 **한 글자도 안 바뀝니다
 | `0x4000_0000` | `board_index` · `board_samples` |
 
 ```
-1회      W · PB · PG · Step · POS 적재
+1회      W · Requant · Affine · Inst · POS 적재
 샘플마다  latinit → Z, LATV / bkv → BKV
-         N_TIME 쓰고 CTRL.start
+         N_TSTEP 쓰고 CTRL.start
          T 번 반복 { STATUS.tok_req 대기 → t 읽기 → X·pos_idx DMA
                     → TOK_N 쓰기 → TOK_ACK }
          STATUS.done 대기 → RES_CLASS 읽기
@@ -588,16 +598,16 @@ step 프로그램은 이 20 타임스텝 내내 **한 글자도 안 바뀝니다
 
 ## 5. ③ AXI 두 채널
 
-### AXI4-Lite 레지스터 맵 (`Evt_Accel.v`)
+### AXI4-Lite 레지스터 맵 (`Top.v`)
 
 | off | R/W | 이름 | 내용 |
 |---|---|---|---|
 | `0x000` | W | CTRL | [0] start(펄스) [1] dump(펄스) |
-| `0x004` | R | STATUS | [0] done [1] busy [5:2] state [13:6] step<br/>[14] **tok_req** [15] loader busy [16] dumping [22:17] 요청 중인 t |
-| `0x008` | RW | N_BODY | 타임스텝당 step 수 (**118**) |
-| `0x00C` | RW | N_TAIL | 끝에 한 번 도는 step 수 (5) |
-| `0x010` | RW | N_TIME | 타임스텝 수 T (≤20) |
-| `0x014` | RW | LOAD_SEL | 0=W 1=A 2=PB 3=PG 4=Step 5=POS |
+| `0x004` | R | STATUS | [0] done [1] busy [5:2] state [13:6] inst_ptr<br/>[14] **tok_req** [15] loader busy [16] dumping [22:17] 요청 중인 t |
+| `0x008` | RW | N_BODY | 타임스텝당 명령어 수 (**118**) |
+| `0x00C` | RW | N_TAIL | 끝에 한 번 도는 명령어 수 (5) |
+| `0x010` | RW | N_TSTEP | 타임스텝 수 T (≤20) |
+| `0x014` | RW | LOAD_SEL | 0=W 1=A 2=RQ 3=AF 4=INST 5=POS |
 | `0x018` | W | LOAD_BASE | 쓰면 로더를 arm (시작 워드 주소) |
 | `0x01C` | R | VERSION | `0x4556_5401` |
 | `0x020` | R | CYCLES | 마지막 실행 클럭 수 |
@@ -609,7 +619,7 @@ step 프로그램은 이 20 타임스텝 내내 **한 글자도 안 바뀝니다
 | `0x03C` | R | **RES_CLASS** | [3:0] argmax |
 | `0x400+` | R | RES_LOGITS | 10 워드 (디버그) |
 
-### AXI-Stream 적재 (`Axis_Loader_Ev.v`)
+### AXI-Stream 적재 (`Axis_Loader.v`)
 
 `LOAD_SEL` → `LOAD_BASE`(쓰면 arm) → DMA. `tready` 는 항상 1 (목적지가 BRAM).
 
@@ -617,17 +627,17 @@ step 프로그램은 이 20 타임스텝 내내 **한 글자도 안 바뀝니다
 |---|---|---|
 | 0 | W_Mem | 256b → 2 beat/word |
 | 1 | **A_Mem** | 512b → 4 beat |
-| 2 | PB_Mem | 256b → 2 beat |
-| 3 | PG_Mem | 256b → 2 beat |
-| 4 | **Step_Mem** | 256b → 2 beat |
+| 2 | Requant_Mem | 256b → 2 beat |
+| 3 | Affine_Mem | 256b → 2 beat |
+| 4 | **Inst_Mem** | 256b → 2 beat |
 | 5 | POS 표 (`Pos_Gather` 안) | 512b → 4 beat |
 
-> step 을 DMA 목적지로 넣은 게 `fpga_nl` 과 다른 점입니다 — 123 step × 8 워드를
+> 명령어를 DMA 목적지로 넣은 게 `fpga_nl` 과 다른 점입니다 — 123 명령어 × 8 워드를
 > AXI-Lite 레지스터로 쓰면 976 번입니다.
 
 ---
 
-## 6. ④ Evt_Accel — 최상위 배선
+## 6. ④ Top — 최상위 배선
 
 `tcl/build.tcl` 이 만드는 BD:
 
@@ -642,7 +652,7 @@ axi_dma_0 / S_AXIS_S2MM(128b) ←── evt_accel_0 / m_axis    A_Mem 덤프
 
 ---
 
-## 7. ⑤ EvT_Engine — step 프로그램 실행기
+## 7. ⑤ EvT_Engine — 명령어 프로그램 실행기
 
 ### FSM
 
@@ -650,20 +660,20 @@ axi_dma_0 / S_AXIS_S2MM(128b) ←── evt_accel_0 / m_axis    A_Mem 덤프
 IDLE → FETCH → DEC → GCONST → RUN → WAIT → NEXT → TSTEP → TLOAD → DONE
 ```
 
-`Step_Mem` 에서 256b step 워드를 하나씩 읽어 7 종 명령을 발행합니다
-(타임스텝당 **118** step + 마지막에 꼬리 **5** step):
+`Inst_Mem` 에서 256b 명령어 워드를 하나씩 읽어 7 종 명령을 발행합니다
+(타임스텝당 명령어 **118**개 + 마지막에 꼬리 **5**개):
 
 | KIND | 하는 일 |
 |---|---|
-| `K_GEMM` (0) | GEMM → Col_Post_Ev |
-| `K_LN` (1) | LayerNorm_Ev |
-| `K_SMAX` (2) | Softmax_Attn |
-| `K_RES` (3) | 잔차 누적 (bf16) |
-| `K_MEAN` (4) | latent 평균 |
-| `K_ARGMAX` (5) | 분류 결과 |
-| `K_POS` (6) | Pos_Gather |
+| `OP_GEMM` (0) | GEMM → Format_Cast_Act |
+| `OP_LN` (1) | LayerNorm_Top |
+| `OP_SMAX` (2) | Softmax_Top |
+| `OP_RES` (3) | 잔차 누적 (bf16) |
+| `OP_MEAN` (4) | latent 평균 |
+| `OP_ARGMAX` (5) | 분류 결과 |
+| `OP_POS` (6) | Pos_Gather |
 
-### step 프로그램은 **정적**입니다
+### 명령어 프로그램은 **정적**입니다
 
 `n_tok` 은 타임스텝마다 다릅니다(실측 16~123). 영역 크기를 `n_tok` 에 맞추면 베이스가
 매번 바뀌어 프로그램을 5,182 벌 만들어야 합니다. 그래서 **모든 영역 stride 를
@@ -671,27 +681,27 @@ IDLE → FETCH → DEC → GCONST → RUN → WAIT → NEXT → TSTEP → TLOAD 
 바뀌는 것은 네 필드뿐입니다 — 발행 시점에 레지스터로 채워 넣습니다:
 
 ```
-VAR[0]  M    ← n_tok        (토큰 행을 도는 step)
+VAR[0]  M    ← n_tok        (토큰 행을 도는 명령어)
 VAR[1]  NOUT ← n_tok+1      (Q·Kᵀ 의 Nout = Lk)
 VAR[2]  K    ← n_tok+1      (attn·V 의 reduce = Lk)
 VAR[3]  C    ← n_tok+1      (softmax 의 클래스 수 = Lk)
 ```
 
-### step 워드 (256b)
+### 명령어 워드 (256b)
 
 ```
-[ 31: 0] KIND[3:0] CONS[5:4] ACT[7:6] VAR[11:8] FLAG[15:12]
-         SHIFT[21:16] GSH[27:22] FLAG2[31:28]
+[ 31: 0] KIND[3:0] FMT[5:4] ACT[7:6] VAR[11:8] FLAG[15:12]
+         SHIFT[21:16] SHIFT2[27:22] FLAG2[31:28]
 [ 63:32] M   [ 95:64] K   [127:96] NOUT
 [159:128] AIN   [191:160] BIN   [223:192] AOUT
-[255:224] PB[15:0] | OSTR[31:16]
+[255:224] RQ_BASE[15:0] | OSTR[31:16]
 
 FLAG  [0] Transpose32 경유  [1] head-major  [2] B는 A_Mem  [3] raw16
 FLAG2 [0] LN 입력이 정수 코드  [1] RES 피연산자가 정수 코드
       [2] B에 bias 토큰  [3] 활성함수 뒤 2차 재양자화
 ```
 
-필드 하나가 step 종류에 따라 다른 뜻을 갖습니다 — 워드를 늘리는 대신 **그 step 에서
+필드 하나가 명령어 종류에 따라 다른 뜻을 갖습니다 — 워드를 늘리는 대신 **그 명령어에서
 확실히 노는 칸**을 씁니다 (QK 는 `AOUT`, AV 는 `OSTR` 이 놉니다).
 
 ### 온칩 메모리
@@ -700,9 +710,9 @@ FLAG2 [0] LN 입력이 정수 코드  [1] RES 피연산자가 정수 코드
 |---|---|---|
 | W_Mem | 256b × 16384 | 437 KB (14,000 워드) |
 | **A_Mem** | **512b × 16384, 2벌** | 478 KB 사용 |
-| PB_Mem | 256b × 1024 | 27 KB (채널 3,476) |
-| PG_Mem | 256b × 256 | 6.5 KB (LayerNorm 13개) |
-| Step_Mem | 256b × 256 | 3.9 KB (123 step = 본체 118 + 꼬리 5) |
+| Requant_Mem | 256b × 1024 | 27 KB (채널 3,476) |
+| Affine_Mem | 256b × 256 | 6.5 KB (LayerNorm 13개) |
+| Inst_Mem | 256b × 256 | 3.9 KB (명령어 123 = 본체 118 + 꼬리 5) |
 
 ### A_Mem 이 구조의 중심입니다
 
@@ -737,17 +747,17 @@ flowchart TB
   AR["rd 포트 ar"]
   BR["rd 포트 br"]
   WMEM[("W_Mem<br/>가중치")]
-  PBM[("PB_Mem<br/>bias · mult · shift")]
-  PGM[("PG_Mem<br/>gamma · beta")]
+  PBM[("Requant_Mem<br/>bias · mult · shift")]
+  PGM[("Affine_Mem<br/>gamma · beta")]
 
-  GEMM["Gemm_Core_Ev<br/>32×32 systolic<br/>★ ping-pong"]
-  COLP["Col_Post_Ev<br/>소비자 포맷 4종"]
-  SMX["Softmax_Attn<br/>→ softmax_top"]
+  GEMM["Gemm_Core<br/>32×32 systolic<br/>★ ping-pong"]
+  COLP["Format_Cast_Act<br/>출력 포맷 4종"]
+  SMX["Softmax_Top<br/>→ Softmax_Unit"]
   TRN["Transpose32<br/>V 전용 corner-turn"]
   RES["잔차 (bf16)<br/>Int32_To_Bf16 → Fp32_Add"]
-  LNV["LayerNorm_Ev<br/>→ layernorm_top + LN_Affine"]
+  LNV["LayerNorm_Top<br/>→ LayerNorm_Unit + LayerNorm_Affine"]
   POS["Pos_Gather<br/>POS 표 + pos_idx"]
-  CLS["K_MEAN / K_ARGMAX<br/>→ res_class"]
+  CLS["OP_MEAN / OP_ARGMAX<br/>→ res_class"]
   AWM{{"A_Mem 쓰기 포트<br/>단일 mux"}}
 
   AMEM --> AR
@@ -792,31 +802,31 @@ A_Mem[a_base + mt*K + k] 레인 i = A[mt*32+i][k]
 B    [b_base + nt*K + k] 레인 j = B[k][nt*32+j]
 ```
 
-그래서 `Gemm_Core_Ev` 는 **`b_rd_addr` 만 내보내고**, 어느 메모리가 답할지는
+그래서 `Gemm_Core` 는 **`b_rd_addr` 만 내보내고**, 어느 메모리가 답할지는
 `EvT_Engine` 이 정합니다.
 
 **예외는 V 하나뿐입니다.** `attn·V` 는 reduce 축이 head_dim(32)에서 토큰(Lk)으로
 바뀌는 유일한 자리라 B 가 "워드[j] 레인=d" 여야 하는데 `in_proj` 은 "워드[d] 레인=토큰"
 을 줍니다. 그래서 `Transpose32` 가 붙습니다 — 이 모듈이 존재하는 이유의 전부입니다.
 
-### Col_Post_Ev — 소비자 4종
+### Format_Cast_Act — 출력 포맷 4종
 
 | consumer | 경로 | 목적지 |
 |---|---|---|
-| `C_INT8` | requant(acc+b, M, sh) → [ReLU] → int8 | A_Mem 하위 8b |
-| `C_Q411` | requant → Q4.11 → **gelu_pwl** → requant → int8<br/>(`raw16=1` 이면 Q4.11 16b 그대로) | A_Mem |
-| `C_BF16` | bf16( (acc+b)·step[n] ) — 잔차 스트림 | A_Mem 16b |
-| `C_Q69` | requant → Q6.9 | **Softmax_Attn 직결** |
+| `FMT_INT8` | requant(acc+b, M, sh) → [ReLU] → int8 | A_Mem 하위 8b |
+| `FMT_Q411` | requant → Q4.11 → **Gelu_Pwl** → requant → int8<br/>(`raw16=1` 이면 Q4.11 16b 그대로) | A_Mem |
+| `FMT_BF16` | bf16( (acc+b)·scale[n] ) — 잔차 스트림 | A_Mem 16b |
+| `FMT_Q69` | requant → Q6.9 | **Softmax_Top 직결** |
 
 ### 비선형은 래퍼로 감쌌습니다
 
-`Softmax_Attn.v` / `LayerNorm_Ev.v` 가 엔진 쪽 인터페이스를 그대로 유지하면서 안쪽만
+`Softmax_Top.v` / `LayerNorm_Top.v` 가 엔진 쪽 인터페이스를 그대로 유지하면서 안쪽만
 새 코어로 바꿉니다. **엔진은 바뀐 줄 모릅니다.**
 
 | | 래퍼가 맞춰 주는 것 | 효과 |
 |---|---|---|
-| `Softmax_Attn` | `C` → `in_last`, Q1.14 → uint8 (SM_MULT 16253, SH 21) | 6,800 → **151** 사이클 (Lk=53) |
-| `LayerNorm_Ev` | A_Mem 스트리밍, `LN_Affine`(gamma/beta), Q4.11 → int8 | 5,376 → **572** 사이클 (타일 3개) |
+| `Softmax_Top` | `n_col` → `in_last`, Q1.14 → uint8 (SM_MULT 16253, SH 21) | 6,800 → **151** 사이클 (Lk=53) |
+| `LayerNorm_Top` | A_Mem 스트리밍, `LayerNorm_Affine`(gamma/beta), Q4.11 → int8 | 5,376 → **572** 사이클 (타일 3개) |
 
 ### Pos_Gather — pos enc 는 온칩입니다
 
@@ -829,9 +839,9 @@ B    [b_base + nt*K + k] 레인 j = B[k][nt*32+j]
 
 ---
 
-## 9. ⑦ Gemm_Core_Ev 와 ping-pong 누산기
+## 9. ⑦ Gemm_Core 와 ping-pong 누산기
 
-> `PE_Array_Pp.v` / `PE_OS_Pp.v` — 이번에 추가된 부분입니다. 상세 그림은
+> `PE_Array.v` / `PE_OS.v` — 이번에 추가된 부분입니다. 상세 그림은
 > [`docs/evt_gemm_pingpong.png`](docs/evt_gemm_pingpong.png).
 
 ```mermaid
@@ -841,10 +851,10 @@ flowchart TB
   SKA["Skew_Buf (A)<br/>삼각 지연"]
   SKB["Skew_Buf (B)<br/>삼각 지연"]
   SH["32탭 시프트<br/>clr_edge · snap_edge"]
-  MESH["PE_Array_Pp — 32×32 mesh<br/>파면 4개: A·clr·snap →우, B ↓아래"]
-  PE["PE_OS_Pp × 1,024<br/>P = 현재 타일 (ping, DSP48E2)<br/>shadow = 직전 타일 (pong)"]
+  MESH["PE_Array — 32×32 mesh<br/>파면 4개: A·clr·snap →우, B ↓아래"]
+  PE["PE_OS × 1,024<br/>P = 현재 타일 (ping, DSP48E2)<br/>shadow = 직전 타일 (pong)"]
   RD["컬럼 읽어내기<br/>shadow 에서, 다음 타일이 도는 중에"]
-  OUT["→ Col_Post_Ev<br/>32레인 INT32"]
+  OUT["→ Format_Cast_Act<br/>32레인 INT32"]
 
   ARD --> SKA
   BMUX --> SKB
@@ -885,7 +895,7 @@ P 에 반영                  = + 2                (DSP48E2 MREG+PREG)
 |---|---|---|
 | 원본 `PE_OS` (P 하나) | K + 114 | 컬럼을 다 뽑을 때까지 다음 타일 불가 |
 | 순수 ping-pong (전역 clr/snap) | K + 67 | `PE[31][31]` 확정을 배열 전체가 대기 |
-| **★ systolic clr/snap (`PE_OS_Pp`)** | **max(K+4, 36)** | PE 마다 제 시각(K+i+j+2)에 snapshot |
+| **★ systolic clr/snap (`PE_OS`)** | **max(K+4, 36)** | PE 마다 제 시각(K+i+j+2)에 snapshot |
 
 **DSP48E2 인스턴스는 원본 그대로입니다** — 리셋 소스만 전역 `clr` 에서 그 PE 의
 `clr_in` 으로 바뀝니다. 비용은 PE 당 shadow 32 FF + 전파 2 FF, 배열 전체 약
@@ -904,16 +914,16 @@ P 에 반영                  = + 2                (DSP48E2 MREG+PREG)
 sequenceDiagram
   participant APU as PS · main_evt.c
   participant DMA as AXI DMA
-  participant ACC as Evt_Accel
+  participant ACC as Top
   participant ENG as EvT_Engine
 
   Note over APU,ENG: 1회 — 상수 적재
   APU->>ACC: LOAD_SEL=0..5, LOAD_BASE (arm)
-  DMA->>ACC: W · PB · PG · Step · POS 표
+  DMA->>ACC: W · Requant · Affine · Inst · POS 표
 
   Note over APU,ENG: 샘플마다
   APU->>ACC: LOAD_SEL=1 → latinit → Z, LATV / bkv → BKV
-  APU->>ACC: N_TIME, CTRL.start
+  APU->>ACC: N_TSTEP, CTRL.start
   ACC->>ENG: start
 
   loop 타임스텝 T회 · 최대 20
@@ -922,10 +932,10 @@ sequenceDiagram
     DMA->>ACC: X (토큰) → A_Mem, pos_idx → A_Mem
     APU->>ACC: TOK_N, TOK_ACK
     ACC->>ENG: ack
-    Note over ENG: K_POS → event_projection → preproc<br/>3 블록 × (LN → in_proj → QKᵀ → softmax<br/>→ attn·V → out_proj → FFN → RES)<br/>latent_vectors += z  (118 step)
+    Note over ENG: OP_POS → event_projection → preproc<br/>3 블록 × (LN → in_proj → QKᵀ → softmax<br/>→ attn·V → out_proj → FFN → RES)<br/>latent_vectors += z  (명령어 118개)
   end
 
-  Note over ENG: 꼬리 5 step — proc_embs → 분류기
+  Note over ENG: 꼬리 명령어 5개 — proc_embs → 분류기
   ENG->>ACC: done, res_class, CYCLES
   APU->>ACC: RES_CLASS 읽기
 ```
@@ -977,6 +987,6 @@ dot -Tpng -Gdpi=120 evt_gemm_pingpong.dot -o evt_gemm_pingpong.png
 |---|---|
 | **A_Mem 2벌은 핑퐁이 아닙니다** | 쓰기 포트를 공유하는 **같은 내용 미러**입니다. 나뉘는 건 읽기 포트뿐 (`EvT_Engine.v:222-231`) |
 | **pos enc 는 온칩입니다** | `sw/export_board_evt.py` 독스트링의 "호스트가 미리 펴서 넣습니다" 는 예전 방식입니다. 현재 경로는 `Pos_Gather` + `SEL_POS`(`sw/main_evt.c:153-160`) |
-| **`Softmax_Attn`/`LayerNorm_Ev` 는 래퍼입니다** | 실제 연산은 `../../SOFTMAX`, `../../layernorm` 의 코어에 있습니다 |
+| **`Softmax_Top`/`LayerNorm_Top` 은 래퍼입니다** | 실제 연산은 `Softmax_Unit`/`LayerNorm_Unit` 코어에 있습니다 |
 | **`tb_softmax_attn` 은 더는 안 맞습니다** | 예전 코어의 LUT 산술을 비트 단위로 보던 TB 입니다. 지금은 `tb_smx_wrap` / `tb_ln_wrap` |
-| **`PE_Array_Pp`/`PE_OS_Pp` 는 미커밋** | 보드 264 샘플까지 확인됐으나 아직 커밋 전입니다 |
+| **`PE_Array`/`PE_OS` 는 미커밋** | 보드 264 샘플까지 확인됐으나 아직 커밋 전입니다 |

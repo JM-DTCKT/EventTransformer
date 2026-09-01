@@ -1,85 +1,96 @@
-// ============================================================================
-//  layernorm_unit.v  --  32행 Tile 단위 D축 LayerNorm  (BF16 in / signed Q4.11 out)
-// ----------------------------------------------------------------------------
-//  EvT 의 nn.LayerNorm([embed_dim]) 을 그대로 구현한다.  정규화 축은 **마지막
-//  차원(embed_dim = D = 128)** 이고, 토큰(latent embedding) 96개가 "몇 번
-//  LayerNorm 하느냐" 다.  이를 Tile_M = LANE = 32 행씩 3 Tile 로 나눠 처리한다.
+// -----------------------------------------------------------------------------
+// LayerNorm_Unit : 32행 Tile 단위 D축 LayerNorm  (BF16 in / signed Q4.11 out)
 //
-//     for r in 0..95:  y[r][0..D-1] = (x[r][.] - mu[r]) / sqrt(var[r] + eps)
-//     mu[r]  = (1/D) * sum_d x[r][d]
-//     var[r] = (1/D) * sum_d x[r][d]^2 - mu[r]^2          (biased, PyTorch 와 동일)
+// EvT 의 nn.LayerNorm([embed_dim]) 을 그대로 구현한다.  정규화 축은 **마지막
+// 차원(embed_dim = D = 128)** 이고, 토큰(latent embedding) 96개가 "몇 번
+// LayerNorm 하느냐" 다.  이를 LANE = 32 행씩 3 Tile 로 나눠 처리한다.
 //
-//  [입력]  매 clk "한 열" = 32행 각각의 원소 1개 (LANE x 16b = 512b, BF16)
-//    · 열 하나가 32행에 1원소씩이므로 부분 beat 가 없다 -> keep 마스크 불필요
-//    · D 는 컴파일타임 상수(2의 거듭제곱)라 1/D 가 시프트로 끝난다. in_last 불필요.
+//    for r in 0..95:  y[r][0..D-1] = (x[r][.] - mu[r]) / sqrt(var[r] + eps)
+//    mu[r]  = (1/D) * sum_d x[r][d]
+//    var[r] = (1/D) * sum_d x[r][d]^2 - mu[r]^2          (biased, PyTorch 와 동일)
 //
-//  [핵심 1] 수신하면서 sum / sumsq 를 같이 구한다
-//    데이터가 어차피 버스를 지나가므로 **제곱기 32개 + 누산기 2벌**만 얹으면
-//    추가 사이클·추가 메모리 읽기 없이 행별 통계가 확정된다.  softmax 가 max 를
-//    수신 중에 구한 것과 같은 구조다.
+// ## 입력
 //
-//  [핵심 2] 분산을 **정수 그대로** 구해 상쇄오차를 원천 제거
-//    X 를 24b 정수 표현(x = X*2^-IF)이라 하면
-//        SX = sum X            (31b signed, 정확)
-//        SQ = sum X*X          (54b unsigned, 정확)
-//        var = SQ*2^-(2IF+DLOG) - (SX*2^-(IF+DLOG))^2
-//            = 2^-(2IF+2DLOG) * ( (SQ << DLOG) - SX*SX )
-//    괄호 안이 **오차 없는 정수식**이다.  E[x^2]-mu^2 형태는 보통 mu >> sigma 일 때
-//    치명적 상쇄가 나지만, 여기서는 두 항 모두 정확한 정수라 뺄셈도 정확하고
-//    Cauchy-Schwarz 에 의해 결과가 **절대 음수가 되지 않는다**.
-//    (mu 는 SX 를 소수점만 바꿔 읽은 값이라 나눗셈이 아예 없다: mu = SX * 2^-MUF)
+// 매 clk "한 열" = 32행 각각의 원소 1개 (LANE x 16b = 512b, BF16)
+// · 열 하나가 32행에 1원소씩이므로 부분 beat 가 없다 -> keep 마스크 불필요
+// · D 는 컴파일타임 상수(2의 거듭제곱)라 1/D 가 시프트로 끝난다. in_last 불필요.
 //
-//  [핵심 3] 곱하기 전에 시프트 (DSP 1개/lane)
-//    y = (x - mu) * rstd,  rstd = r * 2^-RF * 2^-e   (r in (0.5,1], e 는 행마다 다름)
-//    d = x - mu 는 33b 라 곱셈기가 33x18 (DSP 2개) 이 되어버린다.  대신 e 시프트를
-//    **곱셈 앞으로** 옮기면 ds = d*2^-e 의 크기가 |ds| = |y|/r < 2|y| <= 32 로 묶여
-//    25b(Q6.18) 면 충분해진다 -> 25x18 = DSP48 **1개**에 정확히 들어간다.
-//    (softmax 처럼 곱 뒤에 시프트하면 44b 를 시프트해야 해서 더 비싸다)
+// ## 수신하면서 sum / sumsq 를 같이 구한다
 //
-//  [3-stage Tile 파이프라인]  한 Tile 안에서는 mu/var 가 전역 의존성이라 RECV 와
-//  NORM 을 겹칠 수 없다.  대신 **서로 다른 Tile** 을 세 단계가 동시에 처리한다.
+// 데이터가 어차피 버스를 지나가므로 **제곱기 32개 + 누산기 2벌**만 얹으면
+// 추가 사이클·추가 메모리 읽기 없이 행별 통계가 확정된다.  softmax 가 max 를
+// 수신 중에 구한 것과 같은 구조다.
 //
-//     Tile k+2 :  [S1 RECV  D=128 clk ]
-//     Tile k+1 :                [S2 STAT  1+2+LANE+3 = 38 clk ]
-//     Tile k   :                        [S3 NORM  1+D+L+3 = 133 clk ]
-//                주기 P = max(128, 38, 133) = 133 clk        (L = SRAM_LAT = 1)
+// ## 분산을 **정수 그대로** 구해 상쇄오차를 원천 제거
 //
-//  [슬롯을 몇 개 두는가]  xbuf 는 S1 이 쓰고 **S3 가** 읽는다.  그 사이에 S2 가
-//  끼어 있으므로 한 Tile 의 버퍼 점유는 S1+S2+S3 = 299 clk 이고, 이는 2P=266 보다
-//  크다.  따라서 **슬롯 3개** 가 필요하다 (3P = 399 >= 299).
-//  슬롯 하나 = D word x (LANE*16b) = 64 kbit  ->  합계 196 kbit.
-//    · 버퍼에는 **변환 전 BF16(16b)** 을 그대로 담는다.  고정소수점(24b)으로
-//      담으면 98 kbit 가 더 드는데, 대신 S3 쪽 변환기 32개(~5k gate)면 끝난다.
-//      SRAM 이 훨씬 비싸므로 BF16 저장이 이득이다.  두 변환기는 같은 모듈이라
-//      S1 이 누산한 X 와 S3 가 재생성한 X 가 **비트 단위로 동일**하다.
+// X 를 24b 정수 표현(x = X*2^-IF)이라 하면
+//       SX = sum X            (31b signed, 정확)
+//       SQ = sum X*X          (54b unsigned, 정확)
+//       var = SQ*2^-(2IF+DLOG) - (SX*2^-(IF+DLOG))^2
+//           = 2^-(2IF+2DLOG) * ( (SQ << DLOG) - SX*SX )
+// 괄호 안이 **오차 없는 정수식**이다.  E[x^2]-mu^2 형태는 보통 mu >> sigma 일 때
+// 치명적 상쇄가 나지만, 여기서는 두 항 모두 정확한 정수라 뺄셈도 정확하고
+// Cauchy-Schwarz 에 의해 결과가 **절대 음수가 되지 않는다**.
+// (mu 는 SX 를 소수점만 바꿔 읽은 값이라 나눗셈이 아예 없다: mu = SX * 2^-MUF)
 //
-//  [고정소수점 포맷]
-//    in_col   BF16              16b   입력 (FP32 상위 16b)
-//    X (내부) signed Q8.15       24b   범위 [-256, 256), LSB 3.05e-5
-//    SX       signed             31b   sum X                  (정확)
-//    SQ       unsigned           54b   sum X*X                (정확)
-//    V        unsigned           61b   var*2^44 + eps*2^44    (정확)
-//    mu       signed Q8.22       31b   = SX 를 소수점만 바꿔 읽은 값
-//    r        unsigned UQ1.17    18b   (m*2^par)^-0.5,  범위 (0.5, 1]
-//    e        signed              6b   rstd = r*2^-17 * 2^-e
-//    d        signed Q10.22      33b   x - mu
-//    ds       signed Q6.18       25b   d * 2^-e            (포화)
-//    out_col  **signed Q4.11**   16b   범위 [-16, 16), LSB 4.88e-4
+// ## 곱하기 전에 시프트 (DSP 1개/lane)
 //
-//    y_out = (ds * r + 2^23) >> 24        (24 = DSF + RF - OF)
+// y = (x - mu) * rstd,  rstd = r * 2^-RF * 2^-e   (r in (0.5,1], e 는 행마다 다름)
+// d = x - mu 는 33b 라 곱셈기가 33x18 (DSP 2개) 이 되어버린다.  대신 e 시프트를
+// **곱셈 앞으로** 옮기면 ds = d*2^-e 의 크기가 |ds| = |y|/r < 2|y| <= 32 로 묶여
+// 25b(Q6.18) 면 충분해진다 -> 25x18 = DSP48 **1개**에 정확히 들어간다.
+// (softmax 처럼 곱 뒤에 시프트하면 44b 를 시프트해야 해서 더 비싸다)
 //
-//  [affine(gamma/beta) 는 왜 없는가]
-//    EvT 의 LayerNorm 은 **전부 뒤에 Linear 가 붙는다** (layer_norm_x -> attention
-//    의 Q/K/V projection, layer_norm_2 -> linear2, ...).  따라서
-//        W*(gamma (*) xhat + beta) + b = (W*diag(gamma))*xhat + (W*beta + b)
-//    로 gamma/beta 를 **다음 Linear 의 가중치·바이어스에 접어 넣을 수 있다**.
-//    하드웨어에 넣으면 lane 당 곱셈기 1개 + 파라미터 메모리가 더 드는데,
-//    오프라인 상수 접기로 공짜가 되므로 코어는 정규화만 한다.
-// ============================================================================
+// ## 3-stage Tile 파이프라인
+//
+// 한 Tile 안에서는 mu/var 가 전역 의존성이라 RECV 와
+// NORM 을 겹칠 수 없다.  대신 **서로 다른 Tile** 을 세 단계가 동시에 처리한다.
+//
+//    Tile k+2 :  [S1 RECV  D=128 clk ]
+//    Tile k+1 :                [S2 STAT  1+2+LANE+3 = 38 clk ]
+//    Tile k   :                        [S3 NORM  1+D+L+3 = 133 clk ]
+//               주기 P = max(128, 38, 133) = 133 clk        (L = SRAM_LAT = 1)
+//
+// ## 슬롯을 몇 개 두는가
+//
+// xbuf 는 S1 이 쓰고 **S3 가** 읽는다.  그 사이에 S2 가
+// 끼어 있으므로 한 Tile 의 버퍼 점유는 S1+S2+S3 = 299 clk 이고, 이는 2P=266 보다
+// 크다.  따라서 **슬롯 3개** 가 필요하다 (3P = 399 >= 299).
+// 슬롯 하나 = D word x (LANE*16b) = 64 kbit  ->  합계 196 kbit.
+// · 버퍼에는 **변환 전 BF16(16b)** 을 그대로 담는다.  고정소수점(24b)으로
+//     담으면 98 kbit 가 더 드는데, 대신 S3 쪽 변환기 32개(~5k gate)면 끝난다.
+//     SRAM 이 훨씬 비싸므로 BF16 저장이 이득이다.  두 변환기는 같은 모듈이라
+//     S1 이 누산한 X 와 S3 가 재생성한 X 가 **비트 단위로 동일**하다.
+//
+// ## 고정소수점 포맷
+//
+// in_col   BF16              16b   입력 (FP32 상위 16b)
+// X (내부) signed Q8.15       24b   범위 [-256, 256), LSB 3.05e-5
+// SX       signed             31b   sum X                  (정확)
+// SQ       unsigned           54b   sum X*X                (정확)
+// V        unsigned           61b   var*2^44 + eps*2^44    (정확)
+// mu       signed Q8.22       31b   = SX 를 소수점만 바꿔 읽은 값
+// r        unsigned UQ1.17    18b   (m*2^par)^-0.5,  범위 (0.5, 1]
+// e        signed              6b   rstd = r*2^-17 * 2^-e
+// d        signed Q10.22      33b   x - mu
+// ds       signed Q6.18       25b   d * 2^-e            (포화)
+// out_col  **signed Q4.11**   16b   범위 [-16, 16), LSB 4.88e-4
+//
+// y_out = (ds * r + 2^23) >> 24        (24 = DSF + RF - OF)
+//
+// ## affine(gamma/beta) 는 왜 없는가
+//
+// EvT 의 LayerNorm 은 **전부 뒤에 Linear 가 붙는다** (layer_norm_x -> attention
+// 의 Q/K/V projection, layer_norm_2 -> linear2, ...).  따라서
+//       W*(gamma (*) xhat + beta) + b = (W*diag(gamma))*xhat + (W*beta + b)
+// 로 gamma/beta 를 **다음 Linear 의 가중치·바이어스에 접어 넣을 수 있다**.
+// 하드웨어에 넣으면 lane 당 곱셈기 1개 + 파라미터 메모리가 더 드는데,
+// 오프라인 상수 접기로 공짜가 되므로 코어는 정규화만 한다.
+// -----------------------------------------------------------------------------
 `timescale 1ns/1ps
 
-module layernorm_unit #(
-    parameter integer LANE   = 32,   // Tile 행 수 (= Tensor Core 타일 행 수)
+module LayerNorm_Unit #(
+    parameter integer LANE   = 32,   // Tile 행 수 (= GEMM 코어 타일 행 수)
     parameter integer D      = 128,  // 정규화 축 길이 (= embed_dim, 2^DLOG)
     parameter integer DLOG   = 7,    // log2(D)
     parameter integer IW     = 24,   // 내부 고정소수점 폭 (signed Q8.15)
@@ -183,7 +194,7 @@ module layernorm_unit #(
     end
 
     // ======================================================================
-    //  S1 : 수신 + 행별 sum / sumsq   (Tensor Core 와 독립적으로 굴러감)
+    //  S1 : 수신 + 행별 sum / sumsq   (뒤 단계와 독립적으로 굴러감)
     // ======================================================================
     reg  [DLOG-1:0]      recv_col;
     reg  signed [SXW-1:0] sum_x  [0:NB-1][0:LANE-1];   // sum X   (= mu),  S1 -> S2,**S3**
@@ -214,7 +225,7 @@ module layernorm_unit #(
     //  변환기` 가 최악 경로였다 (5.600 ns, 그중 배선이 65 %).
     //
     //  `in_shift`(= EvT_Engine 의 `q_gsh`) 와 `in_q411`(= `q_flag2[0]`) 는
-    //  **step 내내 고정**이고 `xshift_slot[]` 도 그 값을 담은 것이라, 먹스의 두
+    //  **명령어 내내 고정**이고 `xshift_slot[]` 도 그 값을 담은 것이라, 먹스의 두
     //  갈래가 항상 같은 값이다.  따라서 한 사이클 늦춰도 값이 안 바뀐다
     //  (첫 beat 도 안전 : q_gsh 는 S_DEC 에서 정해져 S_GCONST 3 사이클 뒤에야
     //   ln_start 가 뜬다).
@@ -239,15 +250,13 @@ module layernorm_unit #(
     generate
         for (gl = 0; gl < LANE; gl = gl + 1) begin : g_rx
             localparam integer G = gl / GSZ;      // 이 레인이 속한 그룹
-            // 입력 포맷 두 갈래를 **병렬**로 변환하고 마지막에 고릅니다.
-            //   예전에는 `EvT_Engine` 이 `Int32_To_Bf16` 으로 Q4.11 을 bf16 으로
-            //   올려서 넣었고, 그러면 정규화(LZC+좌시프트) 와 역정규화(우시프트)
-            //   가 한 사이클에 **직렬**로 놓였습니다 — A_Mem BRAM -> x_p 8.475 ns
-            //   (150 MHz 에서 -2.208 ns) 의 원인입니다.  각자 Q(IW-1-IF).IF 까지
-            //   가서 mux 로 합치면 깊이가 절반이 됩니다.
+            // [타이밍] 입력 포맷 두 갈래를 **병렬**로 변환하고 마지막에 고릅니다.
+            // Q4.11 을 bf16 으로 올려서 넣으면 정규화(LZC+좌시프트)와
+            // 역정규화(우시프트)가 한 사이클에 직렬로 놓입니다. 각자
+            // Q(IW-1-IF).IF 까지 가서 mux 로 합치면 깊이가 절반입니다.
             wire signed [IW-1:0] xc_bf, xc_q4;
             wire                 ov_bf, ov_q4;
-            bf16_to_fix #(.IW(IW), .IF(IF), .XSW(XSW)) u_cvt (
+            Bf16_To_Fix #(.IW(IW), .IF(IF), .XSW(XSW)) u_cvt (
                 .bf(in_col[gl*16 +: 16]), .xsh(xsh_g[G]),
                 .x(xc_bf), .ovf(ov_bf));
             Q411_To_Fix #(.IW(IW), .IF(IF), .QF(11), .XSW(XSW)) u_cvt_q (
@@ -285,7 +294,7 @@ module layernorm_unit #(
     // ------------------------------------------------------------------
     //  RXP : 수신 누산 파이프라인 (2단)
     // ------------------------------------------------------------------
-    //  BRAM 출력 -> bf16_to_fix(33b 배럴 시프트) -> X*X(DSP) -> 47b 누산 을
+    //  BRAM 출력 -> Bf16_To_Fix(33b 배럴 시프트) -> X*X(DSP) -> 47b 누산 을
     //  **한 사이클에 두면 논리 40단, 12.8 ns** 가 되어 100 MHz 를 못 맞춘다
     //  (ZU9EG -2 실측 WNS -3.083 ns).  그래서 두 곳을 끊는다 :
     //
@@ -378,8 +387,8 @@ module layernorm_unit #(
     reg              stat_state;
     reg  [MW:0]      stat_row_i, stat_row_c;                     // 행 투입 / 수집 포인터
     // rstd_man/rstd_exp 는 S2 -> S3 로 수명 S2+S3 = 170 clk (< 2P) -> 슬롯 2개.
-    // 단 정상상태 throttle 구간에서 여유가 3 clk 뿐이다 (§ README 6.4) — 파이프 단수를
-    // 건드리면 반드시 PART F2(30 Tile 연속)로 재검증할 것.
+    // 단 정상상태에서 여유가 3 clk 뿐이라, 파이프 단수를 건드리면 Tile 을 연속으로
+    // 밀어 넣는 경우로 반드시 재검증할 것.
     reg  [RW-1:0]        rstd_man [0:NB2-1][0:LANE-1];  // 행별 rstd 가수
     reg  signed [EWD-1:0] rstd_exp [0:NB2-1][0:LANE-1]; // 행별 rstd 지수
     reg  rstd_wslot, rstd_rslot;
@@ -407,7 +416,7 @@ module layernorm_unit #(
     wire                  rsq_vld;
     wire [RW-1:0]         rsq_man;
     wire signed [EWD-1:0] rsq_exp;
-    rsqrt_unit #(.VW(VW), .VF(VF), .RW(RW), .RF(RF), .QW(QW), .EW(EWD)) u_rsqrt (
+    Rsqrt_Unit #(.VW(VW), .VF(VF), .RW(RW), .RF(RF), .QW(QW), .EW(EWD)) u_rsqrt (
         .clk(clk), .rst_n(rst_n),
         .in_valid(var2_vld), .v(var_v),
         .out_valid(rsq_vld), .r(rsq_man), .e(rsq_exp)
@@ -468,7 +477,7 @@ module layernorm_unit #(
             // xbuf 는 **원본 포맷 그대로** 담으므로 S3 도 같은 분기가 필요합니다.
             wire signed [IW-1:0]  xo_bf, xo_q4;
             wire                  ovb, ovq;
-            bf16_to_fix #(.IW(IW), .IF(IF), .XSW(XSW)) u_cvt (
+            Bf16_To_Fix #(.IW(IW), .IF(IF), .XSW(XSW)) u_cvt (
                 .bf(sram_rd[gl*16 +: 16]), .xsh(xshift_slot[slot_norm]),
                 .x(xo_bf), .ovf(ovb));
             Q411_To_Fix #(.IW(IW), .IF(IF), .QF(11), .XSW(XSW)) u_cvt_q (
@@ -556,17 +565,17 @@ module layernorm_unit #(
     // ---- 파라미터 정합성 체크 (합성 무관) ---------------------------------
     initial begin
         if (D != (1 << DLOG))
-            $display("ERROR: layernorm_unit D(%0d) must be 2^DLOG(%0d)", D, DLOG);
+            $display("ERROR: LayerNorm_Unit D(%0d) must be 2^DLOG(%0d)", D, DLOG);
         if (NB < 3 || NB > (1 << NBW))
-            $display("ERROR: layernorm_unit NB(%0d) must be 3..%0d (버퍼 점유 > 2P)",
+            $display("ERROR: LayerNorm_Unit NB(%0d) must be 3..%0d (버퍼 점유 > 2P)",
                      NB, (1 << NBW));
         if (RW != RF+1)
-            $display("ERROR: layernorm_unit RW(%0d) must be RF+1", RW);
+            $display("ERROR: LayerNorm_Unit RW(%0d) must be RF+1", RW);
         if (YSH < 1)
-            $display("ERROR: layernorm_unit DSF+RF must be > OF");
+            $display("ERROR: LayerNorm_Unit DSF+RF must be > OF");
         if (VF % 2 != 0)
-            $display("ERROR: layernorm_unit VF(%0d) must be even", VF);
+            $display("ERROR: LayerNorm_Unit VF(%0d) must be even", VF);
         if (LANE != (1 << MW))
-            $display("ERROR: layernorm_unit LANE(%0d) must be 2^%0d", LANE, MW);
+            $display("ERROR: LayerNorm_Unit LANE(%0d) must be 2^%0d", LANE, MW);
     end
 endmodule

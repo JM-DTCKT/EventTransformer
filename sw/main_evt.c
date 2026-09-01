@@ -5,8 +5,8 @@
  * **타임스텝마다 입력을 새로 넣어야** 합니다. X/PIN 은 A_Mem 에 한 타임스텝분만
  * 들어가기 때문입니다 (20벌이면 24k 워드로 A_Mem 을 넘습니다).
  *
- *   1회      W / PB / PG / Step 을 DMA
- *   샘플마다  latinit → Z, LATV / bkv → BKV, N_TIME 쓰고 start
+ *   1회      W / RQ / AF / INST 를 DMA
+ *   샘플마다  latinit → Z, LATV / bkv → BKV, N_TSTEP 쓰고 start
  *            T 번 { tok_req 대기 → X, PIN DMA → TOK_N → TOK_ACK }
  *            done 대기 → RES_CLASS
  *
@@ -37,7 +37,7 @@
 #define R_STAT       0x004
 #define R_NBODY      0x008
 #define R_NTAIL      0x00C
-#define R_NTIME      0x010
+#define R_NTSTEP      0x010
 #define R_LSEL       0x014
 #define R_LBASE      0x018
 #define R_VER        0x01C
@@ -61,9 +61,9 @@
 /* ---- 적재 목적지 ---- */
 #define SEL_W 0u
 #define SEL_A 1u
-#define SEL_PB 2u
-#define SEL_PG 3u
-#define SEL_S 4u
+#define SEL_RQ 2u
+#define SEL_AF 3u
+#define SEL_INST 4u
 #define SEL_POS 5u   /* pos enc 표 → PL BRAM (`Pos_Gather`) */
 
 /* ---- A_Mem 영역 (data/schedule.json 과 한 벌) ---- */
@@ -81,9 +81,9 @@
 
 /* ---- DDR 배치 (board/load_ddr.tcl 과 한 벌) ---- */
 #define DDR_W        0x10000000u    /* wmem.bin      14000 x 32B */
-#define DDR_PB       0x10100000u    /* pbmem.bin       869 x 32B */
-#define DDR_PG       0x10110000u    /* pgmem.bin       208 x 32B */
-#define DDR_STEP     0x10120000u    /* stepmem.bin     123 x 32B */
+#define DDR_RQ       0x10100000u    /* rqmem.bin       869 x 32B */
+#define DDR_AF       0x10110000u    /* afmem.bin       208 x 32B */
+#define DDR_INST     0x10120000u    /* instmem.bin     123 x 32B */
 #define DDR_LATINIT  0x10130000u    /* latinit.bin     384 x 64B */
 #define DDR_BKV      0x10140000u    /* bkv.bin          24 x 64B */
 #define DDR_POSTBL   0x10150000u    /* posmem.bin      441 x 64B  → PL BRAM */
@@ -93,9 +93,9 @@
 #define DDR_SAMPLES  0x40100000u    /* board_samples.int32.bin */
 
 #define W_WORDS   14000
-#define PB_WORDS  869
-#define PG_WORDS  208
-#define S_WORDS   123
+#define RQ_WORDS  869
+#define AF_WORDS  208
+#define INST_WORDS   123
 #define LAT_WORDS 384
 #define BKV_WORDS 24
 
@@ -154,12 +154,12 @@ int main(void)
        타임스텝마다 펴서 보냈고 그 이미지가 96.7 MB 였습니다 — 이제 27.6 KB 표가
        PL BRAM 에 있고 오는 것은 `pos_idx`(타임스텝당 최대 246 B) 뿐입니다. */
     if (load(SEL_W,   0, (UINTPTR)DDR_W,      W_WORDS)  ||
-        load(SEL_PB,  0, (UINTPTR)DDR_PB,     PB_WORDS) ||
-        load(SEL_PG,  0, (UINTPTR)DDR_PG,     PG_WORDS) ||
-        load(SEL_S,   0, (UINTPTR)DDR_STEP,   S_WORDS)  ||
+        load(SEL_RQ,  0, (UINTPTR)DDR_RQ,     RQ_WORDS) ||
+        load(SEL_AF,  0, (UINTPTR)DDR_AF,     AF_WORDS) ||
+        load(SEL_INST,   0, (UINTPTR)DDR_INST,   INST_WORDS)  ||
         load(SEL_POS, 0, (UINTPTR)DDR_POSTBL, POS_ROWS)) return 1;
-    xil_printf("   W %u / PB %u / PG %u / Step %u / POS %u words\r\n",
-               W_WORDS, PB_WORDS, PG_WORDS, S_WORDS, POS_ROWS);
+    xil_printf("   W %u / RQ %u / AF %u / INST %u / POS %u words\r\n",
+               W_WORDS, RQ_WORDS, AF_WORDS, INST_WORDS, POS_ROWS);
 
     /* 인덱스/샘플 표는 XSCT 가 JTAG 로 직접 써 넣은 것이라 **캐시에 없습니다**.
        무효화하지 않으면 옛 캐시 라인을 읽습니다. */
@@ -186,7 +186,7 @@ int main(void)
             load(SEL_A, R_LATV_BASE, (UINTPTR)DDR_LATINIT, LAT_WORDS) ||
             load(SEL_A, R_BKV_BASE,  (UINTPTR)DDR_BKV,     BKV_WORDS)) return 1;
 
-        WR(R_NTIME, T);
+        WR(R_NTSTEP, T);
         WR(R_CTRL, 1);                       /* start */
 
         for (int t = 0; t < T; t++) {

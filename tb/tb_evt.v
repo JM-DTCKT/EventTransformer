@@ -1,10 +1,10 @@
 // -----------------------------------------------------------------------------
 // tb_evt : EvT_Engine 전체 통합 — 타임스텝 **하나 + 마지막 꼬리**
 //
-//   본체 153 step (전처리 4 + 잔차 + attention 블록 3개) + 꼬리 5 step
+//   본체 명령어 153개 (전처리 4 + 잔차 + attention 블록 3개) + 꼬리 명령어 5개
 //   → 클래스 하나가 나옵니다.
 //
-// `tb_evt_head` 가 앞단 7 step 만 봤다면 여기는 **attention 까지 전부**입니다.
+// `tb_evt_head` 가 앞단 명령어 7개 만 봤다면 여기는 **attention 까지 전부**입니다.
 // 특히 이 TB 만 확인할 수 있는 것들:
 //
 //   · Q/K/V 의 head-major 주소와 Vᵀ 전치
@@ -13,7 +13,7 @@
 //   · 블록 3개가 Z/ZATT 를 이어받는 것
 //   · MEAN(레인 축 리덕션) 과 ARGMAX
 //
-// 기대값은 `sw/golden_steps.py --single` 이 뽑습니다 — 골든도 타임스텝 하나만
+// 기대값은 `sw/golden_insts.py --single` 이 뽑습니다 — 골든도 타임스텝 하나만
 // 넣어 돌리므로 latent 누적과 분류기 출력까지 그대로 대조됩니다.
 //
 // K/V/Q/CTX 는 블록 3개가 **돌려 쓰므로** 끝나고 보면 마지막 블록 값입니다.
@@ -21,7 +21,7 @@
 // -----------------------------------------------------------------------------
 `timescale 1ns/1ps
 module tb_evt;
-  localparam N=32, AW_A=13, AW_W=14, AW_S=8, DIM_W=16;
+  localparam N=32, AW_A=13, AW_W=14, AW_INST=8, DIM_W=16;
   localparam NTOK = 52, TT = 2, QT = 3, HD = 32, HEADS = 4;
   localparam KSTR = 160, VSTR = 129;          // head 간 간격 (schedule_evt.py)
   // 영역 베이스 — `data/schedule.json` 과 한 벌
@@ -35,38 +35,38 @@ module tb_evt;
   localparam S_QK0 = 11, S_OUTPROJ = 35;      // 스냅 시점 (cross 블록)
   // 꼬리 : 117 embs.ln  118 embs.linear1  119 MEAN  120 clf.linear_1  121 argmax
   localparam S_MEAN = 120;
-  // cross 블록 FFN 체인 스냅 시점 (그 step 진입 시 = 직전 step 의 출력)
+  // cross 블록 FFN 체인 스냅 시점 (그 명령어 진입 시 = 직전 명령어 의 출력)
   //   36 ln_att(입력 ZATT)  37 linear1(입력 LNA)  39 linear2(입력 LNA)
   //   40 linear3(입력 FFN)
   localparam S_ZATT = 37, S_LNA1 = 38, S_LNA2 = 40, S_FFN3 = 41;
 
   reg clk = 0, rst = 1; always #5 clk = ~clk;
 
-  reg  [AW_S-1:0] n_body = 118, n_tail = 5;
-  reg  [5:0]      n_time = 1;
+  reg  [AW_INST-1:0] n_body = 118, n_tail = 5;
+  reg  [5:0]      n_tstep = 1;
   reg  [31:0]     eps = 32'h3727c5ac;
   reg             start = 0;
   wire            done, busy;
   wire [3:0]      dbg_state;
-  wire [AW_S-1:0] dbg_step;
-  wire [5:0]      tok_rd_idx;
-  reg  [DIM_W-1:0] tok_rd_n = NTOK;
+  wire [AW_INST-1:0] dbg_inst;
+  wire [5:0]      tstep_idx;
+  reg  [DIM_W-1:0] tok_n = NTOK;
   reg             ld_we = 0;
   reg  [2:0]      ld_sel = 0;
   reg  [AW_W-1:0] ld_addr = 0;
   reg  [N*16-1:0] ld_data = 0;
   wire [3:0]      res_class;
-  wire [N*32-1:0] res_logits;
+  wire [10*32-1:0] res_logits;
   reg             dbg_rd_en = 0;
   reg  [AW_A-1:0] dbg_rd_addr = 0;
   wire [N*16-1:0] dbg_rd_data;
 
-  EvT_Engine #(.N(N), .AW_A(AW_A), .AW_W(AW_W), .AW_S(AW_S)) dut (
+  EvT_Engine #(.N(N), .AW_A(AW_A), .AW_W(AW_W), .AW_INST(AW_INST)) dut (
     .clk(clk), .rst(rst), .start(start), .done(done), .busy(busy),
-    .dbg_state(dbg_state), .dbg_step(dbg_step),
-    .n_body(n_body), .n_tail(n_tail), .n_time(n_time), .eps(eps),
+    .dbg_state(dbg_state), .dbg_inst(dbg_inst),
+    .n_body(n_body), .n_tail(n_tail), .n_tstep(n_tstep), .eps(eps),
     // 입력이 이미 A_Mem 에 있으므로 요청은 즉시 승인합니다
-    .tok_rd_idx(tok_rd_idx), .tok_rd_n(tok_rd_n),
+    .tstep_idx(tstep_idx), .tok_n(tok_n),
     .tok_req(), .tok_ack(1'b1),
     .ld_we(ld_we), .ld_sel(ld_sel), .ld_addr(ld_addr), .ld_data(ld_data),
     .res_class(res_class), .res_logits(res_logits),
@@ -74,9 +74,9 @@ module tb_evt;
 
   // ---- 메모리 이미지 ----
   reg [N*8-1:0]  wimg  [0:W_WORDS-1];
-  reg [N*8-1:0]  pbimg [0:PB_WORDS-1];
-  reg [N*8-1:0]  pgimg [0:PG_WORDS-1];
-  reg [N*8-1:0]  simg  [0:S_WORDS-1];
+  reg [N*8-1:0]  rqimg [0:PB_WORDS-1];
+  reg [N*8-1:0]  afimg [0:PG_WORDS-1];
+  reg [N*8-1:0]  instimg  [0:S_WORDS-1];
   reg [N*16-1:0] ximg  [0:TT*144-1];
   reg [N*16-1:0] pimg  [0:TT*64-1];
   reg [N*16-1:0] qimg  [0:TT-1];            // pos_idx (호스트가 주는 것)
@@ -115,9 +115,9 @@ module tb_evt;
         @(negedge clk); ld_we = 1; ld_sel = sel; ld_addr = w;
         case (which)
           0: ld_data = {{(N*8){1'b0}}, wimg[w]};
-          1: ld_data = {{(N*8){1'b0}}, pbimg[w]};
-          2: ld_data = {{(N*8){1'b0}}, pgimg[w]};
-          3: ld_data = {{(N*8){1'b0}}, simg[w]};
+          1: ld_data = {{(N*8){1'b0}}, rqimg[w]};
+          2: ld_data = {{(N*8){1'b0}}, afimg[w]};
+          3: ld_data = {{(N*8){1'b0}}, instimg[w]};
         endcase
       end
       @(negedge clk); ld_we = 0;
@@ -182,142 +182,142 @@ module tb_evt;
   reg sn_za = 0, sn_l1 = 0, sn_l2 = 0, sn_f3 = 0;
   integer z;
   always @(posedge clk) if (!rst) begin
-    if (dbg_step == S_QK0 && !snap_qkv) begin
+    if (dbg_inst == S_QK0 && !snap_qkv) begin
       snap_qkv <= 1'b1;
-      for (z = 0; z < HEADS*QT*HD; z = z + 1) sq[z] = dut.u_amem0.mem[R_Q + z];
-      for (z = 0; z < HEADS*KSTR;  z = z + 1) sk[z] = dut.u_amem0.mem[R_K + z];
-      for (z = 0; z < HEADS*VSTR;  z = z + 1) sv[z] = dut.u_amem0.mem[R_V + z];
-      for (z = 0; z < TT*128;      z = z + 1) snx[z] = dut.u_amem0.mem[R_LNX + z];
-      for (z = 0; z < QT*128;      z = z + 1) s1[z] = dut.u_amem0.mem[R_LN1 + z];
+      for (z = 0; z < HEADS*QT*HD; z = z + 1) sq[z] = dut.u_a_mem0.mem[R_Q + z];
+      for (z = 0; z < HEADS*KSTR;  z = z + 1) sk[z] = dut.u_a_mem0.mem[R_K + z];
+      for (z = 0; z < HEADS*VSTR;  z = z + 1) sv[z] = dut.u_a_mem0.mem[R_V + z];
+      for (z = 0; z < TT*128;      z = z + 1) snx[z] = dut.u_a_mem0.mem[R_LNX + z];
+      for (z = 0; z < QT*128;      z = z + 1) s1[z] = dut.u_a_mem0.mem[R_LN1 + z];
     end
-    if (dbg_step == S_ZATT && !sn_za) begin
+    if (dbg_inst == S_ZATT && !sn_za) begin
       sn_za <= 1'b1;
-      for (z = 0; z < QT*128; z = z + 1) sza[z] = dut.u_amem0.mem[R_ZATT + z];
+      for (z = 0; z < QT*128; z = z + 1) sza[z] = dut.u_a_mem0.mem[R_ZATT + z];
     end
-    if (dbg_step == S_LNA1 && !sn_l1) begin
+    if (dbg_inst == S_LNA1 && !sn_l1) begin
       sn_l1 <= 1'b1;
-      for (z = 0; z < QT*128; z = z + 1) sl1[z] = dut.u_amem0.mem[R_LNA + z];
+      for (z = 0; z < QT*128; z = z + 1) sl1[z] = dut.u_a_mem0.mem[R_LNA + z];
     end
-    if (dbg_step == S_LNA2 && !sn_l2) begin
+    if (dbg_inst == S_LNA2 && !sn_l2) begin
       sn_l2 <= 1'b1;
-      for (z = 0; z < QT*128; z = z + 1) sl2[z] = dut.u_amem0.mem[R_LNA + z];
+      for (z = 0; z < QT*128; z = z + 1) sl2[z] = dut.u_a_mem0.mem[R_LNA + z];
     end
-    if (dbg_step == S_FFN3 && !sn_f3) begin
+    if (dbg_inst == S_FFN3 && !sn_f3) begin
       sn_f3 <= 1'b1;
-      for (z = 0; z < QT*128; z = z + 1) sf3[z] = dut.u_amem0.mem[R_FFN + z];
+      for (z = 0; z < QT*128; z = z + 1) sf3[z] = dut.u_a_mem0.mem[R_FFN + z];
     end
-    if (dbg_step == S_MEAN && !snap_ln) begin
+    if (dbg_inst == S_MEAN && !snap_ln) begin
       snap_ln <= 1'b1;
       for (z = 0; z < QT*128; z = z + 1) begin
-        sln[z] = dut.u_amem0.mem[R_LNA + z];
-        sfn[z] = dut.u_amem0.mem[R_FFN + z];
+        sln[z] = dut.u_a_mem0.mem[R_LNA + z];
+        sfn[z] = dut.u_a_mem0.mem[R_FFN + z];
       end
     end
-    if (dbg_step == S_OUTPROJ && !snap_ctx) begin
+    if (dbg_inst == S_OUTPROJ && !snap_ctx) begin
       snap_ctx <= 1'b1;
-      for (z = 0; z < QT*128; z = z + 1) sc[z] = dut.u_amem0.mem[R_CTX + z];
+      for (z = 0; z < QT*128; z = z + 1) sc[z] = dut.u_a_mem0.mem[R_CTX + z];
     end
   end
 
-  // ---- step 별 활동 계수 (어디서 끊겼는지) ----
+  // ---- 명령어 별 활동 계수 (어디서 끊겼는지) ----
   integer n_colv=0, n_cpv=0, n_awe=0, n_lnov=0, n_smov=0, n_tr=0;
-  reg [7:0] prev_step = 8'hFF;
+  reg [7:0] prev_inst = 8'hFF;
   always @(posedge clk) if (!rst && dut.busy) begin
-    if (dut.col_v)   n_colv = n_colv + 1;
-    if (dut.cp_v)    n_cpv  = n_cpv  + 1;
+    if (dut.col_valid)   n_colv = n_colv + 1;
+    if (dut.fca_valid)    n_cpv  = n_cpv  + 1;
     if (dut.a_we_en) n_awe  = n_awe  + 1;
-    if (dut.ln_ov)   n_lnov = n_lnov + 1;
-    if (dut.sm_ov)   n_smov = n_smov + 1;
-    if (dut.tr_run)  n_tr   = n_tr   + 1;
-    if (dbg_step != prev_step) begin
-      if (prev_step != 8'hFF && (prev_step < 16 || prev_step >= 118))
-        $display("  step %0d: col_v=%0d cp_v=%0d a_we=%0d ln_ov=%0d sm_ov=%0d tr=%0d",
-                 prev_step, n_colv, n_cpv, n_awe, n_lnov, n_smov, n_tr);
+    if (dut.ln_valid)   n_lnov = n_lnov + 1;
+    if (dut.smax_valid)   n_smov = n_smov + 1;
+    if (dut.tr_drain)  n_tr   = n_tr   + 1;
+    if (dbg_inst != prev_inst) begin
+      if (prev_inst != 8'hFF && (prev_inst < 16 || prev_inst >= 118))
+        $display("  inst %0d: col_valid=%0d fca_valid=%0d a_we=%0d ln_valid=%0d smax_valid=%0d tr=%0d",
+                 prev_inst, n_colv, n_cpv, n_awe, n_lnov, n_smov, n_tr);
       n_colv=0; n_cpv=0; n_awe=0; n_lnov=0; n_smov=0; n_tr=0;
-      prev_step = dbg_step;
+      prev_inst = dbg_inst;
     end
   end
 
-  // step 진입 시 디코드 결과 (문자열은 반드시 한 줄로!)
-  always @(posedge clk) if (!rst && dut.st == 4'd3 && dut.gc == 2'd2 && (dbg_step < 5 || dbg_step > 31))
-    $display("  DEC step=%0d kind=%0d cons=%0d flag=%0d/%0d M=%0d K=%0d NOUT=%0d AIN=%0d BIN=%0d AOUT=%0d PB=%0d OSTR=%0d sh=%0d gsh=%0d", dbg_step, dut.q_kind, dut.q_cons, dut.q_flag, dut.q_flag2, dut.q_M, dut.q_K, dut.q_NOUT, dut.q_AIN, dut.q_BIN, dut.q_AOUT, dut.q_PB, dut.q_OSTR, dut.q_sh, dut.q_gsh);
+  // 명령어 진입 시 디코드 결과 (문자열은 반드시 한 줄로!)
+  always @(posedge clk) if (!rst && dut.state == 4'd3 && dut.const_ph == 2'd2 && (dbg_inst < 5 || dbg_inst > 31))
+    $display("  DEC inst=%0d kind=%0d fmt=%0d flag=%0d/%0d M=%0d K=%0d NOUT=%0d AIN=%0d BIN=%0d AOUT=%0d RQ_BASE=%0d OSTR=%0d shift=%0d shift2=%0d", dbg_inst, dut.op_kind, dut.op_fmt, dut.op_flag, dut.op_flag2, dut.op_m, dut.op_k, dut.op_nout, dut.op_ain, dut.op_bin, dut.op_aout, dut.op_rq_base, dut.op_ostr, dut.op_shift, dut.op_shift2);
 
   reg smdone = 0;
-  always @(posedge clk) if (!rst && dbg_step == 13 && !smdone) begin
+  always @(posedge clk) if (!rst && dbg_inst == 13 && !smdone) begin
     smdone <= 1'b1;
-    $display("  SM[0]=%04x SM[1]=%04x SM[52]=%04x SM[53]=%04x  V[0]=%04x", dut.u_amem0.mem[6748][15:0], dut.u_amem0.mem[6749][15:0], dut.u_amem0.mem[6800][15:0], dut.u_amem0.mem[6801][15:0], dut.u_amem0.mem[6208][15:0]);
+    $display("  SM[0]=%04x SM[1]=%04x SM[52]=%04x SM[53]=%04x  V[0]=%04x", dut.u_a_mem0.mem[6748][15:0], dut.u_a_mem0.mem[6749][15:0], dut.u_a_mem0.mem[6800][15:0], dut.u_a_mem0.mem[6801][15:0], dut.u_a_mem0.mem[6208][15:0]);
   end
   integer qkp = 0;
-  always @(posedge clk) if (!rst && dbg_step == 11 && dut.cp_v && qkp < 4) begin
-    $display("  QK#%0d n=%0d q69=%04x acc=%08x pbm=%08x", qkp, dut.cp_n, dut.cp_q69[15:0], dut.col_d_d[31:0], dut.pb_mult);
+  always @(posedge clk) if (!rst && dbg_inst == 11 && dut.fca_valid && qkp < 4) begin
+    $display("  QK#%0d n=%0d q69=%04x acc=%08x pbm=%08x", qkp, dut.fca_n, dut.fca_q69[15:0], dut.col_data_d1[31:0], dut.rq_scale);
     qkp = qkp + 1;
   end
 
-  // X 를 처음 쓰는 step 을 잡습니다 (X 는 여기서 시작해 뒤로 번집니다)
+  // X 를 처음 쓰는 명령어 을 잡습니다 (X 는 여기서 시작해 뒤로 번집니다)
   reg [7:0] pstep = 8'hFF;
-  always @(posedge clk) if (!rst && dbg_step != pstep) begin
-    pstep <= dbg_step;
-    if (dbg_step == 8 || dbg_step == 11 || dbg_step == 35)
-      $display("  PEEK step=%0d LNX[0].l0=%0d LN1[0].l0=%0d snapLNX=%0d", dbg_step, $signed(dut.u_amem0.mem[R_LNX][15:0]), $signed(dut.u_amem0.mem[R_LN1][15:0]), $signed(snx[0][15:0]));
+  always @(posedge clk) if (!rst && dbg_inst != pstep) begin
+    pstep <= dbg_inst;
+    if (dbg_inst == 8 || dbg_inst == 11 || dbg_inst == 35)
+      $display("  PEEK inst=%0d LNX[0].l0=%0d LN1[0].l0=%0d snapLNX=%0d", dbg_inst, $signed(dut.u_a_mem0.mem[R_LNX][15:0]), $signed(dut.u_a_mem0.mem[R_LN1][15:0]), $signed(snx[0][15:0]));
   end
 
   integer q47 = 0;
-  always @(posedge clk) if (!rst && dbg_step == 48 && dut.cp_v && dut.cp_n > 93 && q47 < 8) begin
-    $display("  QK47 n=%0d q69=%04x acc=%08x  b_rd=%0d b0=%02x qk_hit=%0d bk=%04x", dut.cp_n, dut.cp_q69[15:0], dut.col_d_d[31:0], dut.gb_rd_addr, dut.gb_data[7:0], dut.qk_hit, dut.bk_word[15:0]);
+  always @(posedge clk) if (!rst && dbg_inst == 48 && dut.fca_valid && dut.fca_n > 93 && q47 < 8) begin
+    $display("  QK47 n=%0d q69=%04x acc=%08x  b_rd=%0d b0=%02x qk_hit=%0d bk=%04x", dut.fca_n, dut.fca_q69[15:0], dut.col_data_d1[31:0], dut.gemm_b_rd_addr, dut.gemm_b_data[7:0], dut.qk_hit, dut.bias_k_word[15:0]);
     q47 = q47 + 1;
   end
 
   integer sx = 0;
-  always @(posedge clk) if (!rst && dut.sm_iv && sx < 6 && (^dut.sm_id === 1'bx)) begin
-    $display("  SMX#%0d step=%0d 입력이 X", sx, dbg_step); sx = sx + 1;
+  always @(posedge clk) if (!rst && dut.smax_in_valid && sx < 6 && (^dut.smax_in_data === 1'bx)) begin
+    $display("  SMX#%0d inst=%0d 입력이 X", sx, dbg_inst); sx = sx + 1;
   end
 
   integer xp = 0;
   always @(posedge clk) if (!rst && dut.a_we_en && xp < 8 && (^dut.a_we_data[15:0] === 1'bx)) begin
-    $display("  XWR#%0d step=%0d kind=%0d cons=%0d addr=%0d", xp, dbg_step, dut.q_kind, dut.q_cons, dut.a_we_addr);
+    $display("  XWR#%0d inst=%0d kind=%0d fmt=%0d addr=%0d", xp, dbg_inst, dut.op_kind, dut.op_fmt, dut.a_we_addr);
     xp = xp + 1;
   end
 
   // MEAN 프로브 — 특징 k 별 (누적합, 곱수, 시프트, 출력)
   integer mnp = 0;
-  always @(posedge clk) if (!rst && dut.mn_run && dut.mn_ph == 2'd2 && mnp < 6) begin
-    $display("  MN k=%0d acc=%0d gmult=%0d gsh=%0d out=%0d  M=%0d K=%0d AIN=%0d", dut.mn_k, $signed(dut.mn_acc), $signed(dut.g_mult_q), dut.q_gsh, $signed(dut.mn_out), dut.q_M, dut.q_K, dut.q_AIN);
+  always @(posedge clk) if (!rst && dut.mean_run && dut.mean_ph == 2'd2 && mnp < 6) begin
+    $display("  MN k=%0d acc=%0d gscale=%0d gsh=%0d out=%0d  M=%0d K=%0d AIN=%0d", dut.mean_k, $signed(dut.mean_acc), $signed(dut.rq_scale2_q), dut.op_shift2, $signed(dut.mean_out), dut.op_m, dut.op_k, dut.op_ain);
     mnp = mnp + 1;
   end
 
   integer amp = 0;
-  always @(posedge clk) if (!rst && dut.q_kind == 4'd5 && dut.col_v_d2 && amp < 20) begin
-    $display("  AM step=%0d n=%0d NOUT=%0d acc=%0d mult=%0d val=%0d best=%0d any=%0d cls=%0d", dbg_step, dut.col_n_d2, dut.q_NOUT, $signed(dut.am_acc), $signed(dut.pb_mult_q), $signed(dut.am_val), $signed(dut.am_best), dut.am_any, dut.res_class);
+  always @(posedge clk) if (!rst && dut.op_kind == 4'd5 && dut.col_valid_d2 && amp < 20) begin
+    $display("  AM inst=%0d n=%0d NOUT=%0d acc=%0d scale=%0d val=%0d best=%0d any=%0d cls=%0d", dbg_inst, dut.col_n_d2, dut.op_nout, $signed(dut.argmax_acc), $signed(dut.rq_scale_q), $signed(dut.argmax_val), $signed(dut.argmax_best), dut.argmax_any, dut.res_class);
     amp = amp + 1;
   end
 
-  // softmax step 별 입출력 개수
+  // softmax 명령어 별 입출력 개수
   integer smi=0, smo=0, smhs=0, smnr=0; reg [7:0] smc_last=0; reg [7:0] smstep=0;
   always @(posedge clk) if (!rst && dut.busy) begin
-    if (dbg_step != smstep) begin
+    if (dbg_inst != smstep) begin
       if (smi != 0 || smo != 0)
-        $display("  SM step=%0d 입력 %0d 코어수신 %0d 안받음 %0d 출력 %0d (C=%0d)", smstep, smi, smhs, smnr, smo, dut.q_NOUT);
-      smi=0; smo=0; smhs=0; smnr=0; smstep=dbg_step;
+        $display("  SM inst=%0d 입력 %0d 코어수신 %0d 안받음 %0d 출력 %0d (n_col=%0d)", smstep, smi, smhs, smnr, smo, dut.op_nout);
+      smi=0; smo=0; smhs=0; smnr=0; smstep=dbg_inst;
     end
-    if (dut.sm_iv) smi = smi + 1;
-    if (dut.sm_iv && dut.u_sm.take && dut.u_sm.core_iready) smhs = smhs + 1;
-    if (dut.sm_iv && !dut.u_sm.core_iready) smnr = smnr + 1;
-    if (dut.sm_ov) begin smo = smo + 1; smc_last = dut.sm_c; end
+    if (dut.smax_in_valid) smi = smi + 1;
+    if (dut.smax_in_valid && dut.u_smax.take && dut.u_smax.core_iready) smhs = smhs + 1;
+    if (dut.smax_in_valid && !dut.u_smax.core_iready) smnr = smnr + 1;
+    if (dut.smax_valid) begin smo = smo + 1; smc_last = dut.smax_col; end
   end
 
   integer avp = 0;
-  always @(posedge clk) if (!rst && dbg_step == 13 && dut.a_we_en && avp < 4) begin
+  always @(posedge clk) if (!rst && dbg_inst == 13 && dut.a_we_en && avp < 4) begin
     // 주의 : Verilog 는 인접 문자열을 이어붙이지 않습니다. 줄을 나눠 쓰면
     // 이 $display 가 통째로 사라집니다 (VCS 가 조용히 넘어감).
-    $display("  AVW#%0d addr=%0d AOUT=%0d cp_n=%0d cp_mt=%0d d0=%04x SM0=%04x b_rd=%0d/%02x", avp, dut.a_we_addr, dut.q_AOUT, dut.cp_n, dut.cp_mt, dut.a_we_data[15:0], dut.ar_data[15:0], dut.gb_rd_addr, dut.gb_data[7:0]);
+    $display("  AVW#%0d addr=%0d AOUT=%0d fca_n=%0d fca_mt=%0d d0=%04x SM0=%04x b_rd=%0d/%02x", avp, dut.a_we_addr, dut.op_aout, dut.fca_n, dut.fca_mt, dut.a_we_data[15:0], dut.a_ra_data[15:0], dut.gemm_b_rd_addr, dut.gemm_b_data[7:0]);
     avp = avp + 1;
   end
 
   integer twp = 0;
-  always @(posedge clk) if (!rst && dut.tr_run && twp < 6) begin
+  always @(posedge clk) if (!rst && dut.tr_drain && twp < 6) begin
     $display("  TRW#%0d addr=%0d we=%0d AOUT=%0d OSTR=%0d h=%0d mt=%0d r=%0d d0=%04x",
-             twp, dut.a_we_addr, dut.a_we_en, dut.q_AOUT, dut.q_OSTR,
-             dut.tr_h, dut.tr_mt, dut.tr_r, dut.a_we_data[15:0]);
+             twp, dut.a_we_addr, dut.a_we_en, dut.op_aout, dut.op_ostr,
+             dut.tr_head, dut.tr_mt, dut.tr_row, dut.a_we_data[15:0]);
     twp = twp + 1;
   end
 
@@ -364,7 +364,7 @@ module tb_evt;
               g = sza[mt*128+kk][lane*16 +: 16];
               x = g_zatt[mt*128+kk][lane*16 +: 16];
             end else begin
-              g = dut.u_amem0.mem[R_LATV + mt*128 + kk][lane*16 +: 16];
+              g = dut.u_a_mem0.mem[R_LATV + mt*128 + kk][lane*16 +: 16];
               x = g_tlatv[mt*128+kk][lane*16 +: 16];
             end
             d = g - x; if (d < 0) d = -d;
@@ -417,11 +417,11 @@ module tb_evt;
             if (mt*32 + lane < nrow) begin
               n = n + 1;
               case (which)
-                0: begin g = dut.u_amem0.mem[base + mt*nfeat + k][lane*16 +: 16];
+                0: begin g = dut.u_a_mem0.mem[base + mt*nfeat + k][lane*16 +: 16];
                          x = g_pin[mt*nfeat + k][lane*16 +: 16]; end
-                1: begin g = dut.u_amem0.mem[base + mt*nfeat + k][lane*16 +: 16];
+                1: begin g = dut.u_a_mem0.mem[base + mt*nfeat + k][lane*16 +: 16];
                          x = g_pre[mt*nfeat + k][lane*16 +: 16]; end
-                2: begin g = dut.u_amem0.mem[base + mt*nfeat + k][lane*16 +: 16];
+                2: begin g = dut.u_a_mem0.mem[base + mt*nfeat + k][lane*16 +: 16];
                          x = g_ev1[mt*nfeat + k][lane*16 +: 16]; end
                 3: begin g = snx[mt*nfeat + k][lane*16 +: 16];    // 스냅
                          x = g_lnx[mt*nfeat + k][lane*16 +: 16]; end
@@ -440,9 +440,9 @@ module tb_evt;
   initial begin
     $display("[tb_evt] EvT_Engine 전 구간 (샘플0 t0, 토큰 %0d, 타임스텝 1개)", NTOK);
     $readmemh("../data/wmem.hex",  wimg);
-    $readmemh("../data/pbmem.hex", pbimg);
-    $readmemh("../data/pgmem.hex", pgimg);
-    $readmemh("../data/stepmem.hex", simg);
+    $readmemh("../data/rqmem.hex", rqimg);
+    $readmemh("../data/afmem.hex", afimg);
+    $readmemh("../data/instmem.hex", instimg);
     $readmemh("../data/latinit.hex", limg);
     $readmemh("../data/bkv.hex", bimg);
     $readmemh("../data/board/t0_x.hex",   ximg);
@@ -485,7 +485,7 @@ module tb_evt;
     cyc = 0;
     while (!done && cyc < 20000000) begin @(posedge clk); cyc = cyc + 1; end
     if (!done) begin
-      $display("=== TIMEOUT  state=%0d step=%0d ===", dbg_state, dbg_step);
+      $display("=== TIMEOUT  state=%0d inst=%0d ===", dbg_state, dbg_inst);
       $finish;
     end
     $display("     %0d 사이클  (100 MHz 에서 %.2f us)", cyc, cyc/100.0);
@@ -568,7 +568,7 @@ module tb_evt;
     $display("-- 꼬리 진단 : LATV / TLNA / TFFN 앞 6레인 (하드웨어 / 골든)");
     for (i = 0; i < 6; i = i + 1)
       $display("     LATV[k0] lane%0d : %04x / %04x   TLNA %0d / %0d   TFFN %0d / %0d",
-               i, dut.u_amem0.mem[R_LATV][i*16 +: 16], g_tlatv[0][i*16 +: 16],
+               i, dut.u_a_mem0.mem[R_LATV][i*16 +: 16], g_tlatv[0][i*16 +: 16],
                $signed(sln[0][i*16 +: 16]),  $signed(g_tlna[0][i*16 +: 16]),
                $signed(sfn[0][i*16 +: 16]),  $signed(g_tffn[0][i*16 +: 16]));
 
@@ -637,7 +637,7 @@ module tb_evt;
     e0 = errors; s0 = soft; i = 0;
     for (kk = 0; kk < 128; kk = kk + 1) begin
       i = i + 1;
-      gv = dut.u_amem0.mem[R_LNA + kk][15:0];
+      gv = dut.u_a_mem0.mem[R_LNA + kk][15:0];
       xv = g_tmn[kk][15:0];
       cmp("TMEAN gap", i, gv, xv, 1);
     end
@@ -646,7 +646,7 @@ module tb_evt;
     e0 = errors; s0 = soft; i = 0;
     for (kk = 0; kk < 128; kk = kk + 1) begin
       i = i + 1;
-      gv = dut.u_amem0.mem[R_FFN + kk][15:0];
+      gv = dut.u_a_mem0.mem[R_FFN + kk][15:0];
       xv = g_tc1[kk][15:0];
       cmp("TCLF1 clf.linear_1", i, gv, xv, 1);
     end

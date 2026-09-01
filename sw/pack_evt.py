@@ -11,19 +11,19 @@
 
     W_Mem   256b   가중치 b_mem[k][n], **n 으로 뱅킹** (int8 레인 32)
     A_Mem   512b   활성값, 32레인 x 16b (int8 / bf16 / Q4.11 공용)
-    PB_Mem  256b   채널별 {mult|step, bias} 4쌍/워드
-    PG_Mem  256b   LayerNorm {gamma, beta} 8쌍/워드
+    Requant_Mem 256b  채널별 {mult|scale, bias} 4쌍/워드   → data/rqmem.bin
+    Affine_Mem  256b  LayerNorm {gamma, beta} 8쌍/워드     → data/afmem.bin
 
-`fpga_nl` 과 같은 규칙이라 `Gemm_Core_Ev` · `Col_Post` 가 그대로 붙습니다.
+`fpga_nl` 과 같은 규칙이라 `Gemm_Core` · `Format_Cast_Act` 가 그대로 붙습니다.
 
 ## 레이아웃 규칙 (이게 곧 RTL 스펙)
 
     W_Mem[w_base + nt*K + k] 레인 j = w_int[nt*32+j][k]      ← 전치
     A_Mem[a_base + mt*K + k] 레인 i = x[mt*32+i][k]
 
-`Gemm_Core_Ev` 는 A·B 둘 다 "워드 = reduce 인덱스, 레인 = non-reduce" 로 읽습니다.
+`Gemm_Core` 는 A·B 둘 다 "워드 = reduce 인덱스, 레인 = non-reduce" 로 읽습니다.
 그래서 attention 의 `Q·Kᵀ`/`attn·V` 도 같은 규칙에 그대로 들어맞습니다
-(자세한 것은 `rtl/Gemm_Core_Ev.v` 머리말).
+(자세한 것은 `rtl/gemm_core/Gemm_Core.v` 머리말).
 
 ## positional encoding 을 호스트가 미리 붙입니다
 
@@ -73,10 +73,7 @@ E, LATENT, HEADS, HEAD_DIM = 128, 96, 4, 32
 POS_DIM = 64
 N_CLASS = 10
 
-# 소비자 코드 (RTL 의 step.consumer) — fpga_nl 과 같은 인코딩
-C_INT8, C_Q411, C_BF16, C_Q69 = 0, 1, 2, 3
-# step 종류
-K_GEMM, K_LN, K_ATTN, K_RES, K_SMAX, K_MEAN = 0, 1, 2, 3, 4, 5
+# (명령어 KIND/FMT 상수는 `schedule_evt.py` 가 갖고 있습니다 — 여기서는 안 씁니다)
 
 
 BLOCKS = ['backbone.proc_memory_blocks.0.cross_attention',
@@ -87,8 +84,8 @@ BLOCKS = ['backbone.proc_memory_blocks.0.cross_attention',
 # GELU 뒤 재양자화 : 어느 레이어의 Q4.11 출력이 **어느 격자로** 떨어지나
 #
 #   골든은 `s_out(F.gelu(s_in(z)))` 로 Q4.11 실수를 내고, 그 다음 소비자가
-#   자기 입력 step 으로 int8 화합니다. 그래서 목표 격자는 **다음 레이어의
-#   input.step** 입니다. 여기서만 적어 두고 값은 manifest 에서 읽습니다.
+#   자기 입력 scale 로 int8 화합니다. 그래서 목표 격자는 **다음 레이어의
+#   input scale** 입니다. 여기서만 적어 두고 값은 manifest 에서 읽습니다.
 #
 #   `linear1` 만 예외입니다 — 다음이 `layer_norm_2` 라 int8 격자가 없습니다.
 #   LayerNorm 은 스케일 불변이므로 하드웨어는 **Q4.11 16비트를 그대로 저장**하고
@@ -111,8 +108,8 @@ GELU_RAW16 = {f'{_b}.linear1' for _b in BLOCKS}      # 재양자화 없이 Q4.11
 # LayerNorm 뒤 재양자화 : Q4.11 출력 → 다음 GEMM 이 읽는 int8 격자
 #
 #   LayerNorm 도 GELU 와 같습니다 — 골든은 Q4.11 실수를 내고 다음 소비자가 자기
-#   입력 step 으로 int8 화합니다. `layer_norm_x` 의 소비자는 in_proj 의 K·V 밴드,
-#   `layer_norm_1` 은 Q 밴드입니다 (K 와 V 의 입력 step 은 **같습니다** — 골든의
+#   입력 scale 로 int8 화합니다. `layer_norm_x` 의 소비자는 in_proj 의 K·V 밴드,
+#   `layer_norm_1` 은 Q 밴드입니다 (K 와 V 의 입력 scale 은 **같습니다** — 골든의
 #   `k_in_scales`/`v_in_scales` 가 세 블록 모두 동일해, 하드웨어가 LNX 를 한 벌만
 #   저장해도 됩니다).
 # ---------------------------------------------------------------------------
@@ -138,7 +135,7 @@ GELU_LSB = 2.0 ** -11                                # Q4.11
 #
 # 뒤 격자가 **더 촘촘해서** 코드가 127 을 넘어 포화하는 자리까지 골든과 같아야
 # 하므로, 한 번에 접어 넣을 수 없습니다. 하드웨어도 두 번 합니다 — 곱수는
-# 레이어 뒤 빈 칸(`PB + NOUT`, GELU 스칼라와 같은 자리)에 넣고 GSH 를 씁니다.
+# 레이어 뒤 빈 칸(`RQ_BASE + NOUT`, GELU 스칼라와 같은 자리)에 넣고 SHIFT2 를 씁니다.
 # ---------------------------------------------------------------------------
 # `proc_embs_block` 의 gap(latent 96개 평균) 은 **평균의 나누기까지 곱수에**
 # 접습니다 — 엔진은 32레인 합을 타일마다 누적한 뒤 이 곱수 하나로 끝냅니다.
@@ -213,20 +210,20 @@ def main():
                                 for j in range(N)])
 
     # =========================================================================
-    # PB_Mem : 채널별 {mult, bias} 8바이트, 4채널/워드
-    #   bf16 소비자는 mult 자리에 bf16 step 을 넣습니다 (fpga_nl 과 같은 규칙)
+    # Requant_Mem : 채널별 {mult, bias} 8바이트, 4채널/워드
+    #   bf16 소비자는 mult 자리에 bf16 scale 을 넣습니다 (fpga_nl 과 같은 규칙)
     # =========================================================================
-    pb_pairs, pb_base = [], {}
+    rq_pairs, rq_base = [], {}
     gelu_mult, gelu_shift, gelu_target = {}, {}, {}
     for name, L in layers.items():
         Eo, Ei = L['shape']
-        pb_base[name] = len(pb_pairs)
+        rq_base[name] = len(rq_pairs)
         b = rd(L['bias_file'], np.int32).astype(np.int64)
         rq = L.get('requant', {})
         if 'mult_file' in rq:
             M = rd(rq['mult_file'], np.int32).astype(np.int64)
         elif 'scale_file' in rq:
-            # bf16 소비자 : 곱수 대신 **bf16 step 16비트**가 들어갑니다.
+            # bf16 소비자 : 곱수 대신 **bf16 scale 16비트**가 들어갑니다.
             # 필드가 `requant` 밑에 있습니다 — `output` 밑이 아닙니다.
             M = rd(rq['scale_file'], np.uint16).astype(np.int64)
         else:
@@ -237,9 +234,9 @@ def main():
         if int((M == 0).sum()):
             raise SystemExit(f'{name}: 곱수 0 인 채널 {int((M==0).sum())}개')
         for c in range(Eo):
-            pb_pairs.append((int(M[c]), int(b[c])))
+            rq_pairs.append((int(M[c]), int(b[c])))
         # ---- 채널 바로 뒤 한 칸 = GELU 뒤 int8 재양자화 곱수 ----
-        # 엔진이 step 시작 시 `PB + NOUT` 을 한 번 읽습니다(`S_GCONST`). 레이어를
+        # 엔진이 명령어 시작 시 `RQ_BASE + NOUT` 을 한 번 읽습니다(`ST_CONST`). 레이어를
         # 빈틈없이 붙여 담으면 그 자리가 **다음 레이어의 채널 0** 이 됩니다 —
         # 통합 TB 에서 결과가 −128 로 포화해 드러났습니다. 모든 레이어 뒤에
         # 한 칸씩 두어 자리를 고정합니다(GELU 가 없는 레이어는 안 읽힘).
@@ -260,42 +257,42 @@ def main():
             gelu_target[name] = float(tgt)
         else:
             gelu_mult[name], gelu_shift[name] = 1, 0
-        pb_pairs.append((gelu_mult[name], 0))
+        rq_pairs.append((gelu_mult[name], 0))
 
     # attention 의 QK / AV 는 **블록당 스칼라 1개**입니다
-    attn_pb = {}
+    attn_rq = {}
     for blk, a in attn.items():
-        attn_pb[blk] = dict(
-            qk=(len(pb_pairs), int(a['QK']['mult']), int(a['QK']['shift'])))
-        pb_pairs.append((int(a['QK']['mult']), 0))
-        attn_pb[blk]['av'] = (len(pb_pairs), int(a['AV']['mult']),
+        attn_rq[blk] = dict(
+            qk=(len(rq_pairs), int(a['QK']['mult']), int(a['QK']['shift'])))
+        rq_pairs.append((int(a['QK']['mult']), 0))
+        attn_rq[blk]['av'] = (len(rq_pairs), int(a['AV']['mult']),
                               int(a['AV']['shift']))
-        pb_pairs.append((int(a['AV']['mult']), 0))
+        rq_pairs.append((int(a['AV']['mult']), 0))
 
     # ---- LayerNorm 뒤 재양자화 (스칼라 1개씩) ----
-    ln_pb, ln_shift, ln_target = {}, {}, {}
+    ln_rq, ln_shift, ln_target = {}, {}, {}
     for ln, tgt in LN_NEXT.items():
         if tgt[0] == 'layer':
-            step = layers[tgt[1]]['input']['step']
+            scale = layers[tgt[1]]['input']['step']
         else:                                    # in_proj 밴드
             bands = layers[tgt[1]]['input']['bands']
-            step = next(b['step'] for b in bands if b['name'] == tgt[2])
-        Mn, kn = make_requant([LN_LSB / step])
-        ln_pb[ln], ln_shift[ln], ln_target[ln] = len(pb_pairs), int(kn), float(step)
-        pb_pairs.append((int(Mn[0]), 0))
+            scale = next(b['step'] for b in bands if b['name'] == tgt[2])
+        Mn, kn = make_requant([LN_LSB / scale])
+        ln_rq[ln], ln_shift[ln], ln_target[ln] = len(rq_pairs), int(kn), float(scale)
+        rq_pairs.append((int(Mn[0]), 0))
 
-    while len(pb_pairs) % 4:
-        pb_pairs.append((0, 0))
-    pb_words = []
-    for i in range(0, len(pb_pairs), 4):
+    while len(rq_pairs) % 4:
+        rq_pairs.append((0, 0))
+    rq_words = []
+    for i in range(0, len(rq_pairs), 4):
         raw = b''
-        for mv, bv in pb_pairs[i:i + 4]:
+        for mv, bv in rq_pairs[i:i + 4]:
             raw += struct.pack('<i', mv if mv < 2**31 else mv - 2**32)
             raw += struct.pack('<i', bv)
-        pb_words.append(raw)
+        rq_words.append(raw)
 
     # ---- LayerNorm 코어의 고정소수점 창 (`in_shift`) ----
-    # 새 코어(`LAYERNORM/layernorm_top`)는 내부가 Q8.15(±256) 입니다. 입력을
+    # 새 코어(`rtl/layernorm/LayerNorm_Unit`)는 내부가 Q8.15(±256) 입니다. 입력을
     # `value * 2^xsh` 로 옮겨 넣는데, 이 값은 LayerNorm 이 스케일 불변이라
     # **정확도가 아니라 정밀도**만 바꿉니다.
     #
@@ -320,9 +317,9 @@ def main():
                             else LN_XSH_BLOCK)
 
     # =========================================================================
-    # PG_Mem : LayerNorm {gamma(Q1.14), beta(Q4.11)} 4바이트, 8특징/워드
+    # Affine_Mem : LayerNorm {gamma(Q1.14), beta(Q4.11)} 4바이트, 8특징/워드
     # =========================================================================
-    pg_pairs, pg_base = [], {}
+    af_pairs, af_base = [], {}
     ln_names = sorted({f['name'].rsplit('.', 1)[0] for f in mf['fx_params']
                        if f['name'].endswith(('.weight', '.bias'))})
     for ln in ln_names:
@@ -331,17 +328,17 @@ def main():
             continue
         g = rd(gw['file'], np.int16).astype(np.int64)
         be = rd(gb['file'], np.int16).astype(np.int64)
-        pg_base[ln] = len(pg_pairs)
+        af_base[ln] = len(af_pairs)
         for i in range(len(g)):
-            pg_pairs.append((int(g[i]), int(be[i])))
-    while len(pg_pairs) % 8:
-        pg_pairs.append((0, 0))
-    pg_words = []
-    for i in range(0, len(pg_pairs), 8):
+            af_pairs.append((int(g[i]), int(be[i])))
+    while len(af_pairs) % 8:
+        af_pairs.append((0, 0))
+    af_words = []
+    for i in range(0, len(af_pairs), 8):
         raw = b''
-        for gv, bv in pg_pairs[i:i + 8]:
+        for gv, bv in af_pairs[i:i + 8]:
             raw += struct.pack('<h', gv) + struct.pack('<h', bv)
-        pg_words.append(raw)
+        af_words.append(raw)
 
     # =========================================================================
     # 자체 검증 : W_Mem 레이아웃으로 골든 acc 를 재계산
@@ -367,26 +364,26 @@ def main():
     # 출력
     # =========================================================================
     nw = emit_words(args.dst, 'wmem', w_words, 8)
-    npb = emit_raw(args.dst, 'pbmem', pb_words)
-    npg = emit_raw(args.dst, 'pgmem', pg_words)
+    n_rq = emit_raw(args.dst, 'rqmem', rq_words)
+    n_af = emit_raw(args.dst, 'afmem', af_words)
 
     # =========================================================================
     # positional encoding 테이블 — **소비자 격자로 옮겨 담습니다**
     #
-    # export 된 표는 자기 자신의 step(0.010073) 위에 있습니다. 하지만 하드웨어의
-    # A_Mem 한 행은 `preproc` 의 입력 벡터 160개 전부이고, GEMM 은 **입력 step 이
+    # export 된 표는 자기 자신의 scale(0.010073) 위에 있습니다. 하지만 하드웨어의
+    # A_Mem 한 행은 `preproc` 의 입력 벡터 160개 전부이고, GEMM 은 **입력 scale 이
     # 하나**입니다 (`requant` 의 M[c] 에 그 하나가 접혀 있음). 골든도 마찬가지로
-    # `cat([gelu_out, pos_embs])` 를 통째로 preproc 의 입력 step 으로 양자화합니다.
+    # `cat([gelu_out, pos_embs])` 를 통째로 preproc 의 입력 scale 로 양자화합니다.
     #
-    #     code_hw = round(code_tbl * step_tbl / step_preproc)      ratio 0.1189
+    #     code_hw = round(code_tbl * scale_tbl / scale_preproc)      ratio 0.1189
     #
     # 이걸 빠뜨리면 pos 64워드가 통째로 8배 크게 들어가 통합 TB 에서 PIN 의 뒤쪽
     # 64워드가 전부 틀립니다 (앞쪽 96워드는 맞으므로 바로 짚힙니다).
     # =========================================================================
     pe = mf['pos_encoding']
     pos_tbl = rd(pe['file'], np.int8).astype(np.float64).reshape(pe['shape'])
-    pos_step = layers[PREPROC]['input']['step']
-    pos = np.clip(np.round(pos_tbl * pe['step'] / pos_step), -128, 127).astype(np.int8)
+    pos_scale = layers[PREPROC]['input']['step']
+    pos = np.clip(np.round(pos_tbl * pe['step'] / pos_scale), -128, 127).astype(np.int8)
     pos.tofile(os.path.join(args.dst, 'posenc.int8.bin'))
 
     # ---- PL 온칩 표 (`Pos_Gather`) ----
@@ -403,8 +400,8 @@ def main():
             fh.write(raw[::-1].hex() + '\n')
     print(f"  posmem  {G*G} 행 x {POS_DIM} B = {G*G*POS_DIM/1024:.1f} KB "
           f"(PL BRAM, `Pos_Gather`)")
-    print(f"\npos enc 재양자화 : step {pe['step']:.6g} → {pos_step:.6g} "
-          f"(x{pe['step']/pos_step:.4f})  코드 범위 {pos.min()}~{pos.max()}")
+    print(f"\npos enc 재양자화 : step {pe['step']:.6g} → {pos_scale:.6g} "
+          f"(x{pe['step']/pos_scale:.4f})  코드 범위 {pos.min()}~{pos.max()}")
 
     # =========================================================================
     # latent 초기값 (`backbone.memory_vertical`) → A_Mem 워드 레이아웃 bf16
@@ -453,15 +450,15 @@ def main():
         dataset='DVS128_10', N=N, E=E, LATENT=LATENT,
         HEADS=HEADS, HEAD_DIM=HEAD_DIM, N_CLASS=N_CLASS,
         T_MAX=20, TOK_MAX=128,
-        words=dict(w=nw, pb=npb, pg=npg),
+        words=dict(w=nw, pb=n_rq, pg=n_af),
         w_base=w_base, w_shape={k: list(v) for k, v in w_shape.items()},
-        pb_base=pb_base, pg_base=pg_base, attn_pb=attn_pb,
-        ln_pb=ln_pb, ln_shift=ln_shift, ln_target=ln_target,
+        rq_base=rq_base, af_base=af_base, attn_rq=attn_rq,
+        ln_rq=ln_rq, ln_shift=ln_shift, ln_target=ln_target,
         ln_xsh=ln_shift_map,
         gelu_shift=gelu_shift, gelu_mult=gelu_mult, gelu_target=gelu_target,
         gelu_raw16=sorted(GELU_RAW16), req2=sorted(REQ2_NEXT),
         mean_layer=MEAN_NEXT[0],
-        input_steps={n: L['input']['step'] for n, L in layers.items()
+        input_scales={n: L['input']['step'] for n, L in layers.items()
                      if 'step' in L.get('input', {})},
         shifts={n: L.get('requant', {}).get('shift') for n, L in layers.items()},
         in_proj_bands={n: L['requant']['bands'] for n, L in layers.items()
@@ -470,19 +467,19 @@ def main():
                  order='[block][k,v][head], lane = head_dim'),
         latent_init=dict(file='latinit.bin', shape=[n_lat, E_lat],
                          words=len(lat_words)),
-        pos_encoding=dict(shape=pe['shape'], step=pos_step,
-                          table_step=pe['step'], file='posenc.int8.bin',
+        pos_encoding=dict(shape=pe['shape'], scale=pos_scale,
+                          table_scale=pe['step'], file='posenc.int8.bin',
                           pl_table=dict(file='posmem.bin', rows=pe['shape'][0]**2,
                                         feat=POS_DIM)),
-        input_step=layers['backbone.event_projection.seq_init.0']['input']['step'],
+        input_scale=layers['backbone.event_projection.seq_init.0']['input']['step'],
     )
     json.dump(cfg, open(os.path.join(args.dst, 'config.json'), 'w'), indent=1)
 
     print(f'-> {args.dst}\n')
     print(f"{'mem':>6} {'워드':>8} {'KB':>8}")
     print(f"{'W':>6} {nw:>8,} {nw*32/1024:>8.1f}")
-    print(f"{'PB':>6} {npb:>8,} {npb*32/1024:>8.1f}   (채널 {len(pb_pairs):,}개)")
-    print(f"{'PG':>6} {npg:>8,} {npg*32/1024:>8.1f}   (LayerNorm {len(pg_base)}개)")
+    print(f"{'RQ':>6} {n_rq:>8,} {n_rq*32/1024:>8.1f}   (채널 {len(rq_pairs):,}개)")
+    print(f"{'AF':>6} {n_af:>8,} {n_af*32/1024:>8.1f}   (LayerNorm {len(af_base)}개)")
     print(f"{'POS':>6} {'':>8} {pos.nbytes/1024:>8.1f}   {tuple(pos.shape)}")
     print(f"{'LATINIT':>6} {len(lat_words):>8,} {len(lat_words)*64/1024:>8.1f}   "
           f"memory_vertical {tuple(lat.shape)} → bf16")
@@ -492,11 +489,11 @@ def main():
           f', in_proj {sum(1 for L in layers.values() if L["kind"]=="in_proj")})')
     print(f'attention 블록 {len(attn)}개')
     print('\nW_Mem 레이아웃 자체 검증 : 전 레이어 표본 재계산 일치 ✅')
-    print('\nGELU 뒤 재양자화 (채널 뒤 한 칸, `PB + NOUT`)')
+    print('\nGELU 뒤 재양자화 (채널 뒤 한 칸, `RQ_BASE + NOUT`)')
     for n2 in GELU_NEXT:
         err = abs(gelu_mult[n2] / 2.0**gelu_shift[n2]
                   - GELU_LSB / gelu_target[n2]) / (GELU_LSB / gelu_target[n2])
-        print(f'  {n2:<58} step {gelu_target[n2]:.6g}  '
+        print(f'  {n2:<58} scale {gelu_target[n2]:.6g}  '
               f'M={gelu_mult[n2]} sh={gelu_shift[n2]}  상대오차 {err:.2e}')
     for n2 in sorted(GELU_RAW16):
         print(f'  {n2:<58} 재양자화 없음 (Q4.11 16b 저장 → LayerNorm)')
@@ -509,10 +506,10 @@ def main():
     print('\nLayerNorm 고정소수점 창 (새 코어의 in_shift, 실측 범위 기준)')
     for k2 in sorted(ln_shift_map):
         print(f'  {k2:<58} xsh={ln_shift_map[k2]:>3}')
-    print('\nLayerNorm 뒤 재양자화 (PB 스칼라 1개씩)')
+    print('\nLayerNorm 뒤 재양자화 (Requant_Mem 스칼라 1개씩)')
     for ln in LN_NEXT:
-        print(f'  {ln:<58} step {ln_target[ln]:.6g}  '
-              f'PB[{ln_pb[ln]}] sh={ln_shift[ln]}')
+        print(f'  {ln:<58} scale {ln_target[ln]:.6g}  '
+              f'RQ[{ln_rq[ln]}] sh={ln_shift[ln]}')
 
 
 if __name__ == '__main__':

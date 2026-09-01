@@ -47,7 +47,7 @@ POS_GRID = 21
 def lane_words(rows, nfeat, n_row):
     """(n_row, nfeat) int8 → 워드 리스트. 워드 k 의 레인 i = rows[mt*32+i][k]
 
-    타일이 모자란 레인은 0 입니다 (`Gemm_Core_Ev` 의 edge mask 와 같은 규칙).
+    타일이 모자란 레인은 0 입니다 (`Gemm_Core` 의 edge mask 와 같은 규칙).
     """
     TT = (n_row + N - 1) // N
     out = np.zeros((TT * nfeat, N), dtype=np.int16)
@@ -89,7 +89,7 @@ def main():
     print(f"  PIN base {reg['PIN']['base']:>5}  {reg['PIN']['words']} 워드 "
           f"(앞 96 = 엔진, 뒤 64 = pos enc)")
 
-    x_all, p_all, nt_all, step_idx = [], [], [], []
+    x_all, p_all, nt_all, sample_idx = [], [], [], []
     # 보드용 : pos enc 는 **PL 의 표**(`Pos_Gather`)에서 모읍니다. 호스트는
     # `pos_idx` 만 보냅니다 — 워드 mt 의 레인 i = 토큰 mt*32+i 의 표 인덱스.
     # 전에는 펼친 이미지가 96.7 MB 였는데 이제 0.5 MB 입니다.
@@ -98,7 +98,7 @@ def main():
     bad = 0
     for s in range(n_sample):
         off, T = int(samples[s][0]), int(samples[s][1])
-        step_idx.append([len(nt_all), T, 0, 0])
+        sample_idx.append([len(nt_all), T, 0, 0])
         for t in range(T):
             o, n = int(index[off + t][0]), int(index[off + t][1])
             rows = tok[o:o + n].astype(np.int16)              # (n, 144)
@@ -148,14 +148,14 @@ def main():
     X.astype('<i2').tofile(os.path.join(args.dst, 'amem_x.int16.bin'))
     P.astype('<i2').tofile(os.path.join(args.dst, 'amem_pos.int16.bin'))
     np.asarray(nt_all, dtype='<i2').tofile(os.path.join(args.dst, 'n_tok.int16.bin'))
-    np.asarray(step_idx, dtype='<i4').tofile(os.path.join(args.dst, 'samples.int32.bin'))
+    np.asarray(sample_idx, dtype='<i4').tofile(os.path.join(args.dst, 'samples.int32.bin'))
     labels[:n_sample].astype('<i4').tofile(os.path.join(args.dst, 'labels.int32.bin'))
 
     # ---- 보드가 그대로 읽는 형태 ----
     PIN_IMG = np.concatenate(pidx_all)
     PIN_IMG.astype('<i2').tofile(os.path.join(args.dst, 'amem_pidx.int16.bin'))
     np.asarray(bidx, dtype='<i4').tofile(os.path.join(args.dst, 'board_index.int32.bin'))
-    bsam = [[step_idx[s][0], step_idx[s][1], int(labels[s]), 0]
+    bsam = [[sample_idx[s][0], sample_idx[s][1], int(labels[s]), 0]
             for s in range(n_sample)]
     np.asarray(bsam, dtype='<i4').tofile(os.path.join(args.dst, 'board_samples.int32.bin'))
 

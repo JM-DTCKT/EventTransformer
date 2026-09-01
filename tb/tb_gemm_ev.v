@@ -40,10 +40,9 @@ module tb_gemm_ev;
   reg  [N*16-1:0]  a_rd_data;
   reg  [N*8-1:0]   b_rd_data;
 
-  wire                 col_valid, col_first, col_last;
+  wire                 col_valid;
   wire [N*PSUM_W-1:0]  col_data;
   wire [DIM_W-1:0]     col_n, col_mt;
-  wire [N-1:0]         col_row_en;
 
   Gemm_Core #(.N(N), .ACT_W(ACT_W), .PSUM_W(PSUM_W), .DIM_W(DIM_W),
                  .AW_A(AW_A), .AW_B(AW_B)) dut (
@@ -51,8 +50,7 @@ module tb_gemm_ev;
     .M(M), .K(K), .Nout(Nout), .a_base(a_base), .b_base(b_base),
     .a_rd_en(a_rd_en), .a_rd_addr(a_rd_addr), .a_rd_data(a_rd_data),
     .b_rd_en(b_rd_en), .b_rd_addr(b_rd_addr), .b_rd_data(b_rd_data),
-    .col_valid(col_valid), .col_data(col_data), .col_n(col_n), .col_mt(col_mt),
-    .col_first(col_first), .col_last(col_last), .col_row_en(col_row_en));
+    .col_valid(col_valid), .col_data(col_data), .col_n(col_n), .col_mt(col_mt));
 
   // ---- 메모리 (읽기 지연 1사이클 — Bram_Sdp 와 동일) ----
   reg [N*16-1:0] amem [0:4095];

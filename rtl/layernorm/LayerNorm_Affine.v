@@ -1,5 +1,5 @@
 // -----------------------------------------------------------------------------
-// LN_Affine : LayerNorm 의 affine 단계 — 곱셈기 1개 + 고정 시프트
+// LayerNorm_Affine : LayerNorm 의 affine 단계 — 곱셈기 1개 + 고정 시프트
 //
 //   y = sat( (xhat * gamma + (beta << BSHIFT) + (1 << (OSHIFT-1))) >> OSHIFT )
 //
@@ -26,7 +26,9 @@
 // 비트폭: xhat 15b × gamma 12b → 26b (DSP48E2 27×18 하나에 들어감).
 // 반올림: round-half-up. 파이프라인 2단 (곱+정렬 / 반올림+시프트+포화).
 // -----------------------------------------------------------------------------
-module LN_Affine #(
+`timescale 1ns/1ps
+
+module LayerNorm_Affine #(
     parameter XHAT_W     = 16, parameter XHAT_FRAC  = 11,   // Q4.11
     parameter GAMMA_W    = 16, parameter GAMMA_FRAC = 14,   // Q1.14
     parameter BETA_W     = 16, parameter BETA_FRAC  = 11,   // Q4.11

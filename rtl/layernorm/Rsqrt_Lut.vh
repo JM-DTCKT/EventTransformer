@@ -1,5 +1,5 @@
 // ==========================================================================
-//  rsqrt_lut.vh -- 1/sqrt 유닛 PWL LUT      (AUTO-GENERATED, do not hand-edit)
+//  Rsqrt_Lut.vh -- 1/sqrt 유닛 PWL LUT      (AUTO-GENERATED, do not hand-edit)
 // --------------------------------------------------------------------------
 //  r(m, par) = (m * 2^par)^-0.5 ,  m = 1+f in [1,2),  UQ1.17
 //     par=0 : 1/sqrt(m)  in (0.7071, 1.0]      <- var 의 지수가 짝수
@@ -8,7 +8,7 @@
 //     r = rsq_base_rom[idx] + ((rsq_delta_rom[idx]*frac + (1<<11)) >>> 12)
 //  ROM 폭은 실제 값 범위에 맞춰 최소화 : base 18b(unsigned), delta 10b(signed)
 //  최대 근사오차 = 1.2107e-05  (상대오차 <= 1.5065e-05)
-//  * NSEG/FRB/RF 를 바꾸면 rsqrt_unit.v 의 SEGB/FRB 와 함께 재생성해야 한다.
+//  * NSEG/FRB/RF 를 바꾸면 Rsqrt_Unit.v 의 SEGB/FRB 와 함께 재생성해야 한다.
 // ==========================================================================
 localparam integer RSQ_BW = 18;   // base ROM 폭 (unsigned)
 localparam integer RSQ_DW = 10;   // delta ROM 폭 (signed)

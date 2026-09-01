@@ -1,71 +1,61 @@
 // -----------------------------------------------------------------------------
-// EvT_Engine : EvT(DVS128_10) 실행기 — inst 프로그램을 순서대로 돌립니다
+// EvT_Engine : EvT(DVS128_10) 실행기 — 명령어 프로그램을 순서대로 돌립니다
 //
-// `fpga_nl/FFN_Engine` 과 역할은 같지만 규모가 다릅니다:
+// Inst_Mem 에서 256비트 명령어를 하나씩 읽어 KIND 에 맞는 유닛을 기동하고, 끝날
+// 때까지 기다렸다가 다음 명령어로 넘어갑니다 (ST_FETCH → ST_DECODE → ST_CONST →
+// ST_RUN → ST_WAIT → ST_NEXT). 타임스텝 T(<=20) 를 돌며 latent 를 누적하고,
+// 마지막에 tail 명령어 5개로 분류합니다.
 //
-//                     FFN_Engine        EvT_Engine
-//   inst 수           12                **타임스텝당 150 + 끝 5**
-//   재귀              없음              **타임스텝 T(≤20) 루프, latent 누적**
-//   attention         없음              **3블록 x head 4**
+// 신호 이름 규칙과 용어(`inst`/`tstep`/`scale`)는 `rtl/NAMING.md` 를 보십시오.
 //
-// inst 이 150개라 `fpga_nl` 처럼 레지스터 파일에 못 담습니다. **Inst_Mem(BRAM)**
-// 에 담고 하나씩 읽어 실행합니다. AXI-Stream 로더가 다른 메모리와 같은 방식으로
-// 채웁니다.
-//
-// ## inst 프로그램은 정적입니다
+// ## 프로그램은 정적입니다
 //
 // `n_tok` 은 타임스텝마다 다릅니다(실측 16~123). 영역 크기를 `n_tok` 에 맞추면
 // 베이스가 매번 바뀌어 프로그램을 5,182벌 만들어야 합니다. 그래서 **모든 영역
-// stride 를 최악치(토큰 128)로 고정**했습니다(`sw/schedule_evt.py`). 그러면
-// 베이스가 전부 상수가 되고, `n_tok` 에 따라 바뀌는 것은 네 필드뿐입니다:
+// stride 를 최악치(토큰 128)로 고정**했습니다(`sw/schedule_evt.py`). 베이스가
+// 전부 상수가 되고, `n_tok` 에 따라 바뀌는 것은 VAR 이 표시한 네 필드뿐입니다:
 //
-//   VAR[0]  M    <- n_tok        (토큰 행을 도는 inst)
-//   VAR[1]  NOUT <- n_tok+1      (Q·Kᵀ 의 Nout = Lk)
-//   VAR[2]  K    <- n_tok+1      (attn·V 의 reduce = Lk)
-//   VAR[3]  C    <- n_tok+1      (softmax 의 클래스 수 = Lk)
+//   VAR[0] M <- n_tok      VAR[1] NOUT <- Lk
+//   VAR[2] K <- Lk         VAR[3] C    <- Lk        (Lk = n_tok + 1)
 //
-// 발행 시점에 `n_tok` 레지스터로 채워 넣습니다. latent 쪽 inst 은 `Lk = 96+1` 이
+// ST_DECODE 가 `inst_word` 의 VAR 비트를 보고 그 자리에 `tok_n` 을 넣습니다
+// (그래서 `op_var` 라는 레지스터가 없습니다). latent 쪽 명령어는 Lk = 96+1 이
 // 상수라 VAR 을 안 씁니다.
 //
-// ## inst 워드 (256비트 = Inst_Mem 한 워드)
+// ## 명령어 워드 (256비트 = Inst_Mem 한 워드)
 //
-//   [ 31: 0] KIND[3:0] CONS[5:4] ACT[7:6] VAR[11:8] FLAG[15:12]
-//            SHIFT[21:16] GSH[27:22] FLAG2[31:28]
+//   [ 31: 0] KIND[3:0] FMT[5:4] ACT[7:6] VAR[11:8] FLAG[15:12]
+//            SHIFT[21:16] SHIFT2[27:22] FLAG2[31:28]
 //   [ 63:32] M      [ 95:64] K      [127:96] NOUT
 //   [159:128] AIN   [191:160] BIN   [223:192] AOUT
-//   [255:224] PB[15:0] | OSTR[31:16]
+//   [255:224] RQ_BASE[15:0] | OSTR[31:16]
 //
-//   OSTR = GEMM 출력 stride. 보통 NOUT 과 같지만 **다를 수 있습니다** —
-//   `event_projection` 은 96채널을 내면서 `preproc` 입력(160 = 96 + pos enc 64)의
-//   앞쪽에 써야 하므로 stride 가 160 입니다. FLAG[1](head-major)일 때는 head 간
-//   간격으로 쓰입니다.
+//   KIND  0 GEMM  1 LN  2 SMAX  3 RES  4 MEAN  5 ARGMAX  6 POS
+//   FMT   0 int8(+ACT)  1 Q4.11→GELU→int8  2 bf16  3 Q6.9(softmax 직결)
+//   FLAG  [0] 출력을 Transpose32 경유로   [1] 출력을 head-major 주소로
+//         [2] B 피연산자를 A_Mem 에서     [3] Q4.11 을 16b 그대로 (raw16)
+//   FLAG2 [0] LN 입력이 Q4.11 코드        [1] RES 두 피연산자가 정수 코드
+//         [2] bias_k/bias_v 토큰 끼워넣기 [3] 활성함수 뒤 2차 재양자화
 //
-//   GELU 뒤 int8 재양자화 곱수는 **PB + NOUT** 자리에 둡니다 (그 레이어의 채널별
-//   항목 바로 뒤). 그래서 별도 필드가 필요 없습니다.
+// `OSTR` · `RQ_BASE` · `SHIFT2` 는 KIND 마다 뜻이 다릅니다. 아래 선언부에
+// **쓰는 자리마다 이름 붙인 별칭 wire** 를 두었습니다 (`ostr_as_*`). 표는
+// `rtl/NAMING.md` §4.3 — 새 용도를 추가하면 별칭도 같이 추가하십시오.
 //
-//   KIND  0 GEMM  1 LN  2 SMAX  3 RES  4 MEAN  5 ARGMAX
-//   CONS  0 int8(+ACT)  1 Q4.11→GELU→int8  2 bf16  3 Q6.9(softmax 직결)
-//   FLAG (s_rd[15:12] → q_flag[3:0])
-//     [0] GEMM 출력을 **Transpose32 경유**로            (in_proj 의 V)
-//     [1] GEMM 출력을 **head-major 주소**로             (in_proj 의 Q/K)
-//         이때 OSTR 은 head 간 간격으로 쓰입니다
-//     [2] B 피연산자를 **A_Mem** 에서                    (Q·Kᵀ, attn·V)
-//     [3] 예약
+// ## A_Mem 은 읽기 2포트입니다
 //
-// ## A_Mem 포트 중재
+// 읽기를 GEMM(A) · GEMM(B) · LN · RES · MEAN · POS 가 나눠 쓰는데, GEMM 과 RES 는
+// **두 워드를 동시에** 읽습니다. Bram_Sdp 두 벌에 같은 내용을 미러링해 읽기
+// 포트를 둘로 만들었습니다 (`a_ra_*` / `a_rb_*`). BRAM 이 남으므로 이게 가장
+// 단순합니다.
 //
-// 읽기 1포트를 GEMM(A) · GEMM(B) · LN · RES · MEAN 이 나눠 씁니다. 동시에 도는
-// 유닛이 없도록 스케줄이 보장하지만, **GEMM 만은 A 와 B 를 동시에** 읽습니다.
-// B 가 W_Mem 인 경우(Linear)는 충돌이 없고, B 가 A_Mem 인 경우(Q·Kᵀ, attn·V)만
-// 두 포트가 필요합니다. 그래서 A_Mem 을 **읽기 2포트**로 둡니다 (Bram_Sdp 두 벌에
-// 같은 내용을 미러링 — BRAM 이 남으므로 이게 가장 단순합니다).
+// ## 바꾸기 전에
 //
-// ## 검증 상태
-//
-// **아직 통합 TB 를 안 돌렸습니다.** `fpga_nl` 의 12 inst 엔진에서도 위상·주소
-// 버그가 5개 나왔고, 여기는 inst 이 150개입니다. `tb_evt` 로 tap 대조를 하기 전에는
-// 동작한다고 볼 수 없습니다.
+// `tb_evt` 가 골든과 tap 대조를 하고(140,170 점 중 알려진 양자화 오차 2건),
+// ZCU102 에서 187.5 MHz 로 합성·구현·보드 검증까지 끝난 코드입니다. 고친 뒤에는
+// `tb/run_vcs.sh` 로그를 **변경 전과 diff** 하십시오 (`rtl/NAMING.md` §8).
 // -----------------------------------------------------------------------------
+`timescale 1ns/1ps
+
 module EvT_Engine #(
     parameter N      = 32,
     parameter ACT_W  = 8,
@@ -76,17 +66,15 @@ module EvT_Engine #(
     parameter HEADS  = 4,
     parameter HD     = 32,
     parameter TOKMAX = 128,
+    parameter N_CLASS = 10,      // 분류 클래스 수 (DVS128_10)
     parameter AW_W   = 14,       // W_Mem 워드 주소폭 (14,000 워드)
-    // A_Mem 실사용은 `schedule.json` 의 a_words = 7,649 워드입니다 (마지막 영역
-    // FFN base 7,265 + 384).  2^13 = 8,192 이므로 13비트로 충분하고, 여유는
-    // 543 워드(7 %) 입니다 — 영역을 더 늘릴 때 `schedule_evt.py` 에서 상한을
-    // 확인하십시오.  14 였을 때는 BRAM 깊이가 16,384 라 절반이 놀았고,
-    // 깊이 캐스케이드도 4단이라 읽기에 1.691 ns 가 들었습니다 (2단이면 1.187).
+    // A_Mem 실사용 7,649 워드 (`schedule.json` 의 a_words) → 2^13 = 8,192 로 충분.
+    // 여유가 543 워드뿐이므로 영역을 늘릴 때 `schedule_evt.py` 상한을 보십시오.
+    // [타이밍] 14 로 두면 BRAM 깊이 캐스케이드가 4단이 돼 읽기가 1.69 ns 입니다.
     parameter AW_A   = 13,       // A_Mem  (7,649 워드 사용)
-    parameter AW_PB  = 10,       // PB_Mem (860 워드)
-    parameter AW_PG  = 8,        // PG_Mem (208 워드)
-    parameter AW_S   = 8,        // Inst_Mem (155 워드)
-    parameter GELU_LUT_FILE  = "gelu.hex"
+    parameter AW_RQ  = 10,       // Requant_Mem (860 워드,  구 PB_Mem)
+    parameter AW_AF  = 8,        // Affine_Mem  (208 워드,  구 PG_Mem)
+    parameter AW_INST = 8       // Inst_Mem   (155 워드,  구 Step_Mem)
 )(
     input  wire                 clk,
     input  wire                 rst,
@@ -95,12 +83,12 @@ module EvT_Engine #(
     output reg                  done,
     output wire                 busy,
     output wire [3:0]           dbg_state,
-    output wire [AW_S-1:0]      dbg_step,
+    output wire [AW_INST-1:0]      dbg_inst,
 
     // ---- 실행 파라미터 ----
-    input  wire [AW_S-1:0]      n_body,        // 전처리 + Attention inst 수
-    input  wire [AW_S-1:0]      n_tail,        // Classifier inst 수
-    input  wire [5:0]           n_time,        // 타임스텝 T (Time-window)
+    input  wire [AW_INST-1:0]      n_body,        // 전처리 + Attention 명령어 수
+    input  wire [AW_INST-1:0]      n_tail,        // Classifier 명령어 수
+    input  wire [5:0]           n_tstep,        // 타임스텝 T (Time-window)
     input  wire [31:0]          eps,           // LayerNorm eps (fp32 비트)
 
     // ---- 타임스텝 입력 요청 ----
@@ -108,97 +96,113 @@ module EvT_Engine #(
     // 24k 워드로 A_Mem 을 넘습니다). 그래서 타임스텝마다 호스트가 새로 채워야
     // 하고, 엔진은 채워질 때까지 기다립니다.
     //
-    //   tok_req = 1 로 멈춤  →  호스트가 tok_rd_idx 번째 타임스텝의
+    //   tok_req = 1 로 멈춤  →  호스트가 tstep_idx 번째 타임스텝의
     //   X / PIN(pos enc) 를 적재하고 tok_ack 를 한 번 올림  →  진행
     //
-    // `tok_rd_n` 은 그 타임스텝의 토큰 수입니다 (ack 시점에 래치).
-    output wire [5:0]           tok_rd_idx,
-    input  wire [DIM_W-1:0]     tok_rd_n,
+    // `tok_n` 은 그 타임스텝의 토큰 수입니다 (ack 시점에 래치).
+    output wire [5:0]           tstep_idx,
+    input  wire [DIM_W-1:0]     tok_n,
     output reg                  tok_req,
     input  wire                 tok_ack,
 
     // ---- 메모리 적재 ----
     input  wire                 ld_we,
-    input  wire [2:0]           ld_sel,        // 0 W  1 A  2 PB  3 PG  4 STEP  5 POS
+    input  wire [2:0]           ld_sel,        // LD_* (아래 localparam)
     input  wire [AW_W-1:0]      ld_addr,
     input  wire [N*16-1:0]      ld_data,
 
     // ---- 결과 ----
     output reg  [3:0]           res_class,     // argmax
-    output reg  [N*PSUM_W-1:0]  res_logits,    // 클래스별 acc (디버그)
+    output reg  [N_CLASS*PSUM_W-1:0] res_logits,  // 클래스별 acc (디버그)
 
     // ---- A_Mem 리드백 (IDLE 일 때만) ----
     input  wire                 dbg_rd_en,
     input  wire [AW_A-1:0]      dbg_rd_addr,
     output wire [N*16-1:0]      dbg_rd_data
 );
-    localparam K_GEMM=4'd0, K_LN=4'd1, K_SMAX=4'd2, K_RES=4'd3,
-               K_MEAN=4'd4, K_ARGMAX=4'd5, K_POS=4'd6;
-    localparam C_INT8=2'd0, C_Q411=2'd1, C_BF16=2'd2, C_Q69=2'd3;
+    // 로더 목적지 (`ld_sel`) — Top.v 의 LOAD_SEL 레지스터와 같은 인코딩
+    localparam [2:0] LD_W = 3'd0, LD_A = 3'd1, LD_RQ = 3'd2,
+                     LD_AF = 3'd3, LD_INST = 3'd4, LD_POS = 3'd5;
+
+    localparam OP_GEMM=4'd0, OP_LN=4'd1, OP_SMAX=4'd2, OP_RES=4'd3,
+               OP_MEAN=4'd4, OP_ARGMAX=4'd5, OP_POS=4'd6;
+    localparam FMT_INT8=2'd0, FMT_Q411=2'd1, FMT_BF16=2'd2, FMT_Q69=2'd3;
+
+    genvar lane;                 // 모든 generate 루프가 함께 씁니다
 
     // 인스턴스보다 먼저 선언해야 하는 신호들
     // (사용이 선언보다 앞서면 Verilog 가 1비트 net 으로 암묵 선언합니다)
-    reg                 col_v_d,  col_v_d2;
-    reg [N*PSUM_W-1:0]  col_d_d,  col_d_d2;
-    reg [DIM_W-1:0]     col_n_d,  col_mt_d;
-    reg [DIM_W-1:0]     col_n_d2, col_mt_d2;
-    reg                 sm_iv;
-    reg [N*16-1:0]      sm_id;
+    reg                 col_valid_d1, col_valid_d2;
+    reg [N*PSUM_W-1:0]  col_data_d1,  col_data_d2;
+    reg [DIM_W-1:0]     col_n_d1,     col_n_d2;
+    reg [DIM_W-1:0]     col_mt_d1,    col_mt_d2;
+    reg                 smax_in_valid;
+    reg [N*16-1:0]      smax_in_data;
 
     // =========================================================================
     // FSM
     // =========================================================================
-    localparam S_IDLE=4'd0, S_FETCH=4'd1, S_DEC=4'd2, S_GCONST=4'd3,
-               S_RUN=4'd4, S_WAIT=4'd5, S_NEXT=4'd6, S_TSTEP=4'd7, S_DONE=4'd8,
-               S_TLOAD=4'd9;
-    reg [3:0]        st;
-    reg [AW_S-1:0]   sp;              // inst 포인터
-    reg [5:0]        ti;              // 타임스텝 인덱스
-    reg              in_tail;
-    reg [DIM_W-1:0]  n_tok;           // 이번 타임스텝의 토큰 수
+    localparam ST_IDLE=4'd0, ST_FETCH=4'd1, ST_DECODE=4'd2, ST_CONST=4'd3,
+               ST_RUN=4'd4, ST_WAIT=4'd5, ST_NEXT=4'd6, ST_TSTEP=4'd7, ST_DONE=4'd8,
+               ST_TLOAD=4'd9;
+    reg [3:0]         state;
+    reg [AW_INST-1:0] inst_ptr;    // 명령어 포인터 (프로그램 카운터)
+    reg [5:0]         tstep;       // 타임스텝 인덱스
+    reg               in_tail;     // body 를 다 돌고 tail 을 도는 중
+    reg [DIM_W-1:0]   n_tok;       // 이번 타임스텝의 토큰 수
 
-    assign busy      = (st != S_IDLE);
-    assign dbg_state = st;
-    assign dbg_step  = sp;
-    assign tok_rd_idx = ti;
+    assign busy       = (state != ST_IDLE);
+    assign dbg_state  = state;
+    assign dbg_inst   = inst_ptr;
+    assign tstep_idx  = tstep;
 
     // =========================================================================
-    // Inst_Mem — inst 하나 = 256비트 워드 하나
+    // Inst_Mem — 명령어 하나 = 256비트 워드 하나
     // =========================================================================
-    wire [N*8-1:0] s_rd;
-    reg  [AW_S-1:0] s_addr;
-    Bram_Sdp #(.DW(N*8), .AW(AW_S)) u_smem (
-        .clk(clk), .we_en(ld_we && ld_sel == 3'd4), .we_addr(ld_addr[AW_S-1:0]),
+    wire [N*8-1:0]    inst_word;
+    reg  [AW_INST-1:0] inst_addr;
+    Bram_Sdp #(.DW(N*8), .AW(AW_INST)) u_inst_mem (
+        .clk(clk), .we_en(ld_we && ld_sel == LD_INST), .we_addr(ld_addr[AW_INST-1:0]),
         .we_be({N{1'b1}}), .we_data(ld_data[N*8-1:0]),
-        .rd_en(1'b1), .rd_addr(s_addr), .rd_data(s_rd));
+        .rd_en(1'b1), .rd_addr(inst_addr), .rd_data(inst_word));
 
-    // 디코드 (S_DEC 에서 래치)
-    reg [3:0]        q_kind;
-    reg [1:0]        q_cons, q_act;
-    reg [3:0]        q_var, q_flag;
+    // =========================================================================
+    // 디코드된 명령어 필드 (ST_DECODE 에서 래치, 명령어 내내 고정)
+    // =========================================================================
+    reg [3:0]        op_kind;                 // OP_*
+    reg [1:0]        op_fmt;                  // FMT_*  (출력 포맷)
+    reg [1:0]        op_act;                  // Activation.v 인코딩
+    reg [3:0]        op_flag, op_flag2;
+    // 시프트는 32레인 x 2벌 = DSP 64개를 먹습니다. 복제해 배선을 끊습니다.
     (* max_fanout = 16 *)
-    reg [5:0]        q_sh, q_gsh;   // requant 시프트 — 위와 같은 이유로 복제
-    reg [DIM_W-1:0]  q_M, q_K, q_NOUT;
-    reg [AW_A-1:0]   q_AIN, q_AOUT;
-    reg [AW_W-1:0]   q_BIN;
-    reg [15:0]       q_PB, q_OSTR;
-    reg [3:0]        q_flag2;        // 워드0 [31:28]
-    // LayerNorm 은 **한 번에 32행(레인)** 만 처리합니다 (특징 축 리덕션이라
-    // 레인이 곧 행). M 이 32를 넘으면 행타일 수만큼 다시 겁니다. inst 을 타일마다
-    // 쪼개면 프로그램이 n_tok 에 의존하게 되므로(최악 4벌) 엔진이 셉니다.
-    // 하위 코어들의 `done` 은 **다음 start 까지 계속 1** 입니다. start 를 준
-    // 사이클에 done 을 그대로 보면 **직전 완료를 이번 완료로 착각**합니다
-    // (LayerNorm 행타일 반복에서 두 번째 타일이 통째로 건너뛰어져 드러났습니다).
-    // done 이 한 번 0 으로 내려간 것을 본 뒤부터 인정합니다.
-    reg              wait_ack;
-    reg [5:0]        rs_mt;          // 현재 행타일 (RES)
-    // RES 는 A_Mem 이 `base + mt*K + k` 라 행타일마다 다시 돕니다.
-    // (레인이 행이므로 한 바퀴가 32행. M=52 면 두 바퀴, 96 이면 세 바퀴)
-    wire [5:0]       rs_mt_last = (q_M > 0) ? ((q_M - 1'b1) >> 5) : 6'd0;
-    wire [5:0]       ln_mt_last = rs_mt_last;      // MEAN 이 같이 씁니다
-    reg [1:0]        gc;
+    reg [5:0]        op_shift, op_shift2;
+    reg [DIM_W-1:0]  op_m, op_k, op_nout;     // GEMM 형상
+    reg [AW_A-1:0]   op_ain, op_aout;         // A_Mem 피연산자 / 결과 베이스
+    reg [AW_W-1:0]   op_bin;                  // B 베이스 (W_Mem 또는 A_Mem)
+    reg [15:0]       op_rq_base, op_ostr;     // 아래 별칭 참조
 
-    wire [DIM_W-1:0] Lk = n_tok + 1'b1;
+    // `op_ostr` / `op_rq_base` 는 KIND 마다 뜻이 다릅니다 (머리말 참조).
+    // 쓰는 자리마다 **이름 붙인 별칭**을 두어 읽는 사람이 헷갈리지 않게 합니다.
+    // 새 용도를 추가하면 별칭도 같이 추가하십시오.
+    wire [AW_A-1:0]  ostr_as_bkv_addr   = op_ostr[AW_A-1:0];   // AV  : bias_v 워드
+    wire [AW_A-1:0]  ostr_as_smax_base  = op_ostr[AW_A-1:0];   // QK  : softmax 출력
+    wire [AW_AF+2:0] ostr_as_af_base    = op_ostr[AW_AF+2:0];  // LN  : Affine_Mem
+    wire [15:0]      ostr_as_scale_b    = op_ostr;             // RES : B 의 정수 scale
+    wire [15:0]      rq_base_as_scale_a = op_rq_base;          // RES : A 의 정수 scale
+
+    // 행타일 : 레인이 곧 행이므로 한 바퀴가 32행 (M=52 면 두 바퀴, 96 이면 세 바퀴).
+    // RES 는 A_Mem 이 `base + mt*K + k` 라, LayerNorm 과 MEAN 은 특징 축 리덕션이라
+    // 행타일마다 다시 돕니다. 명령어를 타일마다 쪼개면 프로그램이 n_tok 에
+    // 의존하게 되므로(최악 4벌) 엔진이 셉니다.
+    wire [5:0]       row_tile_last = (op_m > 0) ? ((op_m - 1'b1) >> 5) : 6'd0;
+    reg [5:0]        rs_mt;                   // 현재 행타일 (RES)
+    reg [1:0]        const_ph;                // ST_CONST 의 3사이클 위상
+
+    // [함정] 하위 코어의 `done` 은 **다음 start 까지 계속 1** 입니다. start 를 준
+    // 사이클에 그대로 보면 직전 완료를 이번 완료로 착각해 타일 하나를 통째로
+    // 건너뜁니다. done 이 한 번 0 으로 내려간 것을 본 뒤부터 인정합니다.
+    reg              wait_ack;
+
 
     // =========================================================================
     // 메모리
@@ -206,8 +210,8 @@ module EvT_Engine #(
     wire            w_rd_en;
     wire [AW_W-1:0] w_rd_addr;
     wire [N*8-1:0]  w_rd_data;
-    Bram_Sdp #(.DW(N*8), .AW(AW_W)) u_wmem (
-        .clk(clk), .we_en(ld_we && ld_sel == 3'd0), .we_addr(ld_addr),
+    Bram_Sdp #(.DW(N*8), .AW(AW_W)) u_w_mem (
+        .clk(clk), .we_en(ld_we && ld_sel == LD_W), .we_addr(ld_addr),
         .we_be({N{1'b1}}), .we_data(ld_data[N*8-1:0]),
         .rd_en(w_rd_en), .rd_addr(w_rd_addr), .rd_data(w_rd_data));
 
@@ -216,90 +220,87 @@ module EvT_Engine #(
     reg              a_we_en;
     reg  [AW_A-1:0]  a_we_addr;
     reg  [N*16-1:0]  a_we_data;
-    reg              ar_en, br_en;
-    reg  [AW_A-1:0]  ar_addr, br_addr;
-    wire [N*16-1:0]  ar_data, br_data;
+    reg              a_ra_en, a_rb_en;
+    reg  [AW_A-1:0]  a_ra_addr, a_rb_addr;
+    wire [N*16-1:0]  a_ra_data, a_rb_data;
 
-    wire a_we_ld = ld_we && ld_sel == 3'd1;
-    wire            aw_en   = a_we_ld ? 1'b1              : a_we_en;
-    wire [AW_A-1:0] aw_addr = a_we_ld ? ld_addr[AW_A-1:0] : a_we_addr;
-    wire [N*16-1:0] aw_data = a_we_ld ? ld_data           : a_we_data;
+    wire a_wr_from_ld = ld_we && ld_sel == LD_A;
+    wire            a_wr_en   = a_wr_from_ld ? 1'b1              : a_we_en;
+    wire [AW_A-1:0] a_wr_addr = a_wr_from_ld ? ld_addr[AW_A-1:0] : a_we_addr;
+    wire [N*16-1:0] a_wr_data = a_wr_from_ld ? ld_data           : a_we_data;
 
-    Bram_Sdp #(.DW(N*16), .AW(AW_A)) u_amem0 (
-        .clk(clk), .we_en(aw_en), .we_addr(aw_addr), .we_be({(N*2){1'b1}}),
-        .we_data(aw_data), .rd_en(ar_en), .rd_addr(ar_addr), .rd_data(ar_data));
-    Bram_Sdp #(.DW(N*16), .AW(AW_A)) u_amem1 (
-        .clk(clk), .we_en(aw_en), .we_addr(aw_addr), .we_be({(N*2){1'b1}}),
-        .we_data(aw_data), .rd_en(br_en), .rd_addr(br_addr), .rd_data(br_data));
+    Bram_Sdp #(.DW(N*16), .AW(AW_A)) u_a_mem0 (
+        .clk(clk), .we_en(a_wr_en), .we_addr(a_wr_addr), .we_be({(N*2){1'b1}}),
+        .we_data(a_wr_data), .rd_en(a_ra_en), .rd_addr(a_ra_addr), .rd_data(a_ra_data));
+    Bram_Sdp #(.DW(N*16), .AW(AW_A)) u_a_mem1 (
+        .clk(clk), .we_en(a_wr_en), .we_addr(a_wr_addr), .we_be({(N*2){1'b1}}),
+        .we_data(a_wr_data), .rd_en(a_rb_en), .rd_addr(a_rb_addr), .rd_data(a_rb_data));
 
-    assign dbg_rd_data = ar_data;
+    assign dbg_rd_data = a_ra_data;
 
-    // PB_Mem : 채널 c 의 {mult|inst, bias}
-    wire [AW_PB-1:0] pb_word;
-    wire [N*8-1:0]   pb_rd;
-    reg  [AW_PB+1:0] pb_idx;
-    assign pb_word = pb_idx[AW_PB+1:2];
-    Bram_Sdp #(.DW(N*8), .AW(AW_PB)) u_pbmem (
-        .clk(clk), .we_en(ld_we && ld_sel == 3'd2), .we_addr(ld_addr[AW_PB-1:0]),
+    // Requant_Mem : 채널 c 의 {scale, bias} — 워드 하나에 4채널
+    //   scale = round(s_x * s_w[c] / lsb_out * 2^shift)  — 역양자화와 재양자화를
+    //           곱수 하나로 접은 값입니다 (bf16 소비자는 bf16 상수 16비트).
+    wire [AW_RQ-1:0] rq_word;
+    wire [N*8-1:0]   rq_rd;
+    reg  [AW_RQ+1:0] rq_idx;
+    assign rq_word = rq_idx[AW_RQ+1:2];
+    Bram_Sdp #(.DW(N*8), .AW(AW_RQ)) u_rq_mem (
+        .clk(clk), .we_en(ld_we && ld_sel == LD_RQ), .we_addr(ld_addr[AW_RQ-1:0]),
         .we_be({N{1'b1}}), .we_data(ld_data[N*8-1:0]),
-        .rd_en(1'b1), .rd_addr(pb_word), .rd_data(pb_rd));
-    reg [1:0] pb_sub_d;
-    always @(posedge clk) pb_sub_d <= pb_idx[1:0];
-    wire signed [31:0] pb_mult = pb_rd[{pb_sub_d, 6'd0}      +: 32];
-    wire signed [31:0] pb_bias = pb_rd[{pb_sub_d, 6'd0} + 32 +: 32];
+        .rd_en(1'b1), .rd_addr(rq_word), .rd_data(rq_rd));
+    reg [1:0] rq_sub_d1;
+    always @(posedge clk) rq_sub_d1 <= rq_idx[1:0];
+    wire signed [31:0] rq_scale = rq_rd[{rq_sub_d1, 6'd0}      +: 32];
+    wire signed [31:0] rq_bias = rq_rd[{rq_sub_d1, 6'd0} + 32 +: 32];
 
-    // ---- 한 단 더 잡아 둡니다 (타이밍) ----
-    // 임플 결과 크리티컬 패스가 **PB_Mem BRAM → 4:1 서브워드 먹스 → 누산기
-    // 덧셈 → Requant_Bf16 → 레지스터** 한 덩어리로 WNS +0.001 ns 였습니다.
-    // 상수를 레지스터로 받아 BRAM+먹스와 재양자화를 갈라 놓습니다.
-    // 컬럼도 한 단 더 늦춰 정렬을 맞추므로 사이클 비용은 타일당 1 입니다.
-    // **팬아웃을 잘라 둡니다.** 이 상수 하나가 Col_Post 32레인 x 2개 = DSP 64개,
-    // layernorm_top 의 requant, 그리고 ARGMAX 의 64비트 곱을 동시에 먹습니다.
-    // 복제하지 않으면 칩 전역으로 뻗은 배선이 u_cp 경로를 -0.811 ns 로 끌어내립니다
-    // (ZU9EG -2 실측). 상수라 복제 비용은 FF 몇 개뿐입니다.
+    // 1차 재양자화 상수 — **컬럼마다 바뀝니다** (채널별).
+    // [타이밍] BRAM → 4:1 서브워드 먹스 → 누산기 덧셈 → Requant_Bf16 이 한
+    // 사이클에 붙어 있었습니다. 상수를 레지스터로 받아 갈라 놓습니다 (컬럼도
+    // 같이 늦추므로 사이클 비용은 타일당 1).
+    // `max_fanout` 은 **복제 지시**입니다 — 이 상수 하나를 Format_Cast_Act 32레인
+    // x2 = DSP 64개, LayerNorm_Top 의 requant, ARGMAX 의 64비트 곱이 동시에 먹어
+    // 배선이 칩 전역으로 뻗습니다. 상수라 복제 비용은 FF 몇 개뿐입니다.
     (* max_fanout = 16 *)
-    reg signed [31:0] pb_mult_q, pb_bias_q;
+    reg signed [31:0] rq_scale_q, rq_bias_q;
     always @(posedge clk) begin
-        pb_mult_q <= pb_mult;
-        pb_bias_q <= pb_bias;
+        rq_scale_q <= rq_scale;
+        rq_bias_q <= rq_bias;
     end
 
-    // PG_Mem : 특징 k 의 {gamma, beta}
-    wire [AW_PG-1:0] pg_word;
-    wire [N*8-1:0]   pg_rd;
-    wire [AW_PG+2:0] pg_idx;
-    assign pg_word = pg_idx[AW_PG+2:3];
-    Bram_Sdp #(.DW(N*8), .AW(AW_PG)) u_pgmem (
-        .clk(clk), .we_en(ld_we && ld_sel == 3'd3), .we_addr(ld_addr[AW_PG-1:0]),
+    // Affine_Mem : 특징 k 의 {gamma, beta}  — 워드 하나에 8특징
+    wire [AW_AF-1:0] af_word;
+    wire [N*8-1:0]   af_rd;
+    wire [AW_AF+2:0] af_idx;
+    assign af_word = af_idx[AW_AF+2:3];
+    Bram_Sdp #(.DW(N*8), .AW(AW_AF)) u_af_mem (
+        .clk(clk), .we_en(ld_we && ld_sel == LD_AF), .we_addr(ld_addr[AW_AF-1:0]),
         .we_be({N{1'b1}}), .we_data(ld_data[N*8-1:0]),
-        .rd_en(1'b1), .rd_addr(pg_word), .rd_data(pg_rd));
-    reg [2:0] pg_sub_d;
-    always @(posedge clk) pg_sub_d <= pg_idx[2:0];
-    wire signed [15:0] pg_gamma = pg_rd[{pg_sub_d, 5'd0}      +: 16];
-    wire signed [15:0] pg_beta  = pg_rd[{pg_sub_d, 5'd0} + 16 +: 16];
+        .rd_en(1'b1), .rd_addr(af_word), .rd_data(af_rd));
+    reg [2:0] af_sub_d1;
+    always @(posedge clk) af_sub_d1 <= af_idx[2:0];
+    wire signed [15:0] af_gamma = af_rd[{af_sub_d1, 5'd0}      +: 16];
+    wire signed [15:0] af_beta  = af_rd[{af_sub_d1, 5'd0} + 16 +: 16];
 
     // =========================================================================
     // GEMM
     // =========================================================================
-    reg                  gm_start;
-    wire                 gm_done, col_v, col_first, col_last;
-    wire [N*PSUM_W-1:0]  col_d; // 한 column의 data
-    wire [DIM_W-1:0]     col_n, col_mt; // col_n : column idx, col_mt : 행타일 번호
-    wire [N-1:0]         col_re;
-    wire                 ga_rd_en, gb_rd_en;
-    wire [AW_A-1:0]      ga_rd_addr;
-    wire [AW_W-1:0]      gb_rd_addr;
+    reg                 gemm_start;
+    wire                gemm_done;
+    wire                col_valid;
+    wire [N*PSUM_W-1:0] col_data;        // 출력채널 하나에 대한 32행
+    wire [DIM_W-1:0]    col_n, col_mt;   // 전역 출력채널 n / 행타일 번호
+    wire                gemm_a_rd_en,   gemm_b_rd_en;
+    wire [AW_A-1:0]     gemm_a_rd_addr;
+    wire [AW_W-1:0]     gemm_b_rd_addr;
 
-    // B 피연산자 출처 : Linear 은 W_Mem, attention 은 A_Mem
-    // FLAG[2] = B 를 A_Mem 에서 읽음. `q_flag` 는 4비트이므로 절대 비트번호
-    // (s_rd[14])가 아니라 **상대 비트 [2]** 로 씁니다.
-    wire b_from_a = (q_kind == K_GEMM) && q_flag[2];
-    wire [N*8-1:0] gb_data_w = w_rd_data;
-    wire [N*8-1:0] gb_data_a;
-    genvar bn;
+    // B 피연산자 출처 : Linear 은 W_Mem, attention(Q·Kᵀ, attn·V)은 A_Mem
+    wire b_src_amem = (op_kind == OP_GEMM) && op_flag[2];
+    wire [N*8-1:0] gemm_b_from_w = w_rd_data;
+    wire [N*8-1:0] gemm_b_from_a;
     generate
-        for (bn = 0; bn < N; bn = bn + 1) begin : B_NARROW
-            assign gb_data_a[bn*8 +: 8] = br_data[bn*16 +: 8];
+        for (lane = 0; lane < N; lane = lane + 1) begin : g_b_narrow
+            assign gemm_b_from_a[lane*8 +: 8] = a_rb_data[lane*16 +: 8];
         end
     endgenerate
     // ---- bias_k / bias_v 토큰 (FLAG2[2]) ----
@@ -309,175 +310,181 @@ module EvT_Engine #(
     // 각 head 영역 끝의 예약 칸에 호스트가 한 번 넣어 둡니다.
     //
     //   QK : B 워드의 레인 = 키. 키 n_tok 인 **레인 하나**만 바꿉니다.
-    //        bias_k 워드는 레인 = head_dim 이라 inst 시작에 한 번 읽어 둡니다.
+    //        bias_k 워드는 레인 = head_dim 이라 명령어 시작에 한 번 읽어 둡니다.
     //        주소는 `AOUT` — QK 는 메모리에 안 써서 그 칸이 놉니다.
     //   AV : B 워드 자체가 키 하나(레인 = head_dim). 키 n_tok 이면 **주소만**
     //        `OSTR` 이 가리키는 칸으로 돌립니다 (AV 는 행타일이 하나라 놉니다).
     //
     // K/V 영역은 블록 3개가 돌려 쓰므로 예약 칸을 그 안에 둘 수 없습니다 —
-    // 블록마다 bias 값이 다릅니다. 그래서 별도 영역(BKV)에 두고 주소를 inst 이
+    // 블록마다 bias 값이 다릅니다. 그래서 별도 영역(BKV)에 두고 주소를 명령어가
     // 실어 옵니다.
 
-    reg  [N*16-1:0] bk_word;                 // bias_k (레인 = head_dim)
-    wire            has_bkv  = q_flag2[2];
-    wire            is_qk    = has_bkv && (q_cons == C_Q69);
-    wire            is_av    = has_bkv && (q_cons != C_Q69);
-    wire [AW_A-1:0] b_off    = gb_rd_addr[AW_A-1:0] - q_BIN[AW_A-1:0];
+    reg  [N*16-1:0]  bias_k_word;      // bias_k 워드 (레인 = head_dim)
+    wire             use_bkv     = op_flag2[2];
+    wire             bkv_is_qk   = use_bkv && (op_fmt == FMT_Q69);
+    wire             bkv_is_av   = use_bkv && (op_fmt != FMT_Q69);
+    wire [AW_A-1:0]  b_word_off  = gemm_b_rd_addr[AW_A-1:0] - op_bin[AW_A-1:0];
+
     // bias 토큰은 **마지막 키** 입니다. cross 는 Lk = n_tok+1, latent 은 96+1 로
-    // 고정이라 `n_tok` 이 아니라 **그 inst 의 Lk** 로 잡아야 합니다.
-    //   QK : 출력 열이 키라 Lk = q_NOUT      AV : reduce 가 키라 Lk = q_K
-    wire [DIM_W-1:0] qk_key = q_NOUT - 1'b1;
-    wire [DIM_W-1:0] av_key = q_K    - 1'b1;
-    wire            qk_hit   = is_qk && (b_off[AW_A-1:5] == qk_key[AW_A-1:5]);
-    wire [4:0]      qk_lane  = qk_key[4:0];
-    wire [4:0]      qk_k     = b_off[4:0];   // reduce 인덱스 = head_dim
-    wire            av_hit   = is_av && (b_off == av_key[AW_A-1:0]);
+    // 고정이라 `n_tok` 이 아니라 **그 명령어의 Lk** 로 잡아야 합니다.
+    //   QK : 출력 열이 키라 Lk = op_nout      AV : reduce 가 키라 Lk = op_k
+    wire [DIM_W-1:0] qk_key      = op_nout - 1'b1;
+    wire [DIM_W-1:0] av_key      = op_k    - 1'b1;
+    wire [4:0]       qk_lane     = qk_key[4:0];
+    wire [4:0]       qk_dim      = b_word_off[4:0];   // reduce 인덱스 = head_dim
+    wire             qk_hit      = bkv_is_qk && (b_word_off[AW_A-1:5] == qk_key[AW_A-1:5]);
+    wire             av_hit      = bkv_is_av && (b_word_off == av_key[AW_A-1:0]);
 
-    // QK 의 B 워드는 **레인 = 키** 입니다. 마지막 키 타일에서 `Lk` 를 넘는 레인은
-    // `in_proj.K` 가 쓴 적이 없습니다 — latent 블록은 키 96개가 타일 3개를 딱
-    // 채워서 bias 키(96) 가 **아무도 안 쓴 4번째 타일**을 엽니다. 그대로 두면 그
-    // 레인들이 X 로 올라오고, softmax 가 전 키를 합산하므로 **출력 전체가 X** 가
-    // 됩니다 (cross 는 n_tok=52 라 우연히 안 걸렸습니다).
-    wire [DIM_W-1:0] b_tile = {{(DIM_W-(AW_A-5)){1'b0}}, b_off[AW_A-1:5]};
-    wire [DIM_W-1:0] b_lim  = q_NOUT - (b_tile << 5);
+    // [함정] QK 의 B 워드는 레인 = 키입니다. 마지막 타일에서 `Lk` 를 넘는 레인은
+    // `in_proj.K` 가 쓴 적이 없어 X 로 올라오고, softmax 가 전 키를 합산하므로
+    // **출력 전체가 X** 가 됩니다. 그 레인들을 0 으로 막습니다.
+    wire [DIM_W-1:0] b_key_tile = {{(DIM_W-(AW_A-5)){1'b0}}, b_word_off[AW_A-1:5]};
+    wire [DIM_W-1:0] b_key_lim  = op_nout - (b_key_tile << 5);
 
-    // **A_Mem 은 주소를 준 다음 사이클에 답합니다.** 그래서 데이터에 거는 조작
-    // (bias 레인 치환, 남는 레인 0)은 주소 조건을 **한 단 늦춰** 써야 짝이 맞습니다.
-    // 안 늦추면 한 칸 앞 워드의 조건으로 바꿔치기합니다.
-    reg qk_hit_d, is_qk_d;
-    reg [4:0] qk_lane_d, qk_k_d;
-    reg [DIM_W-1:0] b_lim_d;
+    // A_Mem 은 주소를 준 **다음** 사이클에 답합니다. 데이터에 거는 조작(bias 레인
+    // 치환, 남는 레인 0)은 주소 조건을 한 단 늦춰야 짝이 맞습니다.
+    reg              qk_hit_d1, bkv_is_qk_d1;
+    reg [4:0]        qk_lane_d1, qk_dim_d1;
+    reg [DIM_W-1:0]  b_key_lim_d1;
     always @(posedge clk) begin
-        qk_hit_d  <= qk_hit;  is_qk_d <= is_qk;
-        qk_lane_d <= qk_lane; qk_k_d  <= qk_k;
-        b_lim_d   <= b_lim;
+        qk_hit_d1    <= qk_hit;    bkv_is_qk_d1 <= bkv_is_qk;
+        qk_lane_d1   <= qk_lane;   qk_dim_d1    <= qk_dim;
+        b_key_lim_d1 <= b_key_lim;
     end
 
-    wire [N*8-1:0] gb_data_bk;
-    genvar bk;
+    wire [N*8-1:0] gemm_b_patched;
     generate
-        for (bk = 0; bk < N; bk = bk + 1) begin : B_BIAS
-            assign gb_data_bk[bk*8 +: 8] =
-                   (qk_hit_d && bk[4:0] == qk_lane_d) ? bk_word[{qk_k_d, 4'd0} +: 8]
-                 : (is_qk_d && bk >= b_lim_d)         ? 8'd0
-                                                      : gb_data_a[bk*8 +: 8];
+        for (lane = 0; lane < N; lane = lane + 1) begin : g_b_bias
+            assign gemm_b_patched[lane*8 +: 8] =
+                   (qk_hit_d1 && lane[4:0] == qk_lane_d1)   // bias_k 레인 치환
+                       ? bias_k_word[{qk_dim_d1, 4'd0} +: 8]
+                 : (bkv_is_qk_d1 && lane >= b_key_lim_d1)   // Lk 를 넘는 레인은 0
+                       ? 8'd0
+                       : gemm_b_from_a[lane*8 +: 8];
         end
     endgenerate
-    wire [N*8-1:0] gb_data = b_from_a ? gb_data_bk : gb_data_w;
+    wire [N*8-1:0] gemm_b_data = b_src_amem ? gemm_b_patched : gemm_b_from_w;
 
     // 코어는 B 주소를 하나만 냅니다. W_Mem 이 답할 때 그 주소를 그대로 씁니다.
-    // (선언만 하고 연결을 빠뜨리면 Verilog 는 조용히 X 를 읽습니다 — 컴파일도
-    //  통과하고 시뮬도 안 죽습니다. 통합 TB 에서 `b_rd=.../xx` 로 드러났습니다.)
-    assign w_rd_en   = gb_rd_en && !b_from_a;
-    assign w_rd_addr = gb_rd_addr;
+    assign w_rd_en   = gemm_b_rd_en && !b_src_amem;
+    assign w_rd_addr = gemm_b_rd_addr;
 
     Gemm_Core #(.N(N), .ACT_W(ACT_W), .PSUM_W(PSUM_W), .DIM_W(DIM_W),
                    .AW_A(AW_A), .AW_B(AW_W)) u_gemm (
-        .clk(clk), .rst(rst), .start(gm_start), .all_done(gm_done),
-        .M(q_M), .K(q_K), .Nout(q_NOUT), .a_base(q_AIN), .b_base(q_BIN),
-        .a_rd_en(ga_rd_en), .a_rd_addr(ga_rd_addr), .a_rd_data(ar_data),
-        .b_rd_en(gb_rd_en), .b_rd_addr(gb_rd_addr), .b_rd_data(gb_data),
-        .col_valid(col_v), .col_data(col_d), .col_n(col_n), .col_mt(col_mt),
-        .col_first(col_first), .col_last(col_last), .col_row_en(col_re));
+        .clk(clk), .rst(rst), .start(gemm_start), .all_done(gemm_done),
+        .M(op_m), .K(op_k), .Nout(op_nout), .a_base(op_ain), .b_base(op_bin),
+        .a_rd_en(gemm_a_rd_en), .a_rd_addr(gemm_a_rd_addr), .a_rd_data(a_ra_data),
+        .b_rd_en(gemm_b_rd_en), .b_rd_addr(gemm_b_rd_addr), .b_rd_data(gemm_b_data),
+        .col_valid(col_valid), .col_data(col_data),
+        .col_n(col_n), .col_mt(col_mt));
 
-    // GELU 뒤 int8 재양자화 곱수 — inst 시작 시 한 번 읽어 둡니다
+    // 2차 재양자화 상수 — **명령어당 스칼라 하나**입니다 (활성함수 뒤 int8 격자,
+    // MEAN 의 곱수). `RQ_BASE + NOUT` 칸을 ST_CONST 에서 한 번 읽어 떠 둡니다.
     (* max_fanout = 16 *)
-    reg signed [31:0] g_mult_q;
+    reg signed [31:0] rq_scale2_q;
 
-    wire                cp_v;
-    wire [N*16-1:0]     cp_d, cp_q69;
-    Format_Cast_Act #(.N(N), .ACT_W(ACT_W), .PSUM_W(PSUM_W),
-                  .GELU_LUT_FILE(GELU_LUT_FILE)) u_cp (
-        .clk(clk), .rst(rst), .consumer(q_cons),
-        .bias(pb_bias_q), .mult(pb_mult_q), .shift(q_sh),
-        .g_mult(g_mult_q), .g_shift(q_gsh),
-        .act_sel(q_act), .act_parm(8'd0), .raw16(q_flag[3]), .req2(q_flag2[3]),
-        .in_valid(col_v_d2), .acc(col_d_d2),
-        .out_valid(cp_v), .out_data(cp_d), .out_q69(cp_q69));
+    wire                fca_valid;
+    wire [N*16-1:0]     fca_data, fca_q69;
+    Format_Cast_Act #(.N(N), .ACT_W(ACT_W), .PSUM_W(PSUM_W)) u_fca (
+        .clk(clk), .rst(rst), .fmt(op_fmt),
+        .bias(rq_bias_q), .mult(rq_scale_q), .shift(op_shift),
+        .g_mult(rq_scale2_q), .g_shift(op_shift2),
+        .act_sel(op_act), .act_parm(8'd0), .raw16(op_flag[3]), .req2(op_flag2[3]),
+        .in_valid(col_valid_d2), .acc(col_data_d2),
+        .out_valid(fca_valid), .out_data(fca_data), .out_q69(fca_q69));
 
-    // PB 경로 지연(BRAM 1 + 레지스터 1)만큼 컬럼을 늦춰 상수와 정렬
+    // Requant_Mem 경로 지연(BRAM 1 + 레지스터 1)만큼 컬럼을 늦춰 상수와 정렬
     always @(posedge clk) begin
-        col_v_d  <= col_v;   col_v_d2  <= col_v_d;
-        col_d_d  <= col_d;   col_d_d2  <= col_d_d;
-        col_n_d  <= col_n;   col_n_d2  <= col_n_d;
-        col_mt_d <= col_mt;  col_mt_d2 <= col_mt_d;
+        col_valid_d1 <= col_valid;   col_valid_d2 <= col_valid_d1;
+        col_data_d1  <= col_data;    col_data_d2  <= col_data_d1;
+        col_n_d1     <= col_n;       col_n_d2     <= col_n_d1;
+        col_mt_d1    <= col_mt;      col_mt_d2    <= col_mt_d1;
     end
 
-    // Col_Post 지연만큼 쓰기 주소를 늦춥니다. **소비자마다 다릅니다** —.
-    localparam CP_LAT_B = 2, CP_LAT_S = 3, CP_LAT_G = 9, CP_LAT_R = 6;
-    localparam CP_LAT_MAX = CP_LAT_G;
-    
-    reg [DIM_W-1:0] nq [0:CP_LAT_MAX-1];
-    reg [DIM_W-1:0] mq [0:CP_LAT_MAX-1];
-    integer zn;
+    // Format_Cast_Act 지연만큼 쓰기 주소를 늦춥니다. **출력 포맷마다 다릅니다.**
+    localparam FCA_LAT_BF16 = 2,   // bf16
+               FCA_LAT_INT8 = 3,   // int8 (+ 활성함수)
+               FCA_LAT_REQ2 = 6,   // int8 + 활성함수 뒤 2차 재양자화
+               FCA_LAT_GELU = 9;   // Q4.11 → GELU → int8
+    localparam FCA_LAT_MAX  = FCA_LAT_GELU;
+
+    reg [DIM_W-1:0] fca_n_pipe  [0:FCA_LAT_MAX-1];
+    reg [DIM_W-1:0] fca_mt_pipe [0:FCA_LAT_MAX-1];
+    integer stage;
     always @(posedge clk) begin
-        nq[0] <= col_n_d2;  mq[0] <= col_mt_d2;
-        for (zn = 1; zn < CP_LAT_MAX; zn = zn + 1) begin
-            nq[zn] <= nq[zn-1];  mq[zn] <= mq[zn-1];
+        fca_n_pipe[0] <= col_n_d2;   fca_mt_pipe[0] <= col_mt_d2;
+        for (stage = 1; stage < FCA_LAT_MAX; stage = stage + 1) begin
+            fca_n_pipe [stage] <= fca_n_pipe [stage-1];
+            fca_mt_pipe[stage] <= fca_mt_pipe[stage-1];
         end
     end
-    wire [DIM_W-1:0] cp_n = (q_cons == C_Q411) ? nq[CP_LAT_G-1]
-                          : (q_cons == C_BF16) ? nq[CP_LAT_B-1]
-                          : q_flag2[3]         ? nq[CP_LAT_R-1]
-                          :                      nq[CP_LAT_S-1];
-    wire [DIM_W-1:0] cp_mt = (q_cons == C_Q411) ? mq[CP_LAT_G-1]
-                           : (q_cons == C_BF16) ? mq[CP_LAT_B-1]
-                           : q_flag2[3]         ? mq[CP_LAT_R-1]
-                           :                      mq[CP_LAT_S-1];
 
-    // A_Mem 쓰기 주소를 **한 사이클 앞당겨** 레지스터에 담습니다. 위 4:1 먹스와
-    // 주소 곱셈(DSP 2개 캐스케이드)이 A_Mem 주소 디코드까지 한 사이클에 붙어 있어
-    // 187.5 MHz 의 최악 경로였습니다 (`q_flag2[3] → … → ADDRARDADDR`, 5.578 ns).
-    // 탭을 한 칸 당겨(`-2`) 레지스터 한 단을 상쇄하므로 **주소가 유효한 사이클은
-    // 그대로**입니다 — `a_we_en`/`a_we_data` 는 손대지 않고 총 사이클도 안 변합니다.
-    // 네 경로 모두 CP_LAT >= 2 라 당길 여유가 있습니다 (최소 CP_LAT_B=2 → nq[0]).
-    // `cp_n`/`cp_mt` 는 전치 드레인이 **그 컬럼이 나온 순간** 잡아야 하므로 그대로 둡니다.
-    wire [DIM_W-1:0] cp_n_e = (q_cons == C_Q411) ? nq[CP_LAT_G-2]
-                            : (q_cons == C_BF16) ? nq[CP_LAT_B-2]
-                            : q_flag2[3]         ? nq[CP_LAT_R-2]
-                            :                      nq[CP_LAT_S-2];
-    wire [DIM_W-1:0] cp_mt_e = (q_cons == C_Q411) ? mq[CP_LAT_G-2]
-                             : (q_cons == C_BF16) ? mq[CP_LAT_B-2]
-                             : q_flag2[3]         ? mq[CP_LAT_R-2]
-                             :                      mq[CP_LAT_S-2];
-    reg [AW_A-1:0] gm_addr_q;
+    // 네 후보 중 하나를 고르는 규칙이 아래 탭 넷에 공통이라 함수로 한 번만 씁니다.
+    // **인덱스를 계산해서 넣지 않습니다** — 그러면 9:1 가변 선택이 되고, 이 먹스는
+    // 아래 주소 계산의 최악 경로 위에 있습니다. 상수 인덱스 넷을 그대로 먹싱합니다.
+    function [DIM_W-1:0] fca_tap;
+        input [DIM_W-1:0] t_q411, t_bf16, t_req2, t_int8;
+        begin
+            fca_tap = (op_fmt == FMT_Q411) ? t_q411
+                    : (op_fmt == FMT_BF16) ? t_bf16
+                    : op_flag2[3]          ? t_req2
+                    :                        t_int8;
+        end
+    endfunction
+
+    // 지금 나온 컬럼의 (채널, 행타일) — 전치 드레인이 이 시점 값을 잡습니다
+    wire [DIM_W-1:0] fca_n  = fca_tap(fca_n_pipe [FCA_LAT_GELU-1], fca_n_pipe [FCA_LAT_BF16-1],
+                                      fca_n_pipe [FCA_LAT_REQ2-1], fca_n_pipe [FCA_LAT_INT8-1]);
+    wire [DIM_W-1:0] fca_mt = fca_tap(fca_mt_pipe[FCA_LAT_GELU-1], fca_mt_pipe[FCA_LAT_BF16-1],
+                                      fca_mt_pipe[FCA_LAT_REQ2-1], fca_mt_pipe[FCA_LAT_INT8-1]);
+
+    // [타이밍] 위 4:1 먹스 + 주소 곱셈(DSP 2개 캐스케이드) + A_Mem 주소 디코드가
+    // 한 사이클에 붙어 187.5 MHz 의 최악 경로였습니다 (5.578 ns). 레지스터 한 단을
+    // 넣되 탭을 한 칸 당겨(`-2`) 상쇄하므로 **주소가 유효한 사이클은 그대로**이고
+    // 총 사이클도 안 변합니다. 네 경로 모두 FCA_LAT >= 2 라 당길 여유가 있습니다.
+    wire [DIM_W-1:0] fca_n_early  = fca_tap(fca_n_pipe [FCA_LAT_GELU-2], fca_n_pipe [FCA_LAT_BF16-2],
+                                            fca_n_pipe [FCA_LAT_REQ2-2], fca_n_pipe [FCA_LAT_INT8-2]);
+    wire [DIM_W-1:0] fca_mt_early = fca_tap(fca_mt_pipe[FCA_LAT_GELU-2], fca_mt_pipe[FCA_LAT_BF16-2],
+                                            fca_mt_pipe[FCA_LAT_REQ2-2], fca_mt_pipe[FCA_LAT_INT8-2]);
+
+    //   FLAG[1] head-major : AOUT + (n/32)*OSTR + mt*32 + n%32
+    //   그 외              : AOUT + mt*OSTR + n
+    reg [AW_A-1:0] gemm_we_addr_q;
     always @(posedge clk)
-        gm_addr_q <= q_flag[1]
-                   ? (q_AOUT + (cp_n_e[DIM_W-1:5] * q_OSTR[AW_A-1:0])
-                             + (cp_mt_e << 5) + cp_n_e[4:0])
-                   : (q_AOUT + cp_mt_e * q_OSTR + cp_n_e[AW_A-1:0]);
+        gemm_we_addr_q <= op_flag[1]
+            ? (op_aout + (fca_n_early[DIM_W-1:5] * op_ostr[AW_A-1:0])
+                       + (fca_mt_early << 5) + fca_n_early[4:0])
+            : (op_aout +  fca_mt_early * op_ostr + fca_n_early[AW_A-1:0]);
 
-    // Col_Post 파이프라인이 **비었는지** 봅니다. `gm_done` 은 시스톨릭 배열이
-    // 다 쏟은 시점이라, 뒤에 붙은 requant/GELU 단(최대 9)이 아직 값을 들고 있을
-    // 수 있습니다. 그 상태로 inst 을 넘기면 마지막 컬럼들이 **다음 inst 의
-    // AOUT/OSTR** 로 나갑니다 — 전치 드레인에서 이미 한 번 겪은 실패입니다.
-    reg [CP_LAT_MAX-1:0] cp_pipe;
+    // [함정] `gemm_done` 은 시스톨릭 배열이 다 쏟은 시점이라, 뒤에 붙은
+    // requant/GELU 단(최대 9)이 아직 값을 들고 있을 수 있습니다. 그 상태로
+    // 명령어를 넘기면 마지막 컬럼들이 **다음 명령어의 AOUT/OSTR** 로 나갑니다.
+    reg [FCA_LAT_MAX-1:0] fca_pipe;
     always @(posedge clk) begin
-        if (rst) cp_pipe <= {CP_LAT_MAX{1'b0}};
-        else     cp_pipe <= {cp_pipe[CP_LAT_MAX-2:0], col_v_d2};
+        if (rst) fca_pipe <= {FCA_LAT_MAX{1'b0}};
+        else     fca_pipe <= {fca_pipe[FCA_LAT_MAX-2:0], col_valid_d2};
     end
-    wire cp_busy = col_v_d2 | (|cp_pipe);
+    wire fca_busy = col_valid_d2 | (|fca_pipe);
 
     // =========================================================================
     // V 전치 : in_proj 의 V 컬럼을 모아 축을 돌립니다
     // =========================================================================
     wire [N*8-1:0] tr_in, tr_out;
-    // `tr_in` 이 조합(cp_d) 이므로 쓰기 인에이블/주소도 **조합**이어야 합니다.
+    // `tr_in` 이 조합(fca_data) 이므로 쓰기 인에이블/주소도 **조합**이어야 합니다.
     // 레지스터로 한 단 늦추면 데이터만 한 칸 밀려 전치가 통째로 어긋납니다.
     wire [4:0]     tr_widx;
     wire           tr_we;
     wire [4:0]     tr_ridx;
-    genvar tn;
     generate
-        for (tn = 0; tn < N; tn = tn + 1) begin : TR_NARROW
-            assign tr_in[tn*8 +: 8] = cp_d[tn*16 +: 8];
+        for (lane = 0; lane < N; lane = lane + 1) begin : g_tr_narrow
+            assign tr_in[lane*8 +: 8] = fca_data[lane*16 +: 8];
         end
     endgenerate
     Transpose32 #(.N(N), .W(8)) u_tr (
         .clk(clk), .rst(rst), .we(tr_we), .w_idx(tr_widx), .w_data(tr_in),
         .r_idx(tr_ridx), .r_data(tr_out));
 
-    // ---- 채우고 → 쏟기 ----
+    // ---- 채우기(write) → 쏟기(drain) ----
     // `attn·V` 의 reduce 축은 **키**입니다. 그런데 in_proj 이 내는 컬럼은
     // (레인 = 토큰, 워드 = head_dim) 이라 축이 반대입니다. head 하나의 32컬럼
     // (d = 0..31)을 다 받으면 32x32 블록이 차고, 그걸 행(키)별로 32번 읽어
@@ -485,30 +492,41 @@ module EvT_Engine #(
     //
     // 코어가 타일 하나(32컬럼)를 내고 다음 타일을 K 사이클 계산하는 동안이
     // **쏟을 틈**입니다 (K >= 32 이라 항상 충분). 그래서 멈춤이 없습니다.
-    reg        tr_run, tr_arm, tr_go;
-    reg [5:0]  tr_r;
-    reg [1:0]  tr_h;
-    reg [DIM_W-1:0] tr_mt;
-    wire       tr_fill  = (q_kind == K_GEMM) && q_flag[0] && cp_v;
-    wire       tr_last   = tr_fill && (cp_n[4:0] == 5'd31);
-    wire [1:0] cp_n_h    = cp_n[6:5];        // head = 컬럼 / 32
-    assign     tr_ridx   = tr_r[4:0];
-    assign     tr_we     = tr_fill;
-    assign     tr_widx   = cp_n[4:0];
+    //
+    // 제어는 상태기계가 아니라 **한 줄짜리 지연 파이프**입니다 :
+    //
+    //   tr_we ─(32컬럼째)─→ tr_last ─d1─→ tr_last_d1 ─d1─→ tr_last_d2
+    //                                                          └→ tr_drain (32사이클)
+    //
+    // 마지막 컬럼(d=31)의 쓰기가 **반영된 뒤** 읽어야 하므로 두 단 늦춥니다.
+    wire             tr_last = tr_we && (fca_n[4:0] == 5'd31);  // 버퍼가 다 참
+    reg              tr_last_d1, tr_last_d2;                    // 지연 2단
+    reg              tr_drain;                                  // 쏟는 중 (32사이클)
+    reg [5:0]        tr_row;                                    // 쏟는 중인 행(키)
+    reg [1:0]        tr_head;                                   // 어느 head 로
+    reg [DIM_W-1:0]  tr_mt;                                     // 어느 행타일로
+    wire [1:0]       fca_head = fca_n[6:5];                     // head = 컬럼 / 32
+
+    assign tr_we   = (op_kind == OP_GEMM) && op_flag[0] && fca_valid;
+    assign tr_widx = fca_n[4:0];        // 채우기 : 워드 = head_dim
+    assign tr_ridx = tr_row[4:0];       // 쏟기   : 워드 = 키
+
     always @(posedge clk) begin
         if (rst) begin
-            tr_run <= 1'b0; tr_arm <= 1'b0; tr_go <= 1'b0; tr_r <= 0;
+            tr_last_d1 <= 1'b0;  tr_last_d2 <= 1'b0;
+            tr_drain   <= 1'b0;  tr_row     <= 0;
         end else begin
-            // 마지막 컬럼(d=31)의 쓰기가 **반영된 뒤** 읽어야 하므로 두 단 늦춥니다
-            tr_arm  <= tr_last;
-            tr_go   <= tr_arm;
+            tr_last_d1 <= tr_last;
+            tr_last_d2 <= tr_last_d1;
             // head/타일은 **그 컬럼이 나온 순간** 잡아야 합니다 (다음 사이클엔
-            // cp_n 이 이미 다음 타일 값입니다)
-            if (tr_last) begin tr_h <= cp_n_h; tr_mt <= cp_mt; end
-            if (tr_go) begin tr_run <= 1'b1; tr_r <= 0; end
-            else if (tr_run) begin
-                if (tr_r == 6'd31) tr_run <= 1'b0;
-                tr_r <= tr_r + 1'b1;
+            // fca_n 이 이미 다음 타일 값입니다)
+            if (tr_last) begin tr_head <= fca_head;  tr_mt <= fca_mt; end
+
+            if (tr_last_d2) begin                    // 쏟기 시작
+                tr_drain <= 1'b1;  tr_row <= 0;
+            end else if (tr_drain) begin             // 행 32개를 하나씩
+                if (tr_row == 6'd31) tr_drain <= 1'b0;
+                tr_row <= tr_row + 1'b1;
             end
         end
     end
@@ -516,9 +534,8 @@ module EvT_Engine #(
     // =========================================================================
     // positional encoding — 온칩 표에서 모아 PIN 뒤쪽에 씁니다
     //
-    // 호스트가 미리 펴서 보내던 96.7 MB 를 없앱니다. 표(27.6 KB)는 여기 BRAM 에
-    // 있고 타임스텝마다 오는 것은 `pos_idx`(최대 246 B) 뿐입니다. 자세한 것은
-    // `rtl/Pos_Gather.v` 머리말.
+    // 표(27.6 KB)는 PL BRAM 에 있고 타임스텝마다 오는 것은 `pos_idx`(최대 246 B)
+    // 뿐입니다. 자세한 것은 `rtl/core/Pos_Gather.v` 머리말.
     // =========================================================================
     reg              pos_start;
     wire             pos_done, pos_rd_en, pos_we_en;
@@ -527,74 +544,66 @@ module EvT_Engine #(
 
     Pos_Gather #(.N(N), .FEAT(64), .AW_A(AW_A), .AW_T(9), .DIM_W(DIM_W)) u_pos (
         .clk(clk), .rst(rst), .start(pos_start), .done(pos_done),
-        .n_tok(q_M), .a_base(q_AOUT), .ostr(q_OSTR), .idx_base(q_AIN),
-        .ld_we(ld_we && ld_sel == 3'd5), .ld_addr(ld_addr[8:0]),
+        .n_tok(op_m), .a_base(op_aout), .ostr(op_ostr), .idx_base(op_ain),
+        .ld_we(ld_we && ld_sel == LD_POS), .ld_addr(ld_addr[8:0]),
         .ld_data(ld_data[64*8-1:0]),
-        .rd_en(pos_rd_en), .rd_addr(pos_rd_addr), .rd_data(ar_data),
+        .rd_en(pos_rd_en), .rd_addr(pos_rd_addr), .rd_data(a_ra_data),
         .we_en(pos_we_en), .we_addr(pos_we_addr), .we_data(pos_we_data));
 
     // =========================================================================
     // LayerNorm
     // =========================================================================
     reg              ln_start;
-    wire             ln_done, ln_ov;
-    wire [DIM_W-1:0] ln_k, ln_paddr;
-    wire [5:0]       ln_mt_o;
+    wire             ln_done, ln_valid;
+    wire [DIM_W-1:0] ln_k, ln_af_addr;
+    wire [5:0]       ln_mt;
     wire [N*8-1:0]   ln_out;
-    wire             la_rd_en;
-    wire [AW_A-1:0]  la_rd_addr;
+    wire             ln_rd_en;
+    wire [AW_A-1:0]  ln_rd_addr;
 
-    // ---- 입력 포맷 : bf16 이거나, Q4.11 **정수 코드** ----
-    // `layer_norm_2` 만 앞이 `linear1` 의 raw16 출력이라 정수입니다.
-    //
-    // 예전에는 여기서 레인마다 `Int32_To_Bf16` 으로 bf16 을 만들어 넣었습니다.
-    // 그러면 코어 안의 `bf16_to_fix` 와 합쳐져 **정규화 → 역정규화** 배럴 시프터
-    // 두 개가 한 사이클에 직렬로 놓입니다 (A_Mem BRAM -> x_p 8.475 ns).
-    // 지금은 코어가 `Q411_To_Fix` / `bf16_to_fix` 를 **병렬**로 두고 `in_q411` 로
-    // 고르므로, 엔진은 A_Mem 을 **그대로** 넘기고 포맷 비트만 알려 줍니다.
-    // 264 샘플 정확도는 양쪽 동일합니다 (오답 샘플 번호까지 같음).
-
-    // 행타일 반복은 **래퍼가** 합니다 — 코어의 3단 Tile 파이프라인이 겹치려면
-    // 타일을 끊지 않고 연달아 밀어야 하기 때문입니다. 그래서 엔진의 `ln_mt`
-    // 루프가 없어졌습니다 (예전 코어는 타일마다 start 를 다시 걸었습니다).
-    layernorm_top #(.N(N), .E(E), .DIM_W(DIM_W), .AW(AW_A), .XSW(6)) u_ln (
+    // 입력은 bf16 이거나 Q4.11 정수 코드입니다 (`layer_norm_2` 만 앞이 `linear1` 의
+    // raw16 출력이라 정수). 엔진은 A_Mem 워드를 **그대로** 넘기고 포맷 비트만
+    // 알려 줍니다 — 코어가 `Bf16_To_Fix` / `Q411_To_Fix` 를 병렬로 두고 고릅니다.
+    // 행타일 반복은 **래퍼가** 합니다 (코어의 3단 Tile 파이프라인이 겹치려면
+    // 타일을 끊지 않고 연달아 밀어야 하므로 엔진에 `ln_mt` 루프가 없습니다).
+    LayerNorm_Top #(.N(N), .E(E), .DIM_W(DIM_W), .AW(AW_A), .XSW(6)) u_ln (
         .clk(clk), .rst(rst), .start(ln_start), .done(ln_done),
-        .M(q_M), .a_base(q_AIN), .in_shift($signed(q_gsh)),
-        .rd_en(la_rd_en), .rd_addr(la_rd_addr), .rd_data(ar_data),
-        .in_q411(q_flag2[0]),
-        .p_addr(ln_paddr), .p_gamma(pg_gamma), .p_beta(pg_beta),
-        .mult(pb_mult_q), .shift(q_sh),
-        .out_valid(ln_ov), .out_mt(ln_mt_o), .out_k(ln_k), .out_data(ln_out));
+        .M(op_m), .a_base(op_ain), .in_shift($signed(op_shift2)),
+        .rd_en(ln_rd_en), .rd_addr(ln_rd_addr), .rd_data(a_ra_data),
+        .in_q411(op_flag2[0]),
+        .af_addr(ln_af_addr), .af_gamma(af_gamma), .af_beta(af_beta),
+        .mult(rq_scale_q), .shift(op_shift),
+        .out_valid(ln_valid), .out_mt(ln_mt), .out_k(ln_k), .out_data(ln_out));
 
-    // PG(gamma/beta) 와 PB(재양자화 스칼라) 는 **다른 메모리**라 베이스도 둘입니다.
-    assign pg_idx = q_OSTR[AW_PG+2:0] + ln_paddr[AW_PG+2:0];
+    // gamma/beta(Affine_Mem)와 재양자화 스칼라(Requant_Mem)는 **다른 메모리**라
+    // 베이스도 둘입니다 — 전자는 `op_ostr`, 후자는 `op_rq_base` 가 실어 옵니다.
+    assign af_idx = ostr_as_af_base + ln_af_addr[AW_AF+2:0];
 
     // =========================================================================
     // Softmax (attention)
     // =========================================================================
-    reg             sm_start;
-    wire            sm_done, sm_ov;
-    wire [7:0]      sm_c;
-    wire [N*8-1:0]  sm_out;
+    reg             smax_start;
+    wire            smax_done, smax_valid;
+    wire [7:0]      smax_col;
+    wire [N*8-1:0]  smax_out;
 
-    softmax_top #(.N(N), .CMAX(TOKMAX+1)) u_sm (
-        .clk(clk), .rst(rst), .start(sm_start), .C(q_NOUT[7:0]), .done(sm_done),
-        .in_valid(sm_iv), .in_data(sm_id),
-        .out_valid(sm_ov), .out_c(sm_c), .out_data(sm_out));
+    Softmax_Top #(.N(N), .CMAX(TOKMAX+1)) u_smax (
+        .clk(clk), .rst(rst), .start(smax_start), .n_col(op_nout[7:0]), .done(smax_done),
+        .in_valid(smax_in_valid), .in_data(smax_in_data),
+        .out_valid(smax_valid), .out_n(smax_col), .out_data(smax_out));
 
-    // QK GEMM 의 Q6.9 컬럼을 메모리를 안 거치고 직결
-    // **`sm_start` 로 한 번 더 막습니다.** `q_cons` 는 S_DEC 에서 바뀌는데 직전
-    // GEMM 의 Col_Post 파이프는 아직 비워지는 중이라, 그 잔여 컬럼이 새 inst 의
-    // softmax 로 새어 들어갑니다. 그러면 길이가 확정되기 전에 첫 열이 들어가
-    // **1열짜리 타일**이 만들어지고, 코어의 뱅크 포인터가 한 칸 어긋나
-    // 이후 타일이 이전 길이로 나옵니다 (97 을 넣었는데 53 이 나왔습니다).
+    // QK GEMM 의 Q6.9 컬럼을 메모리를 안 거치고 softmax 로 직결합니다.
+    // [함정] `smax_start` 로 한 번 더 막습니다 — `op_fmt` 는 ST_DECODE 에서 바뀌는데
+    // 직전 GEMM 의 Format_Cast_Act 파이프가 아직 비워지는 중이라, 그 잔여 컬럼이
+    // 새 명령어의 softmax 로 새어 들어가 **1열짜리 타일**을 만듭니다. 그러면 코어의
+    // 뱅크 포인터가 어긋나 이후 타일이 이전 길이로 나옵니다.
     always @(posedge clk) begin
-        sm_iv <= cp_v && (q_cons == C_Q69) && sm_start;
-        sm_id <= cp_q69;
+        smax_in_valid <= fca_valid && (op_fmt == FMT_Q69) && smax_start;
+        smax_in_data <= fca_q69;
     end
 
     // =========================================================================
-    // RES : bf16 가산 (A_Mem 두 번 읽어 더함) — `fpga_nl` 과 동일
+    // RES : 잔차 덧셈 (A_Mem 두 워드를 동시에 읽어 더함)
     // =========================================================================
     reg              rs_run;
     reg [DIM_W-1:0]  rs_k;
@@ -602,59 +611,63 @@ module EvT_Engine #(
     reg [N*16-1:0]   rs_a;
     reg [N*16-1:0]   rs_b;   // 포트 B 로 읽은 두번째 피연산자
     wire [N*16-1:0]  rs_sum;
-    // 두 피연산자가 **정수 코드**이고 스케일이 서로 다른 자리가 하나 있습니다 —
-    // `proc_events` 의 `x = seq_init(x) + x_input`. seq_init 출력은 ReLU 앞 int8
-    // 격자(0.019991), x_input 은 preproc 출력의 int8 격자(0.038420) 입니다.
+    // 보통은 bf16 두 값을 더하지만(`res_is_int`=0), `proc_events` 의
+    // `x = seq_init(x) + x_input` 한 자리만 **두 피연산자가 정수 코드이고 scale 이
+    // 서로 다릅니다** (0.019991 vs 0.038420).
     //
-    // ## 왜 bf16 곱셈이 아니라 정수인가
-    //
-    // 두 inst 을 bf16 상수로 곱하면 상수 자체가 가수 8비트로 반올림돼 **비율이
-    // 0.4 % 흔들립니다.** 결과는 bf16 한 칸(0.4 %)과 같은 크기라 절반이 어긋납니다.
-    // 대신 inst 을 `round(inst * 2^RSH)` 정수로 두고 정수로 더한 뒤 **한 번만**
-    // bf16 으로 내리면, 반올림이 골든과 같은 자리에서 한 번만 일어납니다.
-    // 지수에서 RSH 를 빼는 것은 2의 거듭제곱이라 가수를 건드리지 않습니다.
-    //
-    // 스케일을 1 근처로 되돌리는 이유는 LayerNorm 의 `eps` 때문입니다 — 임의
-    // 스케일로 두면 분산에 더하는 eps 의 상대 크기가 달라집니다.
-    localparam RSH = 20;                       // inst 상수의 소수 비트
-    wire res_q = q_flag2[1];
-    genvar rg;
+    // 그 자리를 bf16 상수 곱으로 처리하면 상수가 가수 8비트로 반올림돼 비율이
+    // 0.4 % 흔들리는데, 이는 bf16 한 칸과 같은 크기라 결과의 절반이 어긋납니다.
+    // 대신 scale 을 `round(scale * 2^RSH)` 정수로 두고 정수로 더한 뒤 **한 번만**
+    // bf16 으로 내립니다 — 반올림이 골든과 같은 자리에서 한 번만 일어납니다.
+    // (지수에서 RSH 를 빼는 것은 2의 거듭제곱이라 가수를 안 건드립니다.
+    //  scale 을 1 근처로 되돌리는 것은 LayerNorm 의 `eps` 때문입니다 — 임의
+    //  scale 이면 분산에 더하는 eps 의 상대 크기가 달라집니다.)
+    localparam RSH = 20;                       // 정수 scale 상수의 소수 비트
+    wire res_is_int = op_flag2[1];
     generate
-        for (rg = 0; rg < N; rg = rg + 1) begin : RESLANE
-            wire signed [15:0] ra_c = rs_a[rg*16 +: 16]; // 피연산자 A
-            wire signed [15:0] rb_c = rs_b[rg*16 +: 16]; // 피연산자 B (A_Mem 포트 B, ph1 래치)
-            wire signed [31:0] rq_acc = $signed(ra_c) * $signed({1'b0, q_PB}) // q_PB, q_OSTR : dequant scale factor
-                                      + $signed(rb_c) * $signed({1'b0, q_OSTR});
-            // 곱·덧셈 뒤에서 한 단 끊습니다.  예전에는 아래 `rq_d1`/`rq_d2` 로
-            // **뒤에서** 두 단을 늦췄는데, 그러면 `ar_data → 곱셈2+덧셈 → 32b LZC
-            // ·정규화 → 지수` 가 통째로 한 사이클에 들어갑니다 (150 MHz 에서
-            // 최악 경로였습니다).  단수(2단)와 쓰기 시점은 그대로이고 레지스터
-            // 위치만 앞으로 옮긴 것이라 `Fp32_Add`(2단) 와의 정렬이 안 깨집니다.
-            reg signed [31:0] rq_acc_q;
-            always @(posedge clk) rq_acc_q <= rq_acc;
+        for (lane = 0; lane < N; lane = lane + 1) begin : g_res_lane
+            wire signed [15:0] res_a_lane = rs_a[lane*16 +: 16];   // 포트 A (ph1 래치)
+            wire signed [15:0] res_b_lane = rs_b[lane*16 +: 16];   // 포트 B (ph1 래치)
 
-            wire [15:0] rq_bf_raw;
-            Int32_To_Bf16 #(.IN_W(32)) u_rqb (.din(rq_acc_q), .bf16(rq_bf_raw));
-            wire [15:0] rq_bf = (rq_bf_raw[14:7] == 8'd0) ? 16'd0
-                              : {rq_bf_raw[15], rq_bf_raw[14:7] - RSH[7:0],
-                                 rq_bf_raw[6:0]};
+            // ---- 정수 경로 (res_is_int=1) ----
+            // 두 피연산자의 정수 scale 은 RQ_BASE / OSTR 칸에 실려 옵니다
+            wire signed [31:0] res_int_acc =
+                     $signed(res_a_lane) * $signed({1'b0, rq_base_as_scale_a})
+                   + $signed(res_b_lane) * $signed({1'b0, ostr_as_scale_b});
+            // [타이밍] 곱·덧셈 **뒤에서** 끊습니다. 뒤쪽에서 늦추면
+            // `곱셈2+덧셈 → 32b LZC·정규화 → 지수` 가 한 사이클에 들어갑니다.
+            // 단수(2단)와 쓰기 시점은 그대로라 `Fp32_Add`(2단)와의 정렬이 안 깨집니다.
+            reg signed [31:0] res_int_acc_q;
+            always @(posedge clk) res_int_acc_q <= res_int_acc;
 
-            wire [31:0] sf;
-            // 두 피연산자 모두 ph1 에 래치된 레지스터입니다. 예전에는 `.b` 가
-            // `ar_data`(BRAM 출력) 직결이라 `BRAM → FP 정렬 배럴시프터 → sum1`
-            // 이 한 사이클에 들어갔습니다 (187.5 MHz 최악 경로, 5.712 ns).
-            Fp32_Add u_ra (.clk(clk), .rst(rst),
-                           .in_valid(rs_run && rs_ph == 3'd2 && !res_q),
-                           .a({rs_a[rg*16 +: 16], 16'd0}),
-                           .b({rs_b[rg*16 +: 16], 16'd0}),
-                           .out_valid(), .y(sf));
-            wire [15:0] sb;
-            Fp32_To_Bf16 u_rc (.f(sf), .log2e(6'd0), .y(sb));
-            // 정수 경로는 ph3(곱·덧셈) + ph4(정규화) 로 2단입니다. bf16 경로
+            // 정수 합을 bf16 으로 내리면서 지수에서 RSH 를 뺍니다 (2의 거듭제곱
+            // 이라 가수는 안 건드립니다). 지수가 0 이면 그대로 0.
+            wire [15:0] res_int_bf_raw;
+            Int32_To_Bf16 #(.IN_W(32)) u_res_int_bf (
+                .din(res_int_acc_q), .bf16(res_int_bf_raw));
+            wire [15:0] res_int_bf =
+                   (res_int_bf_raw[14:7] == 8'd0) ? 16'd0
+                 : {res_int_bf_raw[15], res_int_bf_raw[14:7] - RSH[7:0],
+                    res_int_bf_raw[6:0]};
+
+            // ---- bf16 경로 (res_is_int=0) ----
+            // [타이밍] 두 피연산자 모두 ph1 에 래치한 레지스터를 씁니다. BRAM 출력을
+            // 직결하면 `BRAM → FP 정렬 배럴시프터 → sum1` 이 한 사이클입니다.
+            wire [31:0] res_fp_sum;
+            wire [15:0] res_fp_bf;
+            Fp32_Add u_res_fp_add (
+                .clk(clk), .rst(rst),
+                .in_valid(rs_run && rs_ph == 3'd2 && !res_is_int),
+                .a({res_a_lane, 16'd0}), .b({res_b_lane, 16'd0}),
+                .out_valid(), .y(res_fp_sum));
+            Fp32_To_Bf16 u_res_fp_bf (.f(res_fp_sum), .log2e(6'd0), .y(res_fp_bf));
+
+            // 정수 경로는 ph3(곱·덧셈) + ph4(정규화) 로 2단이라 bf16 경로
             // (Fp32_Add 2단)와 쓰기 시점(ph5)이 그대로 맞습니다.
-            reg [15:0] rq_d1;
-            always @(posedge clk) rq_d1 <= rq_bf;
-            assign rs_sum[rg*16 +: 16] = res_q ? rq_d1 : sb;
+            reg [15:0] res_int_bf_q;
+            always @(posedge clk) res_int_bf_q <= res_int_bf;
+
+            assign rs_sum[lane*16 +: 16] = res_is_int ? res_int_bf_q : res_fp_bf;
         end
     endgenerate
 
@@ -667,183 +680,202 @@ module EvT_Engine #(
     //
     // 나누기 96 은 재양자화 곱수에 접혀 있습니다 (`pack_evt.py` 의 MEAN_NEXT).
     // =========================================================================
-    reg  [DIM_W-1:0] mn_k;
-    reg  [5:0]       mn_mt;
-    reg  [2:0]       mn_ph;
-    reg              mn_run;
-    reg signed [15:0] mn_acc;
-    integer mz;
-    // A_Mem BRAM 출력을 **레지스터로 받은 뒤** 더합니다. 예전에는
-    // `BRAM -> 32입력 덧셈트리(CARRY8 5개) -> mn_acc` 가 한 사이클이라
-    // 187.5 MHz 의 최악 경로였습니다 (5.857 ns).  RESLANE 과 같은 처방입니다.
-    // MEAN 은 tail 에서 샘플당 1회(1,024 사이클, 전체의 0.06 %)라 위상을
-    // 하나 늘려도 **+384 사이클(0.024 %)** 뿐입니다.
-    reg [N*16-1:0]    mn_d;
-    always @(posedge clk) mn_d <= ar_data;
-    reg signed [15:0] mn_lane_sum;
-    always @* begin                        // 32레인 int8 합 (유효 행만)
-        mn_lane_sum = 16'sd0;
-        for (mz = 0; mz < N; mz = mz + 1)
-            if (mn_mt * N + mz < q_M)
-                mn_lane_sum = mn_lane_sum + $signed(mn_d[mz*16 +: 16]);
+    reg              mean_run;
+    reg  [DIM_W-1:0] mean_k;      // 특징
+    reg  [5:0]       mean_mt;     // 행타일
+    reg  [2:0]       mean_ph;     // 위상 0~4
+    reg signed [15:0] mean_acc;
+    // [타이밍] BRAM 출력을 레지스터로 받은 뒤 더합니다 — 직결하면
+    // `BRAM → 32입력 덧셈트리(CARRY8 5개) → mean_acc` 가 한 사이클입니다.
+    // MEAN 은 샘플당 1회라 위상이 하나 늘어도 +384 사이클(0.024 %) 뿐입니다.
+    reg [N*16-1:0]    mean_rd_q;
+    always @(posedge clk) mean_rd_q <= a_ra_data;
+    integer sum_lane;
+    reg signed [15:0] mean_lane_sum;
+    always @* begin                                   // 32레인 합 (유효 행만)
+        mean_lane_sum = 16'sd0;
+        for (sum_lane = 0; sum_lane < N; sum_lane = sum_lane + 1)
+            if (mean_mt * N + sum_lane < op_m)
+                mean_lane_sum = mean_lane_sum + $signed(mean_rd_q[sum_lane*16 +: 16]);
     end
-    wire signed [47:0] mn_prod = $signed(mn_acc) * $signed(g_mult_q);
-    // 곱 뒤에서 한 단 끊습니다 (DSP48E2 의 P 레지스터로 흡수).  예전에는
-    // `mn_acc → 곱(DSP 2개) → 48b 반올림 가산 → 가변 시프트 → 포화 → A_Mem 쓰기`
-    // 가 통째로 ph2 한 사이클이라 150 MHz 의 최악 경로였습니다 (6.837 ns).
-    // 페이즈를 하나 늘려(ph3) 쓰기를 한 칸 미룹니다 — 특징당 1사이클 증가라
-    // 전체 165만 사이클에서 128 사이클(0.008 %) 뿐입니다.
-    reg  signed [47:0] mn_prod_q;
-    always @(posedge clk) mn_prod_q <= mn_prod;
-    wire signed [47:0] mn_rnd  = mn_prod_q + (48'sd1 <<< (q_gsh - 1));
-    wire signed [47:0] mn_sh   = mn_rnd >>> q_gsh;
-    wire signed [7:0]  mn_out  = (mn_sh >  127) ?  8'sd127
-                               : (mn_sh < -128) ? -8'sd128 : mn_sh[7:0];
+    wire signed [47:0] mean_prod = $signed(mean_acc) * $signed(rq_scale2_q);
+    // [타이밍] 곱 뒤에서 끊습니다 (DSP48E2 의 P 레지스터로 흡수). 직결하면
+    // `곱 → 48b 반올림 가산 → 가변 시프트 → 포화 → A_Mem 쓰기` 가 한 사이클입니다.
+    // 위상이 하나 늘지만 전체 165만 사이클에서 128 사이클(0.008 %) 뿐입니다.
+    reg  signed [47:0] mean_prod_q;
+    always @(posedge clk) mean_prod_q <= mean_prod;
+    wire signed [47:0] mean_rnd     = mean_prod_q + (48'sd1 <<< (op_shift2 - 1));
+    wire signed [47:0] mean_shifted = mean_rnd >>> op_shift2;
+    wire signed [ 7:0] mean_out     = (mean_shifted >  127) ?  8'sd127
+                                    : (mean_shifted < -128) ? -8'sd128
+                                    :                          mean_shifted[7:0];
 
     // =========================================================================
     // ARGMAX : 마지막 GEMM 의 컬럼을 메모리에 안 쓰고 최대값만 고릅니다
     //   골든 note : argmax(acc[c]*M[c]) — shift 는 순서를 안 바꿔 생략 가능
     // =========================================================================
-    wire signed [PSUM_W-1:0] am_acc = $signed(col_d_d2[PSUM_W-1:0])
-                                    + $signed(pb_bias_q);
-    wire signed [63:0]       am_val = am_acc * $signed(pb_mult_q);
-    // 곱셈 뒤에서 한 단 끊습니다. 예전에는 `col_d_d2 → bias 덧셈 → DSP 2개
-    // 캐스케이드 → **64비트 비교** → am_best 의 CE` 가 통째로 한 사이클이라
-    // 187.5 MHz 의 최악 경로였습니다 (5.707 ns).  ARGMAX 는 샘플당 한 번뿐이라
-    // 한 사이클 늘어도 전체 사이클에는 사실상 영향이 없습니다.
-    reg  signed [63:0]       am_val_q;
-    reg  signed [PSUM_W-1:0] am_acc_q;
-    reg  [DIM_W-1:0]         am_n_q;
-    reg                      am_v_q;
+    wire signed [PSUM_W-1:0] argmax_acc = $signed(col_data_d2[PSUM_W-1:0])
+                                        + $signed(rq_bias_q);
+    wire signed [63:0]       argmax_val = argmax_acc * $signed(rq_scale_q);
+    // [타이밍] 곱셈 뒤에서 끊습니다 — 직결하면 `bias 덧셈 → DSP 2개 캐스케이드 →
+    // 64비트 비교 → argmax_best 의 CE` 가 한 사이클입니다. ARGMAX 는 샘플당 한
+    // 번뿐이라 한 사이클 늘어도 전체에 영향이 없습니다.
+    reg  signed [63:0]       argmax_val_q;
+    reg  signed [PSUM_W-1:0] argmax_acc_q;
+    reg  [DIM_W-1:0]         argmax_n_q;
+    reg                      argmax_valid_q;
     always @(posedge clk) begin
-        if (rst) am_v_q <= 1'b0;
+        if (rst) argmax_valid_q <= 1'b0;
         else begin
-            am_val_q <= am_val;
-            am_acc_q <= am_acc;
-            am_n_q   <= col_n_d2;
-            am_v_q   <= (q_kind == K_ARGMAX) && col_v_d2 && (col_n_d2 < q_NOUT);
+            argmax_val_q   <= argmax_val;
+            argmax_acc_q   <= argmax_acc;
+            argmax_n_q     <= col_n_d2;
+            // 코어가 마지막 타일을 비우며 유효 범위 밖 컬럼을 더 낼 수 있어
+            // `col_n_d2 < op_nout` 로 막습니다 (안 막으면 클래스 10 이 나옵니다).
+            argmax_valid_q <= (op_kind == OP_ARGMAX) && col_valid_d2
+                              && (col_n_d2 < op_nout);
         end
     end
-    reg  signed [63:0]       am_best;
-    reg                      am_any;
+    reg  signed [63:0]       argmax_best;
+    reg                      argmax_any;
 
     // =========================================================================
     // A_Mem 포트 중재 + 쓰기
     // =========================================================================
-    integer za;
+    // int8 결과(레인당 8비트)를 A_Mem 워드(레인당 16비트)로 부호확장해 담습니다.
+    integer wr_lane;
     always @* begin
-        ar_en = 1'b0; ar_addr = {AW_A{1'b0}};
-        br_en = 1'b0; br_addr = {AW_A{1'b0}};
-        a_we_en = 1'b0; a_we_addr = {AW_A{1'b0}}; a_we_data = {N*16{1'b0}};
+        // ---- 기본값 : 아무도 안 쓰면 전부 잠급니다 ----
+        a_ra_en   = 1'b0;  a_ra_addr = {AW_A{1'b0}};
+        a_rb_en   = 1'b0;  a_rb_addr = {AW_A{1'b0}};
+        a_we_en   = 1'b0;  a_we_addr = {AW_A{1'b0}};  a_we_data = {N*16{1'b0}};
 
-        if (st == S_IDLE) begin
-            ar_en = dbg_rd_en; ar_addr = dbg_rd_addr;
-        end else if (st == S_GCONST) begin
-            // QK inst 시작에 bias_k 워드를 한 번 읽어 둡니다 (GELU 곱수와 같이)
-            ar_en = 1'b1; ar_addr = q_AOUT[AW_A-1:0];
-        end else begin
-            case (q_kind)
-                K_ARGMAX,
-                K_GEMM: begin
-                    ar_en = ga_rd_en; ar_addr = ga_rd_addr;
-                    if (b_from_a) begin
-                        br_en   = gb_rd_en;
-                        br_addr = av_hit ? q_OSTR[AW_A-1:0]
-                                         : gb_rd_addr[AW_A-1:0];
-                    end
-                    if (tr_run) begin
-                        // 전치 드레인 : 워드 = head*OSTR + mt*32 + 키
-                        a_we_en   = 1'b1;
-                        // `tr_r` 은 6비트입니다 — `tr_r[AW_A-1:0]` 처럼 범위를
-                        // 넘겨 잘라 쓰면 Verilog 는 **조용히 X** 를 줍니다
-                        // (주소 전체가 X 가 돼 V 영역이 통째로 안 써졌습니다).
-                        a_we_addr = q_AOUT + tr_h * q_OSTR[AW_A-1:0]
-                                  + (tr_mt << 5) + {{(AW_A-6){1'b0}}, tr_r};
-                        for (za = 0; za < N; za = za + 1)
-                            a_we_data[za*16 +: 16] =
-                                {{8{tr_out[za*8+7]}}, tr_out[za*8 +: 8]};
-                    end else if (sm_ov && q_cons == C_Q69) begin
-                        // softmax 출력 : 워드 = 키, 레인 = latent 행
-                        a_we_en   = 1'b1;
-                        a_we_addr = q_OSTR[AW_A-1:0] + {{(AW_A-8){1'b0}}, sm_c};
-                        for (za = 0; za < N; za = za + 1)
-                            a_we_data[za*16 +: 16] = {8'd0, sm_out[za*8 +: 8]};
-                    end else if (cp_v && q_cons != C_Q69 && q_kind == K_GEMM
-                                 && !q_flag[0]) begin
-                        a_we_en   = 1'b1;
-                        // FLAG[13] head-major : AOUT + (n/32)*hstride + mt*32 + n%32
-                        // 그 외        : AOUT + mt*NOUT + n
-                        // 위에서 한 사이클 앞서 계산해 둔 주소를 씁니다
-                        a_we_addr = gm_addr_q;
-                        a_we_data = cp_d;
-                    end
+        if (state == ST_IDLE) begin
+            // ---- 쉬는 동안에만 호스트 리드백을 붙입니다 ----
+            a_ra_en   = dbg_rd_en;
+            a_ra_addr = dbg_rd_addr;
+
+        end else if (state == ST_CONST) begin
+            // ---- QK 명령어 시작에 bias_k 워드를 한 번 읽어 둡니다 ----
+            a_ra_en   = 1'b1;
+            a_ra_addr = op_aout[AW_A-1:0];
+
+        end else case (op_kind)
+
+            // ---------------- GEMM / ARGMAX ----------------
+            OP_ARGMAX,
+            OP_GEMM: begin
+                a_ra_en   = gemm_a_rd_en;
+                a_ra_addr = gemm_a_rd_addr;
+                if (b_src_amem) begin                     // B 도 A_Mem 에서
+                    a_rb_en   = gemm_b_rd_en;
+                    a_rb_addr = av_hit ? ostr_as_bkv_addr // bias_v 칸으로 돌림
+                                       : gemm_b_rd_addr[AW_A-1:0];
                 end
-                K_LN: begin
-                    ar_en = la_rd_en; ar_addr = la_rd_addr;
-                    if (ln_ov) begin
-                        a_we_en   = 1'b1;
-                        a_we_addr = q_AOUT + ln_mt_o * q_NOUT[AW_A-1:0]
-                                  + ln_k[AW_A-1:0];
-                        for (za = 0; za < N; za = za + 1)
-                            a_we_data[za*16 +: 16] =
-                                {{8{ln_out[za*8+7]}}, ln_out[za*8 +: 8]};
-                    end
+
+                if (tr_drain) begin
+                    // 전치 드레인 : 워드 = head*OSTR + mt*32 + 키
+                    // [함정] `tr_row` 은 6비트입니다. `tr_row[AW_A-1:0]` 처럼
+                    // 폭을 넘겨 잘라 쓰면 Verilog 가 **조용히 X** 를 줍니다.
+                    a_we_en   = 1'b1;
+                    a_we_addr = op_aout + tr_head * op_ostr[AW_A-1:0]
+                              + (tr_mt << 5) + {{(AW_A-6){1'b0}}, tr_row};
+                    for (wr_lane = 0; wr_lane < N; wr_lane = wr_lane + 1)
+                        a_we_data[wr_lane*16 +: 16] =
+                            {{8{tr_out[wr_lane*8+7]}}, tr_out[wr_lane*8 +: 8]};
+
+                end else if (smax_valid && op_fmt == FMT_Q69) begin
+                    // QK 직결 softmax 의 출력 : 워드 = 키, 레인 = latent 행
+                    a_we_en   = 1'b1;
+                    a_we_addr = ostr_as_smax_base + {{(AW_A-8){1'b0}}, smax_col};
+                    for (wr_lane = 0; wr_lane < N; wr_lane = wr_lane + 1)
+                        a_we_data[wr_lane*16 +: 16] = {8'd0, smax_out[wr_lane*8 +: 8]};
+
+                end else if (fca_valid && op_fmt != FMT_Q69
+                             && op_kind == OP_GEMM && !op_flag[0]) begin
+                    // 보통의 컬럼 되쓰기 (주소는 한 사이클 앞서 계산해 둔 것)
+                    a_we_en   = 1'b1;
+                    a_we_addr = gemm_we_addr_q;
+                    a_we_data = fca_data;
                 end
-                K_SMAX: begin
-                    if (sm_ov) begin
-                        a_we_en   = 1'b1;
-                        a_we_addr = q_AOUT + {{(AW_A-8){1'b0}}, sm_c};
-                        for (za = 0; za < N; za = za + 1)
-                            a_we_data[za*16 +: 16] = {8'd0, sm_out[za*8 +: 8]};
-                    end
+            end
+
+            // ---------------- LayerNorm ----------------
+            OP_LN: begin
+                a_ra_en   = ln_rd_en;
+                a_ra_addr = ln_rd_addr;
+                if (ln_valid) begin
+                    a_we_en   = 1'b1;
+                    a_we_addr = op_aout + ln_mt * op_nout[AW_A-1:0] + ln_k[AW_A-1:0];
+                    for (wr_lane = 0; wr_lane < N; wr_lane = wr_lane + 1)
+                        a_we_data[wr_lane*16 +: 16] =
+                            {{8{ln_out[wr_lane*8+7]}}, ln_out[wr_lane*8 +: 8]};
                 end
-                K_RES: begin
-                    // 두 피연산자를 **동시에** 읽습니다. A_Mem 은 쓰기가 같고
-                    // 읽기만 독립인 미러 2벌인데, 포트 B(`u_amem1`)는 GEMM 만
-                    // 쓰고 RES 중에는 놀고 있었습니다. 순차 읽기(4위상)를
-                    // 병렬 읽기(2위상)로 바꿔 루프가 6 → 5 위상이 됩니다.
-                    ar_en   = rs_run;
-                    ar_addr = q_AIN  + rs_mt * q_K[AW_A-1:0] + rs_k[AW_A-1:0];
-                    br_en   = rs_run;
-                    br_addr = q_AOUT + rs_mt * q_K[AW_A-1:0] + rs_k[AW_A-1:0];
-                    if (rs_run && rs_ph == 3'd4) begin
-                        a_we_en   = 1'b1;
-                        a_we_addr = q_AOUT + rs_mt * q_K[AW_A-1:0]
-                                  + rs_k[AW_A-1:0];
-                        a_we_data = rs_sum;
-                    end
+            end
+
+            // ---------------- Softmax (단독) ----------------
+            OP_SMAX: begin
+                if (smax_valid) begin
+                    a_we_en   = 1'b1;
+                    a_we_addr = op_aout + {{(AW_A-8){1'b0}}, smax_col};
+                    for (wr_lane = 0; wr_lane < N; wr_lane = wr_lane + 1)
+                        a_we_data[wr_lane*16 +: 16] = {8'd0, smax_out[wr_lane*8 +: 8]};
                 end
-                K_POS: begin
-                    ar_en   = pos_rd_en; ar_addr = pos_rd_addr;
-                    a_we_en = pos_we_en; a_we_addr = pos_we_addr;
-                    a_we_data = pos_we_data;
+            end
+
+            // ---------------- RES (잔차 덧셈) ----------------
+            // 두 피연산자를 **동시에** 읽습니다 (A_Mem 은 읽기만 독립인 미러 2벌).
+            // 순차 읽기였다면 루프가 위상 6개, 지금은 5개입니다.
+            OP_RES: begin
+                a_ra_en   = rs_run;
+                a_ra_addr = op_ain  + rs_mt * op_k[AW_A-1:0] + rs_k[AW_A-1:0];
+                a_rb_en   = rs_run;
+                a_rb_addr = op_aout + rs_mt * op_k[AW_A-1:0] + rs_k[AW_A-1:0];
+                if (rs_run && rs_ph == 3'd4) begin
+                    a_we_en   = 1'b1;
+                    a_we_addr = op_aout + rs_mt * op_k[AW_A-1:0] + rs_k[AW_A-1:0];
+                    a_we_data = rs_sum;
                 end
-                K_MEAN: begin
-                    ar_en   = mn_run;
-                    ar_addr = q_AIN + mn_mt * q_K[AW_A-1:0] + mn_k[AW_A-1:0];
-                    if (mn_run && mn_ph == 3'd4) begin
-                        a_we_en   = 1'b1;
-                        a_we_addr = q_AOUT + mn_k[AW_A-1:0];
-                        a_we_data = {{(N-1)*16{1'b0}}, {{8{mn_out[7]}}, mn_out}};
-                    end
+            end
+
+            // ---------------- positional encoding ----------------
+            OP_POS: begin
+                a_ra_en   = pos_rd_en;   a_ra_addr = pos_rd_addr;
+                a_we_en   = pos_we_en;   a_we_addr = pos_we_addr;
+                a_we_data = pos_we_data;
+            end
+
+            // ---------------- MEAN (레인 축 리덕션) ----------------
+            OP_MEAN: begin
+                a_ra_en   = mean_run;
+                a_ra_addr = op_ain + mean_mt * op_k[AW_A-1:0] + mean_k[AW_A-1:0];
+                if (mean_run && mean_ph == 3'd4) begin
+                    a_we_en   = 1'b1;
+                    a_we_addr = op_aout + mean_k[AW_A-1:0];   // 레인 0 에만
+                    a_we_data = {{(N-1)*16{1'b0}}, {{8{mean_out[7]}}, mean_out}};
                 end
-                default: ;
-            endcase
-        end
+            end
+
+            default: ;
+        endcase
     end
 
-    // PB 인덱스
+    // -------------------------------------------------------------------------
+    // Requant_Mem 인덱스 — 세 가지뿐입니다
+    //
+    //   ST_CONST      RQ_BASE + NOUT   GELU 뒤 2차 곱수 (채널 테이블 바로 뒤 칸)
+    //   채널별        RQ_BASE + n      GEMM · ARGMAX 의 보통 경우
+    //   블록 스칼라   RQ_BASE          attention 의 QK/AV (FLAG2[2] 가 선 명령어)
+    //
+    // ARGMAX 도 **채널별**입니다 — 골든이 `argmax(acc[c]*M[c])` 이라 클래스마다
+    // 곱수가 다릅니다. `OP_GEMM` 만 걸어 두면 10클래스가 전부 채널 0 의 곱수를
+    // 써서 사실상 `argmax(acc[c])` 가 됩니다.
+    // -------------------------------------------------------------------------
+    wire rq_per_channel = (op_kind == OP_GEMM || op_kind == OP_ARGMAX) && !op_flag2[2];
     always @* begin
-        // GELU 뒤 재양자화 곱수는 그 레이어 채널 뒤(PB + NOUT)에 있습니다
-        // attention 의 QK/AV 는 채널별이 아니라 **블록당 스칼라 하나**입니다
-        // (FLAG2[2] 가 서 있는 inst 이 정확히 그 둘입니다).
-        //   ARGMAX 도 **채널별**입니다 — 골든이 `argmax(acc[c]*M[c])` 이고
-        //   acc 에 채널 바이어스가 들어갑니다. `K_GEMM` 만 걸어 두면 10클래스가
-        //   전부 채널 0 의 곱수를 써서 사실상 `argmax(acc[c])` 가 됩니다.
-        if      (st == S_GCONST)   pb_idx = q_PB[AW_PB+1:0] + q_NOUT[AW_PB+1:0];
-        else if ((q_kind == K_GEMM || q_kind == K_ARGMAX) && !q_flag2[2])
-                                   pb_idx = q_PB[AW_PB+1:0] + col_n[AW_PB+1:0];
-        else                       pb_idx = q_PB[AW_PB+1:0];
+        if      (state == ST_CONST) rq_idx = op_rq_base[AW_RQ+1:0] + op_nout[AW_RQ+1:0];
+        else if (rq_per_channel)    rq_idx = op_rq_base[AW_RQ+1:0] + col_n[AW_RQ+1:0];
+        else                        rq_idx = op_rq_base[AW_RQ+1:0];
     end
 
     // =========================================================================
@@ -851,178 +883,206 @@ module EvT_Engine #(
     // =========================================================================
     always @(posedge clk) begin
         if (rst) begin
-            st <= S_IDLE; sp <= 0; ti <= 0; done <= 1'b0; in_tail <= 1'b0;
-            gm_start <= 1'b0; ln_start <= 1'b0; sm_start <= 1'b0;
-            rs_run <= 1'b0; rs_k <= 0; rs_ph <= 0; gc <= 0; g_mult_q <= 0;
-            q_flag2 <= 4'd0; rs_mt <= 6'd0;
-            wait_ack <= 1'b0; bk_word <= 0;
-            s_addr <= 0; n_tok <= 0;
-            res_class <= 4'd0; res_logits <= 0; tok_req <= 1'b0; pos_start <= 1'b0;
-            mn_run <= 1'b0; mn_k <= 0; mn_mt <= 0; mn_ph <= 0; mn_acc <= 0;
-            am_best <= 0; am_any <= 1'b0;
+            // 시퀀서
+            state      <= ST_IDLE;  inst_ptr <= 0;      inst_addr <= 0;
+            tstep      <= 0;        in_tail  <= 1'b0;   n_tok     <= 0;
+            done       <= 1'b0;     tok_req  <= 1'b0;   wait_ack  <= 1'b0;
+            const_ph   <= 0;        op_flag2 <= 4'd0;
+            // 유닛 기동
+            gemm_start <= 1'b0;  ln_start <= 1'b0;  smax_start <= 1'b0;  pos_start <= 1'b0;
+            // RES / MEAN 루프
+            rs_run     <= 1'b0;  rs_k     <= 0;  rs_ph   <= 0;  rs_mt    <= 6'd0;
+            mean_run   <= 1'b0;  mean_k   <= 0;  mean_mt <= 0;  mean_ph  <= 0;  mean_acc <= 0;
+            // 상수 / 결과
+            rq_scale2_q  <= 0;    bias_k_word <= 0;
+            argmax_best <= 0;    argmax_any  <= 1'b0;
+            res_class   <= 4'd0; res_logits  <= 0;
         end else begin
-            // 코어 파이프라인이 마지막 타일을 비우며 컬럼을 더 낼 수 있어
-            // **유효 범위 밖은 세지 않습니다** (안 막으면 클래스 10 이 나옵니다)
-            if (am_v_q) begin
-                res_logits[am_n_q[4:0]*PSUM_W +: PSUM_W] <= am_acc_q;
-                if (!am_any || am_val_q > am_best) begin
-                    am_best   <= am_val_q;
-                    am_any    <= 1'b1;
-                    res_class <= am_n_q[3:0];
+            if (argmax_valid_q) begin
+                res_logits[argmax_n_q[3:0]*PSUM_W +: PSUM_W] <= argmax_acc_q;
+                if (!argmax_any || argmax_val_q > argmax_best) begin
+                    argmax_best <= argmax_val_q;
+                    argmax_any  <= 1'b1;
+                    res_class   <= argmax_n_q[3:0];
                 end
             end
-            case (st)
-                S_IDLE: begin
+            case (state)
+                ST_IDLE: begin
                     done <= 1'b0;
                     if (start) begin
-                        ti <= 0; sp <= 0; in_tail <= 1'b0;
-                        s_addr <= 0; st <= S_TLOAD;
+                        tstep <= 0; inst_ptr <= 0; in_tail <= 1'b0;
+                        inst_addr <= 0; state <= ST_TLOAD;
                     end
                 end
                 // 이 타임스텝의 X/PIN 이 채워지기를 기다립니다
-                S_TLOAD: begin
+                ST_TLOAD: begin
                     tok_req <= 1'b1;
-                    if (tok_ack) begin // PS에서 write 완료
+                    if (tok_ack) begin              // 호스트 적재 완료
                         tok_req <= 1'b0;
-                        n_tok   <= tok_rd_n;
-                        st      <= S_FETCH;
+                        n_tok   <= tok_n;
+                        state   <= ST_FETCH;
                     end
                 end
                 // Inst_Mem 읽기 1사이클
-                S_FETCH: begin
-                    n_tok <= tok_rd_n;
-                    st <= S_DEC;
+                ST_FETCH: begin
+                    n_tok <= tok_n;
+                    state <= ST_DECODE;
                 end
-                S_DEC: begin
-                    q_kind <= s_rd[3:0];   q_cons <= s_rd[5:4];
-                    q_act  <= s_rd[7:6];   q_var  <= s_rd[11:8];
-                    q_flag <= s_rd[15:12];
-                    q_sh   <= s_rd[21:16]; q_gsh  <= s_rd[27:22];
-                    q_flag2 <= s_rd[31:28];
-                    // VAR 비트로 n_tok 의존 필드를 채웁니다 (부분선택을 두 번
-                    // 이어 쓰면 Verilog 문법 오류라 개별 비트로 씁니다)
-                    q_M    <= s_rd[8]  ? tok_rd_n          : s_rd[32 +: DIM_W];
-                    q_K    <= s_rd[10] ? (tok_rd_n + 1'b1) : s_rd[64 +: DIM_W];
-                    q_NOUT <= (s_rd[9] | s_rd[11]) ? (tok_rd_n + 1'b1)
-                                                   : s_rd[96 +: DIM_W];
-                    q_AIN  <= s_rd[128 +: AW_A];
-                    q_BIN  <= s_rd[160 +: AW_W];
-                    q_AOUT <= s_rd[192 +: AW_A];
-                    q_PB   <= s_rd[224 +: 16];
-                    q_OSTR <= s_rd[240 +: 16];
-                    gc <= 0;
-                    st <= S_GCONST;
+                ST_DECODE: begin
+                    op_kind     <= inst_word[  3: 0];
+                    op_fmt      <= inst_word[  5: 4];
+                    op_act      <= inst_word[  7: 6];
+                    op_flag     <= inst_word[ 15:12];
+                    op_shift    <= inst_word[ 21:16];
+                    op_shift2   <= inst_word[ 27:22];
+                    op_flag2    <= inst_word[ 31:28];
+                    op_ain      <= inst_word[128 +: AW_A];
+                    op_bin      <= inst_word[160 +: AW_W];
+                    op_aout     <= inst_word[192 +: AW_A];
+                    op_rq_base  <= inst_word[224 +: 16];
+                    op_ostr     <= inst_word[240 +: 16];
+                    // VAR 비트가 선 필드는 상수 대신 이번 타임스텝의 토큰 수로
+                    // 채웁니다 (부분선택을 두 번 이어 쓰면 문법 오류라 개별 비트).
+                    op_m        <= inst_word[8]  ? tok_n          : inst_word[32 +: DIM_W];
+                    op_k        <= inst_word[10] ? (tok_n + 1'b1) : inst_word[64 +: DIM_W];
+                    op_nout     <= (inst_word[9] | inst_word[11]) ? (tok_n + 1'b1)
+                                                                 : inst_word[96 +: DIM_W];
+                    const_ph <= 0;
+                    state    <= ST_CONST;
                 end
-                // PB 읽기 2사이클 → GELU 뒤 재양자화 곱수 확정
-                S_GCONST: begin
-                    gc <= gc + 1'b1;
-                    if (gc == 2'd1) bk_word <= ar_data;
-                    if (gc == 2'd2) begin g_mult_q <= pb_mult_q; st <= S_RUN; end
+                // Requant_Mem 읽기 2사이클 → GELU 뒤 재양자화 곱수 확정
+                ST_CONST: begin
+                    const_ph <= const_ph + 1'b1;
+                    if (const_ph == 2'd1) bias_k_word <= a_ra_data;   // QK 용
+                    if (const_ph == 2'd2) begin
+                        rq_scale2_q <= rq_scale_q;                      // 2차 곱수
+                        state      <= ST_RUN;
+                    end
                 end
-                S_RUN: begin
-                    case (q_kind)
-                        K_GEMM: begin
-                                    gm_start <= 1'b1;
-                                    if (q_cons == C_Q69) sm_start <= 1'b1;
-                                end
-                        K_LN:   ln_start <= 1'b1;
-                        K_SMAX: sm_start <= 1'b1;
-                        K_RES:  begin rs_run <= 1'b1; rs_k <= 0; rs_ph <= 0;
-                                      rs_mt <= 6'd0; end
-                        K_MEAN: begin mn_run <= 1'b1; mn_k <= 0; mn_mt <= 0;
-                                      mn_ph <= 0; mn_acc <= 0; end
-                        K_POS:  pos_start <= 1'b1;
-                        K_ARGMAX: begin gm_start <= 1'b1; am_any <= 1'b0;
-                                        am_best <= 0; res_class <= 4'd0; end
+                ST_RUN: begin
+                    case (op_kind)
+                        OP_GEMM: begin
+                            gemm_start <= 1'b1;
+                            // Q6.9 는 컬럼이 softmax 로 직결이라 같이 기동합니다
+                            if (op_fmt == FMT_Q69) smax_start <= 1'b1;
+                        end
+                        OP_LN:     ln_start   <= 1'b1;
+                        OP_SMAX:   smax_start <= 1'b1;
+                        OP_POS:    pos_start  <= 1'b1;
+                        OP_RES: begin
+                            rs_run   <= 1'b1;  rs_k   <= 0;  rs_ph   <= 0;  rs_mt <= 6'd0;
+                        end
+                        OP_MEAN: begin
+                            mean_run <= 1'b1;  mean_k <= 0;  mean_mt <= 0;
+                            mean_ph  <= 0;     mean_acc <= 0;
+                        end
+                        OP_ARGMAX: begin
+                            gemm_start  <= 1'b1;
+                            argmax_any  <= 1'b0;  argmax_best <= 0;  res_class <= 4'd0;
+                        end
                         default: ;
                     endcase
                     wait_ack <= 1'b0;
-                    st <= S_WAIT;
+                    state    <= ST_WAIT;
                 end
-                S_WAIT: begin
-                    if (!gm_done && !ln_done && !sm_done && !pos_done)
+                // ---------------------------------------------------------
+                // 유닛이 끝나기를 기다립니다. RES / MEAN 은 하위 코어가 없어
+                // 여기서 직접 위상을 돌립니다.
+                // ---------------------------------------------------------
+                ST_WAIT: begin
+                    if (!gemm_done && !ln_done && !smax_done && !pos_done)
                         wait_ack <= 1'b1;
-                    if (q_kind == K_RES) begin
+
+                    if (op_kind == OP_RES) begin
+                        // ph0 주소 / ph1 두 워드 수신 / ph2 덧셈 투입 / ph3~4 정규화·쓰기
                         rs_ph <= rs_ph + 1'b1;
                         if (rs_ph == 3'd1) begin
-                            rs_a <= ar_data;   // 포트 A
-                            rs_b <= br_data;   // 포트 B — 같은 사이클
+                            rs_a <= a_ra_data;              // 포트 A
+                            rs_b <= a_rb_data;              // 포트 B — 같은 사이클
                         end
                         if (rs_ph == 3'd4) begin
                             rs_ph <= 0;
-                            if (rs_k == q_K - 1) begin
+                            if (rs_k != op_k - 1)                rs_k  <= rs_k + 1'b1;
+                            else begin
                                 rs_k <= 0;
-                                if (rs_mt == rs_mt_last) begin
-                                    rs_run <= 1'b0; st <= S_NEXT;
-                                end else rs_mt <= rs_mt + 1'b1;
-                            end else rs_k <= rs_k + 1'b1;
+                                if (rs_mt != row_tile_last)      rs_mt <= rs_mt + 1'b1;
+                                else begin rs_run <= 1'b0;       state <= ST_NEXT; end
+                            end
                         end
-                    // 전치 드레인이 **다 쏟기 전에** inst 을 넘기면 마지막
-                    // 워드들이 다음 inst 의 AOUT/OSTR 로 나갑니다 (실측 256개 중
-                    // 23개가 다음 inst 으로 넘어갔습니다).
-                    end else if (q_kind == K_GEMM && gm_done && wait_ack
-                                 && !tr_run && !tr_arm && !tr_go && !cp_busy
-                                 && (q_cons != C_Q69 || sm_done)) begin
-                        // Q6.9 소비자는 softmax 까지 **같은 inst** 입니다
-                        gm_start <= 1'b0; sm_start <= 1'b0; st <= S_NEXT;
-                    end else if (q_kind == K_LN && ln_done && wait_ack) begin
-                        ln_start <= 1'b0; st <= S_NEXT;
-                    end else if (q_kind == K_POS && pos_done && wait_ack) begin
-                        pos_start <= 1'b0; st <= S_NEXT;
-                    end else if (q_kind == K_SMAX && sm_done && wait_ack) begin
-                        sm_start <= 1'b0; st <= S_NEXT;
-                    // `am_v_q` 가 아직 서 있으면 **마지막 컬럼이 미반영**입니다
-                    // (곱셈 뒤 레지스터를 넣어 한 단 늘었습니다).
-                    end else if (q_kind == K_ARGMAX && gm_done && wait_ack
-                                 && !am_v_q) begin
-                        gm_start <= 1'b0; st <= S_NEXT;
-                    end else if (q_kind == K_MEAN) begin
+
+                    end else if (op_kind == OP_MEAN) begin
                         // 특징 하나당 : 타일마다 (주소 → 합), 그 뒤 재양자화 · 쓰기
-                        // ph0 주소 / ph1 BRAM 출력을 mn_d 에 수신 / ph2 누산
-                        // ph3 곱 확정 / ph4 재양자화·쓰기
-                        if (mn_ph == 3'd0) mn_ph <= 3'd1;
-                        else if (mn_ph == 3'd1) mn_ph <= 3'd2;
-                        else if (mn_ph == 3'd2) begin
-                            mn_acc <= mn_acc + mn_lane_sum;
-                            if (mn_mt == ln_mt_last) mn_ph <= 3'd3;
-                            else begin mn_mt <= mn_mt + 1'b1; mn_ph <= 3'd0; end
-                        end else if (mn_ph == 3'd3) begin
-                            // 최종 mn_acc 의 곱이 mn_prod_q 에 잡히는 사이클
-                            mn_ph <= 3'd4;
-                        end else begin
-                            mn_ph <= 3'd0; mn_mt <= 0; mn_acc <= 0;
-                            if (mn_k == q_K - 1) begin
-                                mn_run <= 1'b0; st <= S_NEXT;
-                            end else mn_k <= mn_k + 1'b1;
+                        case (mean_ph)
+                            3'd0: mean_ph <= 3'd1;          // 주소 발행
+                            3'd1: mean_ph <= 3'd2;          // BRAM 출력 수신
+                            3'd2: begin                     // 레인 합 누산
+                                mean_acc <= mean_acc + mean_lane_sum;
+                                if (mean_mt == row_tile_last) mean_ph <= 3'd3;
+                                else begin mean_mt <= mean_mt + 1'b1; mean_ph <= 3'd0; end
+                            end
+                            3'd3: mean_ph <= 3'd4;          // 곱이 mean_prod_q 에 잡힘
+                            default: begin                  // ph4 : 재양자화 · 쓰기
+                                mean_ph <= 3'd0;  mean_mt <= 0;  mean_acc <= 0;
+                                if (mean_k != op_k - 1)     mean_k   <= mean_k + 1'b1;
+                                else begin mean_run <= 1'b0; state   <= ST_NEXT; end
+                            end
+                        endcase
+
+                    // [함정] 전치 드레인이 **다 쏟기 전에** 명령어를 넘기면 마지막
+                    // 워드들이 다음 명령어의 AOUT/OSTR 로 나갑니다. Q6.9 는 softmax
+                    // 까지가 같은 명령어라 `smax_done` 도 같이 봅니다.
+                    end else if (op_kind == OP_GEMM && gemm_done && wait_ack
+                                 && !tr_drain && !tr_last_d1 && !tr_last_d2   // 다 쏟았나
+                                 && !fca_busy
+                                 && (op_fmt != FMT_Q69 || smax_done)) begin
+                        gemm_start <= 1'b0;  smax_start <= 1'b0;  state <= ST_NEXT;
+
+                    // [함정] `argmax_valid_q` 가 아직 서 있으면 마지막 컬럼이
+                    // 아직 반영 전입니다 (곱셈 뒤 레지스터로 한 단 늘었습니다).
+                    end else if (op_kind == OP_ARGMAX && gemm_done && wait_ack
+                                 && !argmax_valid_q) begin
+                        gemm_start <= 1'b0;                       state <= ST_NEXT;
+
+                    end else if (op_kind == OP_LN   && ln_done   && wait_ack) begin
+                        ln_start   <= 1'b0;                       state <= ST_NEXT;
+                    end else if (op_kind == OP_SMAX && smax_done && wait_ack) begin
+                        smax_start <= 1'b0;                       state <= ST_NEXT;
+                    end else if (op_kind == OP_POS  && pos_done  && wait_ack) begin
+                        pos_start  <= 1'b0;                       state <= ST_NEXT;
+                    end
+                end
+                // 다음 명령어로. body 끝이면 타임스텝을 넘기고, tail 끝이면 완료.
+                ST_NEXT: begin
+                    if (!gemm_done && !ln_done) begin
+                        if      (!in_tail && inst_ptr == n_body - 1)
+                            state <= ST_TSTEP;
+                        else if ( in_tail && inst_ptr == n_body + n_tail - 1)
+                            state <= ST_DONE;
+                        else begin
+                            inst_ptr  <= inst_ptr + 1'b1;
+                            inst_addr <= inst_ptr + 1'b1;
+                            state     <= ST_FETCH;
                         end
                     end
                 end
-                S_NEXT: begin
-                    if (!gm_done && !ln_done) begin
-                        if (!in_tail && sp == n_body - 1) begin
-                            // 타임스텝 하나 끝 — 다음 타임스텝 또는 tail 로
-                            st <= S_TSTEP;
-                        end else if (in_tail && sp == n_body + n_tail - 1) begin
-                            st <= S_DONE;
-                        end else begin
-                            sp <= sp + 1'b1; s_addr <= sp + 1'b1; st <= S_FETCH;
-                        end
-                    end
-                end
-                S_TSTEP: begin
-                    if (ti == n_time - 1) begin
-                        in_tail <= 1'b1; sp <= n_body; s_addr <= n_body;
-                        st <= S_FETCH;
+
+                // 마지막 타임스텝이면 tail 로, 아니면 다음 타임스텝 입력을 기다립니다.
+                ST_TSTEP: begin
+                    if (tstep == n_tstep - 1) begin
+                        in_tail   <= 1'b1;
+                        inst_ptr  <= n_body;  inst_addr <= n_body;
+                        state     <= ST_FETCH;
                     end else begin
-                        ti <= ti + 1'b1; sp <= 0; s_addr <= 0;
-                        st <= S_TLOAD;          // 다음 타임스텝 입력 대기
+                        tstep     <= tstep + 1'b1;
+                        inst_ptr  <= 0;       inst_addr <= 0;
+                        state     <= ST_TLOAD;
                     end
                 end
-                S_DONE: begin
+                ST_DONE: begin
                     done <= 1'b1;
-                    if (!start) st <= S_IDLE;
+                    if (!start) state <= ST_IDLE;
                 end
-                default: st <= S_IDLE;
+                default: state <= ST_IDLE;
             endcase
         end
     end

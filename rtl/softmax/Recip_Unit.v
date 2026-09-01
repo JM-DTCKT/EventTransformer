@@ -1,37 +1,44 @@
-// ============================================================================
-//  recip_unit.v  --  분모 역수 유닛 (정규화 + PWL-LUT)
-// ----------------------------------------------------------------------------
-//  softmax 의 나눗셈 y_i = e_i / S 를 "역수 한 번 + 곱셈 N 번" 으로 바꾸기 위한
-//  1/S 계산기.  S 는 96개 exp 결과의 합이라 [1, 96] 범위로 넓다.
+// -----------------------------------------------------------------------------
+// Recip_Unit : 분모 역수 유닛 (정규화 + PWL-LUT)
 //
-//  [핵심 아이디어]  S 를 2의 거듭제곱으로 정규화해서 LUT 정의역을 [1,2) 로 좁힌다.
+// softmax 의 나눗셈 y_i = e_i / S 를 "역수 한 번 + 곱셈 N 번" 으로 바꾸기 위한
+// 1/S 계산기.  S 는 96개 exp 결과의 합이라 [1, 96] 범위로 넓다.
 //
-//     S = m * 2^p ,  m in [1,2)          <- p = S 의 MSB 위치 (leading-one)
-//     1/S = (1/m) * 2^-p
-//            └ PWL-LUT ┘ └ 시프트 ┘
+// ## 핵심 아이디어
 //
-//  1/m in (0.5, 1] 이므로 128 세그먼트 선형보간으로 최대오차 1.6e-5
-//  (상대오차 3.2e-5) 이면 충분하다.  Newton-Raphson 반복이 필요 없다.
-//  — 이 오차는 출력 UQ1.15 로 환산하면 0.5 LSB 로, 최종 반올림 오차에 묻힌다.
-//    (256 세그먼트로 늘려도 softmax 출력 오차가 전혀 개선되지 않음을 실측 확인)
+// S 를 2의 거듭제곱으로 정규화해서 LUT 정의역을 [1,2) 로 좁힌다.
 //
-//  [고정소수점 포맷]
-//     s   : unsigned UQ8.EF        분모 (exp 결과 UQ1.EF 를 N개 누산)
-//     m_q : unsigned        (SWb)  s 를 MSB 가 bit(SW-1) 에 오도록 좌시프트한 값
-//                                  = m * 2^(SW-1),  m = 1.f  (f = m_q[SW-2:0])
-//     r   : unsigned UQ1.RF        1/m, 범위 (2^(RF-1), 2^RF],  RW = RF+1
-//     p   : MSB 위치 (0..23)       호출부가 최종 시프트량 계산에 사용
+//    S = m * 2^p ,  m in [1,2)          <- p = S 의 MSB 위치 (leading-one)
+//    1/S = (1/m) * 2^-p
+//           └ PWL-LUT ┘ └ 시프트 ┘
 //
-//  [호출부 사용법]  s_real = s / 2^SF (SF=17) 일 때
-//     1/s_real = r * 2^-RF * 2^(SF-p)
-//     y = e * (1/s_real) 을 UQ1.OF 로 얻으려면  (e * r) >> (p + RF - OF)
+// 1/m in (0.5, 1] 이므로 128 세그먼트 선형보간으로 최대오차 1.6e-5
+// (상대오차 3.2e-5) 이면 충분하다.  Newton-Raphson 반복이 필요 없다.
+// — 이 오차는 출력 UQ1.15 로 환산하면 0.5 LSB 로, 최종 반올림 오차에 묻힌다.
+//   (256 세그먼트로 늘려도 softmax 출력 오차가 전혀 개선되지 않음을 실측 확인)
 //
-//  [파이프라인]  3 stage, 벡터당 1회만 사용
-//     S1 leading-one 검출 | S2 정규화 시프트 & seg/frac 분리 | S3 LUT+보간
-// ============================================================================
+// ## 고정소수점 포맷
+//
+//    s   : unsigned UQ8.EF        분모 (exp 결과 UQ1.EF 를 N개 누산)
+//    m_q : unsigned        (SWb)  s 를 MSB 가 bit(SW-1) 에 오도록 좌시프트한 값
+//                                 = m * 2^(SW-1),  m = 1.f  (f = m_q[SW-2:0])
+//    r   : unsigned UQ1.RF        1/m, 범위 (2^(RF-1), 2^RF],  RW = RF+1
+//    p   : MSB 위치 (0..23)       호출부가 최종 시프트량 계산에 사용
+//
+// ## 호출부 사용법
+//
+// s_real = s / 2^SF (SF=17) 일 때
+//    1/s_real = r * 2^-RF * 2^(SF-p)
+//    y = e * (1/s_real) 을 UQ1.OF 로 얻으려면  (e * r) >> (p + RF - OF)
+//
+// ## 파이프라인
+//
+// 3 stage, 벡터당 1회만 사용
+//    S1 leading-one 검출 | S2 정규화 시프트 & seg/frac 분리 | S3 LUT+보간
+// -----------------------------------------------------------------------------
 `timescale 1ns/1ps
 
-module recip_unit #(
+module Recip_Unit #(
     parameter integer SW = 24,   // 분모 s 폭
     parameter integer RW = 18,   // r 폭 (unsigned UQ1.17, = RF+1)
     parameter integer RF = 17,   // r 소수부 비트수
@@ -50,7 +57,7 @@ module recip_unit #(
 
     // ---- PWL-LUT : rcp_base_rom / rcp_delta_rom + 폭 상수 RCP_BW / RCP_DW ----
     //      ROM 폭은 생성기가 실제 값 범위에 맞춰 최소화해 emit 한다.
-    `include "recip_lut.vh"
+    `include "Recip_Lut.vh"
 
     // ======================= Stage 1 : leading-one 검출 =====================
     //  s 의 최상위 '1' 위치 p 를 찾는다 (우선순위 인코더).  s==0 이면 zero 플래그.
@@ -115,9 +122,9 @@ module recip_unit #(
     // 포맷 정합성 체크
     initial begin
         if (RW != RF+1)   // r 은 UQ1.RF, 최대값 2^RF 를 담아야 함
-            $display("ERROR: recip_unit RW(%0d) must be RF+1(%0d)", RW, RF+1);
+            $display("ERROR: Recip_Unit RW(%0d) must be RF+1(%0d)", RW, RF+1);
         if (RCP_BW != RF+1)
-            $display("ERROR: recip_lut.vh RCP_BW(%0d) != RF+1(%0d) — LUT 재생성 필요",
+            $display("ERROR: Recip_Lut.vh RCP_BW(%0d) != RF+1(%0d) — LUT 재생성 필요",
                      RCP_BW, RF+1);
     end
 endmodule

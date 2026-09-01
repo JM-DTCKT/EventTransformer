@@ -6,10 +6,10 @@ module tb_smx_wrap;
   reg start=0, in_valid=0; reg [7:0] Cw=C;
   reg [N*16-1:0] ind=0;
   wire done, ov; wire [7:0] oc; wire [N*8-1:0] od;
-  softmax_top #(.N(N), .CMAX(128)) dut (
-    .clk(clk), .rst(rst), .start(start), .C(Cw), .done(done),
+  Softmax_Top #(.N(N), .CMAX(128)) dut (
+    .clk(clk), .rst(rst), .start(start), .n_col(Cw), .done(done),
     .in_valid(in_valid), .in_data(ind),
-    .out_valid(ov), .out_c(oc), .out_data(od));
+    .out_valid(ov), .out_n(oc), .out_data(od));
   integer i, j, nout=0; integer sum0=0;
   integer run_c, bad=0;
 

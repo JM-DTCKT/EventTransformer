@@ -127,7 +127,7 @@
    128
   ]
  },
- "pb_base": {
+ "rq_base": {
   "backbone.event_projection.seq_init.0": 0,
   "backbone.preproc_block_events.seq_init.0": 97,
   "backbone.proc_event_blocks.0.seq_init.1": 226,
@@ -151,7 +151,7 @@
   "backbone.proc_memory_blocks.0.latent_attentions.0.attention": 2686,
   "backbone.proc_memory_blocks.0.latent_attentions.1.attention": 3071
  },
- "pg_base": {
+ "af_base": {
   "backbone.proc_embs_block.layer_norm": 0,
   "backbone.proc_memory_blocks.0.cross_attention.layer_norm_1": 128,
   "backbone.proc_memory_blocks.0.cross_attention.layer_norm_2": 256,
@@ -166,7 +166,7 @@
   "backbone.proc_memory_blocks.0.latent_attentions.1.layer_norm_att": 1408,
   "backbone.proc_memory_blocks.0.latent_attentions.1.layer_norm_x": 1536
  },
- "attn_pb": {
+ "attn_rq": {
   "backbone.proc_memory_blocks.0.cross_attention": {
    "qk": [
     3456,
@@ -204,7 +204,7 @@
    ]
   }
  },
- "ln_pb": {
+ "ln_rq": {
   "backbone.proc_embs_block.layer_norm": 3462,
   "backbone.proc_memory_blocks.0.cross_attention.layer_norm_x": 3463,
   "backbone.proc_memory_blocks.0.cross_attention.layer_norm_1": 3464,
@@ -332,7 +332,7 @@
   "models_clf.0.linear_1"
  ],
  "mean_layer": "backbone.proc_embs_block.linear1",
- "input_steps": {
+ "input_scales": {
   "backbone.event_projection.seq_init.0": 0.03014659881591797,
   "backbone.preproc_block_events.seq_init.0": 0.08470916748046875,
   "backbone.proc_event_blocks.0.seq_init.1": 0.03841972351074219,
@@ -476,8 +476,8 @@
    21,
    64
   ],
-  "step": 0.08470916748046875,
-  "table_step": 0.010073184967041016,
+  "scale": 0.08470916748046875,
+  "table_scale": 0.010073184967041016,
   "file": "posenc.int8.bin",
   "pl_table": {
    "file": "posmem.bin",
@@ -485,5 +485,5 @@
    "feat": 64
   }
  },
- "input_step": 0.03014659881591797
+ "input_scale": 0.03014659881591797
 }

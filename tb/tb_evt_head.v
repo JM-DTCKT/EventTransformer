@@ -1,7 +1,7 @@
 // -----------------------------------------------------------------------------
-// tb_evt_head : EvT_Engine 통합 검증 — **attention 앞단 7 step**
+// tb_evt_head : EvT_Engine 통합 검증 — **attention 앞단 명령어 7개**
 //
-// 엔진의 첫 관문입니다. attention 복잡도를 빼고 GEMM · Col_Post(GELU/ReLU) ·
+// 엔진의 첫 관문입니다. attention 복잡도를 빼고 GEMM · Format_Cast_Act(GELU/ReLU) ·
 // RES · LayerNorm 이 스케줄대로 도는지 봅니다.
 //
 //   0 GEMM event_projection  144→96   Q4.11→GELU→int8, **출력 stride 160**
@@ -12,13 +12,13 @@
 //   5 LN   layer_norm_x
 //   6 LN   layer_norm_1
 //
-// 기대값은 골든의 **MAC 피연산자**입니다 (`sw/golden_steps.py`, README §5.5) —
+// 기대값은 골든의 **MAC 피연산자**입니다 (`sw/golden_insts.py`, README §5.5) —
 // 어떤 GEMM 의 `a` 가 곧 그 GEMM 이 읽는 A_Mem 영역이라 나눗셈도 반올림도 없고,
-// **어떤 step 의 출력이 다음 step 의 입력으로 검증**됩니다.
+// **어떤 명령어 의 출력이 다음 명령어 의 입력으로 검증**됩니다.
 // -----------------------------------------------------------------------------
 `timescale 1ns/1ps
 module tb_evt_head;
-  localparam N=32, AW_A=14, AW_W=14, AW_S=8, DIM_W=16;
+  localparam N=32, AW_A=14, AW_W=14, AW_INST=8, DIM_W=16;
   localparam NTOK = 52, TT = 2;                 // 샘플0 t0 : 토큰 52 → 타일 2
   localparam R_X=0, R_PIDX=576, R_PIN=580, R_PRE=1220,
              R_EV1=1732, R_EV=2244, R_LATV=2756,
@@ -29,31 +29,31 @@ module tb_evt_head;
 
   reg clk = 0, rst = 1; always #5 clk = ~clk;
 
-  reg  [AW_S-1:0] n_body = 8, n_tail = 1;
-  reg  [5:0]      n_time = 1;
+  reg  [AW_INST-1:0] n_body = 8, n_tail = 1;
+  reg  [5:0]      n_tstep = 1;
   reg  [31:0]     eps = 32'h3727c5ac;
   reg             start = 0;
   wire            done, busy;
   wire [3:0]      dbg_state;
-  wire [AW_S-1:0] dbg_step;
-  wire [5:0]      tok_rd_idx;
-  reg  [DIM_W-1:0] tok_rd_n = NTOK;
+  wire [AW_INST-1:0] dbg_inst;
+  wire [5:0]      tstep_idx;
+  reg  [DIM_W-1:0] tok_n = NTOK;
   reg             ld_we = 0;
   reg  [2:0]      ld_sel = 0;
   reg  [AW_W-1:0] ld_addr = 0;
   reg  [N*16-1:0] ld_data = 0;
   wire [3:0]      res_class;
-  wire [N*32-1:0] res_logits;
+  wire [10*32-1:0] res_logits;
   reg             dbg_rd_en = 0;
   reg  [AW_A-1:0] dbg_rd_addr = 0;
   wire [N*16-1:0] dbg_rd_data;
 
-  EvT_Engine #(.N(N), .AW_A(AW_A), .AW_W(AW_W), .AW_S(AW_S)) dut (
+  EvT_Engine #(.N(N), .AW_A(AW_A), .AW_W(AW_W), .AW_INST(AW_INST)) dut (
     .clk(clk), .rst(rst), .start(start), .done(done), .busy(busy),
-    .dbg_state(dbg_state), .dbg_step(dbg_step),
-    .n_body(n_body), .n_tail(n_tail), .n_time(n_time), .eps(eps),
+    .dbg_state(dbg_state), .dbg_inst(dbg_inst),
+    .n_body(n_body), .n_tail(n_tail), .n_tstep(n_tstep), .eps(eps),
     // 입력이 이미 A_Mem 에 있으므로 요청은 즉시 승인합니다
-    .tok_rd_idx(tok_rd_idx), .tok_rd_n(tok_rd_n),
+    .tstep_idx(tstep_idx), .tok_n(tok_n),
     .tok_req(), .tok_ack(1'b1),
     .ld_we(ld_we), .ld_sel(ld_sel), .ld_addr(ld_addr), .ld_data(ld_data),
     .res_class(res_class), .res_logits(res_logits),
@@ -61,9 +61,9 @@ module tb_evt_head;
 
   // ---- 메모리 이미지 ----
   reg [N*8-1:0]  wimg  [0:W_WORDS-1];
-  reg [N*8-1:0]  pbimg [0:PB_WORDS-1];
-  reg [N*8-1:0]  pgimg [0:PG_WORDS-1];
-  reg [N*8-1:0]  simg  [0:S_WORDS-1];
+  reg [N*8-1:0]  rqimg [0:PB_WORDS-1];
+  reg [N*8-1:0]  afimg [0:PG_WORDS-1];
+  reg [N*8-1:0]  instimg  [0:S_WORDS-1];
   reg [N*16-1:0] ximg  [0:TT*144-1];
   reg [N*16-1:0] pimg  [0:TT*64-1];
   reg [N*16-1:0] qimg  [0:TT-1];          // pos_idx
@@ -91,9 +91,9 @@ module tb_evt_head;
         @(negedge clk); ld_we = 1; ld_sel = sel; ld_addr = w;
         case (which)
           0: ld_data = {{(N*8){1'b0}}, wimg[w]};
-          1: ld_data = {{(N*8){1'b0}}, pbimg[w]};
-          2: ld_data = {{(N*8){1'b0}}, pgimg[w]};
-          3: ld_data = {{(N*8){1'b0}}, simg[w]};
+          1: ld_data = {{(N*8){1'b0}}, rqimg[w]};
+          2: ld_data = {{(N*8){1'b0}}, afimg[w]};
+          3: ld_data = {{(N*8){1'b0}}, instimg[w]};
         endcase
       end
       @(negedge clk); ld_we = 0;
@@ -168,7 +168,7 @@ module tb_evt_head;
           for (lane = 0; lane < N; lane = lane + 1) begin
             if (mt*32 + lane >= nrow) continue;
             checks = checks + 1;
-            got = dut.u_amem0.mem[base + mt*nfeat + k][lane*16 +: 16];
+            got = dut.u_a_mem0.mem[base + mt*nfeat + k][lane*16 +: 16];
             case (which)
               0: exp = g_pin[mt*nfeat + k][lane*16 +: 16];
               1: exp = g_pre[mt*nfeat + k][lane*16 +: 16];
@@ -194,14 +194,14 @@ module tb_evt_head;
     end
   endtask
 
-  // RES 가 R_EV 를 덮어쓰므로 step 3 이 끝난 순간을 떠 둡니다
+  // RES 가 R_EV 를 덮어쓰므로 명령어 3 이 끝난 순간을 떠 둡니다
   reg [N*16-1:0] snap_ev [0:TT*128-1];
   reg snapped = 0;
   integer sv;
-  always @(posedge clk) if (!rst && dbg_step == 8'd5 && !snapped) begin
+  always @(posedge clk) if (!rst && dbg_inst == 8'd5 && !snapped) begin
     snapped <= 1'b1;
     for (sv = 0; sv < TT*128; sv = sv + 1)
-      snap_ev[sv] = dut.u_amem0.mem[R_EV + sv];
+      snap_ev[sv] = dut.u_a_mem0.mem[R_EV + sv];
   end
 
   task chk_snap(input [255:0] nm, input integer nfeat, input integer nrow);
@@ -228,69 +228,69 @@ module tb_evt_head;
     end
   endtask
 
-  // ---- step 별 계수 : 어디서 끊겼는지 바로 짚습니다 (fpga_nl 에서 유효했던 방법)
+  // ---- 명령어 별 계수 : 어디서 끊겼는지 바로 짚습니다 (fpga_nl 에서 유효했던 방법)
   integer n_colv=0, n_cpv=0, n_awe=0, n_lnov=0, n_gmd=0;
-  reg [7:0] prev_step = 8'hFF;
+  reg [7:0] prev_inst = 8'hFF;
   always @(posedge clk) if (!rst && dut.busy) begin
-    if (dut.col_v)   n_colv = n_colv + 1;
-    if (dut.cp_v)    n_cpv  = n_cpv  + 1;
+    if (dut.col_valid)   n_colv = n_colv + 1;
+    if (dut.fca_valid)    n_cpv  = n_cpv  + 1;
     if (dut.a_we_en) n_awe  = n_awe  + 1;
-    if (dut.ln_ov)   n_lnov = n_lnov + 1;
-    if (dbg_step != prev_step) begin
-      if (prev_step != 8'hFF)
-        $display("  step %0d 종료: col_v=%0d cp_v=%0d a_we=%0d ln_ov=%0d",
-                 prev_step, n_colv, n_cpv, n_awe, n_lnov);
+    if (dut.ln_valid)   n_lnov = n_lnov + 1;
+    if (dbg_inst != prev_inst) begin
+      if (prev_inst != 8'hFF)
+        $display("  inst %0d 종료: col_valid=%0d fca_valid=%0d a_we=%0d ln_valid=%0d",
+                 prev_inst, n_colv, n_cpv, n_awe, n_lnov);
       n_colv=0; n_cpv=0; n_awe=0; n_lnov=0;
-      prev_step = dbg_step;
+      prev_inst = dbg_inst;
     end
   end
 
-  // step 진입 시 디코드된 상수 (스텝 워드가 의도대로 풀렸는지)
-  always @(posedge clk) if (!rst && dut.st == 4'd3 && dut.gc == 2'd2) begin
-    $display("  DEC step=%0d kind=%0d cons=%0d act=%0d flag=%0d/%0d sh=%0d gsh=%0d",
-             dbg_step, dut.q_kind, dut.q_cons, dut.q_act, dut.q_flag, dut.q_flag2,
-             dut.q_sh, dut.q_gsh);
-    $display("      M=%0d K=%0d NOUT=%0d AIN=%0d BIN=%0d AOUT=%0d PB=%0d OSTR=%0d gPB=%0d",
-             dut.q_M, dut.q_K, dut.q_NOUT, dut.q_AIN, dut.q_BIN, dut.q_AOUT,
-             dut.q_PB, dut.q_OSTR, dut.pb_idx);
+  // 명령어 진입 시 디코드된 상수 (스텝 워드가 의도대로 풀렸는지)
+  always @(posedge clk) if (!rst && dut.state == 4'd3 && dut.const_ph == 2'd2) begin
+    $display("  DEC inst=%0d kind=%0d fmt=%0d act=%0d flag=%0d/%0d shift=%0d shift2=%0d",
+             dbg_inst, dut.op_kind, dut.op_fmt, dut.op_act, dut.op_flag, dut.op_flag2,
+             dut.op_shift, dut.op_shift2);
+    $display("      M=%0d K=%0d NOUT=%0d AIN=%0d BIN=%0d AOUT=%0d RQ_BASE=%0d OSTR=%0d gRQ=%0d",
+             dut.op_m, dut.op_k, dut.op_nout, dut.op_ain, dut.op_bin, dut.op_aout,
+             dut.op_rq_base, dut.op_ostr, dut.rq_idx);
   end
 
   integer gp = 0;
   always @(posedge clk) if (!rst && dut.u_pos.we_en && gp < 6) begin
-    $display("  POSW#%0d addr=%0d d0=%04x  mt=%0d di=%0d ntok=%0d idx0=%0d tblq0=%02x", gp, dut.u_pos.we_addr, dut.u_pos.we_data[15:0], dut.u_pos.mt, dut.u_pos.di, dut.u_pos.n_tok, dut.u_pos.idx_q[15:0], dut.u_pos.tbl_q[7:0]);
+    $display("  POSW#%0d addr=%0d d0=%04x  row_tile=%0d feat=%0d ntok=%0d idx0=%0d tbl_q0=%02x", gp, dut.u_pos.we_addr, dut.u_pos.we_data[15:0], dut.u_pos.row_tile, dut.u_pos.feat, dut.u_pos.n_tok, dut.u_pos.idx_word[15:0], dut.u_pos.pos_tbl_q[7:0]);
     gp = gp + 1;
   end
   integer gr = 0;
-  always @(posedge clk) if (!rst && dut.u_pos.st == 3'd2 && dut.u_pos.ph == 2'd2 && gr < 4) begin
-    $display("  POSR#%0d li=%0d tbl_a=%0d tbl_q[7:0]=%02x  buf 저장", gr, dut.u_pos.li, dut.u_pos.tbl_a, dut.u_pos.tbl_q[7:0]);
+  always @(posedge clk) if (!rst && dut.u_pos.state == 3'd2 && dut.u_pos.ph == 2'd2 && gr < 4) begin
+    $display("  POSR#%0d lane=%0d pos_tbl_addr=%0d pos_tbl_q[7:0]=%02x  row_buf 저장", gr, dut.u_pos.lane, dut.u_pos.pos_tbl_addr, dut.u_pos.pos_tbl_q[7:0]);
     gr = gr + 1;
   end
 
   integer pp = 0;
-  always @(posedge clk) if (!rst && dut.busy && dut.col_v && pp < 4) begin
-    $display("  COL#%0d step=%0d n=%0d acc0=%08x | pb_mult=%08x pb_bias=%08x pb_idx=%0d",
-             pp, dbg_step, dut.col_n, dut.col_d[31:0],
-             dut.pb_mult, dut.pb_bias, dut.pb_idx);
-    $display("        a_rd=%0d/%04x  b_rd=%0d/%02x  q_AIN=%0d q_BIN=%0d q_K=%0d",
-             dut.ar_addr, dut.ar_data[15:0], dut.gb_rd_addr, dut.gb_data[7:0],
-             dut.q_AIN, dut.q_BIN, dut.q_K);
+  always @(posedge clk) if (!rst && dut.busy && dut.col_valid && pp < 4) begin
+    $display("  COL#%0d inst=%0d n=%0d acc0=%08x | rq_scale=%08x rq_bias=%08x rq_idx=%0d",
+             pp, dbg_inst, dut.col_n, dut.col_data[31:0],
+             dut.rq_scale, dut.rq_bias, dut.rq_idx);
+    $display("        a_rd=%0d/%04x  b_rd=%0d/%02x  op_ain=%0d op_bin=%0d op_k=%0d",
+             dut.a_ra_addr, dut.a_ra_data[15:0], dut.gemm_b_rd_addr, dut.gemm_b_data[7:0],
+             dut.op_ain, dut.op_bin, dut.op_k);
     pp = pp + 1;
   end
 
   integer wp = 0;
   always @(posedge clk) if (!rst && dut.busy && dut.a_we_en && wp < 6) begin
-    $display("  WRITE#%0d step=%0d addr=%0d  AOUT=%0d OSTR=%0d cp_mt=%0d cp_n=%0d  d0=%04x",
-             wp, dbg_step, dut.a_we_addr, dut.q_AOUT, dut.q_OSTR,
-             dut.cp_mt, dut.cp_n, dut.a_we_data[15:0]);
+    $display("  WRITE#%0d inst=%0d addr=%0d  AOUT=%0d OSTR=%0d fca_mt=%0d fca_n=%0d  d0=%04x",
+             wp, dbg_inst, dut.a_we_addr, dut.op_aout, dut.op_ostr,
+             dut.fca_mt, dut.fca_n, dut.a_we_data[15:0]);
     wp = wp + 1;
   end
 
   initial begin
-    $display("[tb_evt_head] EvT_Engine 앞단 7 step  (샘플0 t0, 토큰 %0d)", NTOK);
+    $display("[tb_evt_head] EvT_Engine 앞단 명령어 7개  (샘플0 t0, 토큰 %0d)", NTOK);
     $readmemh("../data/wmem.hex",  wimg);
-    $readmemh("../data/pbmem.hex", pbimg);
-    $readmemh("../data/pgmem.hex", pgimg);
-    $readmemh("../data/stepmem.hex", simg);
+    $readmemh("../data/rqmem.hex", rqimg);
+    $readmemh("../data/afmem.hex", afimg);
+    $readmemh("../data/instmem.hex", instimg);
     $readmemh("../data/board/t0_x.hex",   ximg);
     $readmemh("../data/board/t0_pidx.hex", qimg);
     $readmemh("../data/posmem.hex", posimg);
@@ -313,7 +313,7 @@ module tb_evt_head;
     // latent 초기값 : `inp_q`(Z) 와 `latent_vectors`(LATV) 가 같은 값에서 시작
     load_lat(R_Z); load_lat(R_LATV);
 
-    $display("-- 실행 (step 0..7)");
+    $display("-- 실행 (inst 0..7)");
     @(negedge clk); start = 1;
     cyc = 0; fin = 1'b0;
     while (!fin && cyc < 3000000) begin
@@ -325,7 +325,7 @@ module tb_evt_head;
     @(negedge clk); start = 0;
     repeat (8) @(posedge clk);
     if (!fin) begin
-      $display("=== TIMEOUT  state=%0d step=%0d ===", dbg_state, dbg_step);
+      $display("=== TIMEOUT  state=%0d inst=%0d ===", dbg_state, dbg_inst);
       $finish;
     end
     $display("     %0d 사이클", cyc);
@@ -333,17 +333,17 @@ module tb_evt_head;
     $display("-- LNX k=0 앞 8레인 (하드웨어 / 골든)");
     for (i = 0; i < 8; i = i + 1)
       $display("     lane %0d : %0d / %0d", i,
-               $signed(dut.u_amem0.mem[R_LNX][i*16 +: 16]),
+               $signed(dut.u_a_mem0.mem[R_LNX][i*16 +: 16]),
                $signed(g_lnx[0][i*16 +: 16]));
     $display("-- LNX mt=1 k=0 앞 6레인 (하드웨어 / 골든)");
     for (i = 0; i < 6; i = i + 1)
       $display("     lane %0d : %0d / %0d", i,
-               $signed(dut.u_amem0.mem[R_LNX + 128][i*16 +: 16]),
+               $signed(dut.u_a_mem0.mem[R_LNX + 128][i*16 +: 16]),
                $signed(g_lnx[128][i*16 +: 16]));
     $display("-- LN1 k=0 앞 8레인 (하드웨어 / 골든)");
     for (i = 0; i < 8; i = i + 1)
       $display("     lane %0d : %0d / %0d", i,
-               $signed(dut.u_amem0.mem[R_LN1][i*16 +: 16]),
+               $signed(dut.u_a_mem0.mem[R_LN1][i*16 +: 16]),
                $signed(g_ln1[0][i*16 +: 16]));
 
     $display("-- A_Mem 대조 (기대값 = 골든 MAC 피연산자)");

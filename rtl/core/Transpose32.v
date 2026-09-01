@@ -6,13 +6,8 @@
 //
 // ## 왜 필요한가 — attention 에서 V 만 전치가 필요합니다
 //
-// 시스톨릭 코어는 `C = A·B` 를 계산하는데, **A 와 B 둘 다 워드가 reduce 인덱스로
-// 주소되고 레인이 non-reduce 인덱스**입니다:
-//
-//     A_Mem[a_base + mt*K + k] 레인 i = A[mt*32+i][k]
-//     W_Mem[w_base + nt*K + k] 레인 j = B[k][nt*32+j]
-//
-// attention 의 두 MAC 을 이 형태에 맞춰 보면:
+// `Gemm_Core` 는 **A 와 B 둘 다 워드가 reduce 인덱스, 레인이 non-reduce 인덱스**
+// 로 읽습니다. attention 의 두 MAC 을 그 형태에 맞춰 보면:
 //
 //   Q·Kᵀ   C[m][n] = Σ_d Q[m][d]·K[n][d]        reduce = d (head_dim 32)
 //          A 워드[d] 레인 = query,  B 워드[d] 레인 = key
@@ -39,6 +34,8 @@
 // 읽기는 **조합**입니다. 소비자(Skew_Buf)가 어차피 레지스터를 물고 있어서 여기서
 // 한 단 더 잡으면 지연만 늘어납니다.
 // -----------------------------------------------------------------------------
+`timescale 1ns/1ps
+
 module Transpose32 #(
     parameter N = 32,
     parameter W = 8

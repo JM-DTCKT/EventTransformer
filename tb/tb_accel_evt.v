@@ -5,7 +5,7 @@
 // 일어나는 순서**를 그대로 밟습니다:
 //
 //   1회      W / PB / PG / Step 을 DMA (LOAD_SEL → LOAD_BASE → 스트림)
-//   샘플마다  latinit → Z, LATV / bkv → BKV, N_TIME 쓰고 start
+//   샘플마다  latinit → Z, LATV / bkv → BKV, N_TSTEP 쓰고 start
 //   타임스텝  STATUS.tok_req 대기 → t 읽기 → X/PIN DMA → TOK_N → TOK_ACK
 //   끝        STATUS.done 대기 → RES_CLASS
 //
@@ -42,7 +42,7 @@ module tb_accel_evt;
   wire        m_tvalid, m_tlast;
   wire [SW-1:0] m_tdata;
 
-  top dut (
+  Top dut (
     .aclk(aclk), .aresetn(aresetn),
     .s_axi_awaddr(awaddr), .s_axi_awprot(3'd0), .s_axi_awvalid(awvalid),
     .s_axi_awready(awready), .s_axi_wdata(wdata), .s_axi_wstrb(4'hF),
@@ -78,9 +78,9 @@ module tb_accel_evt;
 
   // ---- 메모리 이미지 (hex 한 줄 = 워드 하나, MSB 먼저) ----
   reg [255:0] wimg  [0:W_WORDS-1];
-  reg [255:0] pbimg [0:PB_WORDS-1];
-  reg [255:0] pgimg [0:PG_WORDS-1];
-  reg [255:0] simg  [0:S_WORDS-1];
+  reg [255:0] rqimg [0:PB_WORDS-1];
+  reg [255:0] afimg [0:PG_WORDS-1];
+  reg [255:0] instimg  [0:S_WORDS-1];
   reg [511:0] limg  [0:LAT_WORDS-1];
   reg [511:0] bimg  [0:BKV_WORDS-1];
   reg [511:0] ximg  [0:TT*144-1];
@@ -115,9 +115,9 @@ module tb_accel_evt;
       for (k = 0; k < nw; k = k + 1)
         case (which)
           0: push({256'd0, wimg[k]},  nb, k == nw-1);
-          1: push({256'd0, pbimg[k]}, nb, k == nw-1);
-          2: push({256'd0, pgimg[k]}, nb, k == nw-1);
-          3: push({256'd0, simg[k]},  nb, k == nw-1);
+          1: push({256'd0, rqimg[k]}, nb, k == nw-1);
+          2: push({256'd0, afimg[k]}, nb, k == nw-1);
+          3: push({256'd0, instimg[k]},  nb, k == nw-1);
           4: push(limg[k],            nb, k == nw-1);
           5: push(bimg[k],            nb, k == nw-1);
           6: push(ximg[k],            nb, k == nw-1);
@@ -142,9 +142,9 @@ module tb_accel_evt;
   initial begin
     $display("[tb_accel_evt] AXI 래퍼 — 보드 순서 그대로 (타임스텝 1개)");
     $readmemh("../data/wmem.hex",  wimg);
-    $readmemh("../data/pbmem.hex", pbimg);
-    $readmemh("../data/pgmem.hex", pgimg);
-    $readmemh("../data/stepmem.hex", simg);
+    $readmemh("../data/rqmem.hex", rqimg);
+    $readmemh("../data/afmem.hex", afimg);
+    $readmemh("../data/instmem.hex", instimg);
     $readmemh("../data/latinit.hex", limg);
     $readmemh("../data/bkv.hex", bimg);
     $readmemh("../data/board/t0_x.hex",   ximg);

@@ -1,11 +1,11 @@
-"""골든에서 **step 별 기대 A_Mem 내용**을 뽑아 통합 TB 용 hex 로
+"""골든에서 **명령어별 기대 A_Mem 내용**을 뽑아 통합 TB 용 hex 로
 
-    python3 golden_steps.py --sample 0 --step_t 0
+    python3 golden_insts.py --sample 0 --tstep 0
 
 ## 왜 MAC 피연산자를 쓰는가
 
 A_Mem 의 어떤 영역이 맞는지 확인하려면 "그 영역이 담아야 할 int8 코드" 가 필요합니다.
-모듈 훅은 **실수값**을 주므로 step 으로 나눠 코드로 만들어야 하는데, 그 매핑 표
+모듈 훅은 **실수값**을 주므로 scale 로 나눠 코드로 만들어야 하는데, 그 매핑 표
 자체가 틀리기 쉽습니다.
 
 대신 **`MAC_PROBE` 가 모든 GEMM 의 int8 피연산자 `a` 를 그대로 줍니다.** 어떤 GEMM 의
@@ -16,7 +16,7 @@ A_Mem 의 어떤 영역이 맞는지 확인하려면 "그 영역이 담아야 �
     A_Mem[EV1] == proc_ev.4 의 a
     A_Mem[EV]  == cross_attention 의 K/V proj 가 읽는 a (layer_norm_x 출력)
 
-즉 **어떤 step 의 출력은 다음 step 의 입력으로 검증**됩니다.
+즉 **어떤 명령어의 출력은 다음 명령어의 입력으로 검증**됩니다.
 
 ## 이름으로 짝지어야 합니다 (README §5 ③)
 
@@ -71,7 +71,7 @@ def w_hex(path, words, bits=16):
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split('\n')[0])
     ap.add_argument('--sample', type=int, default=0)
-    ap.add_argument('--step_t', type=int, default=0, help='몇 번째 타임스텝')
+    ap.add_argument('--tstep', type=int, default=0, help='몇 번째 타임스텝')
     ap.add_argument('--single', action='store_true',
                     help='그 타임스텝 **하나만** 넣어 돌립니다 (통합 TB 와 동일)')
     ap.add_argument('--dst', default=os.path.join(DATA, 'golden'))
@@ -88,7 +88,7 @@ def main():
     # 이걸 안 하면 골든은 정확한 GELU, RTL 은 PWL 이라 int8 출력이 곳곳에서
     # 1 LSB 씩 어긋나고, 그 차이가 뒤 레이어에서 증폭돼 **진짜 버그와 구분이
     # 안 됩니다.** 맞춰 두면 남은 불일치는 전부 RTL 버그입니다.
-    #   · GELU  : 64세그먼트 PWL (`GELU/verilog/gelu_pwl.v` 와 비트 동일)
+    #   · GELU  : 64세그먼트 PWL (`rtl/gelu/Gelu_Pwl.v` 와 비트 동일)
     #   · 잔차  : `x_input` 을 preproc 출력의 int8 격자로 (A_Mem 이 int8 이라)
     #   · gelu1 뒤는 int8 화 **안 함** — 하드웨어가 Q4.11 16b 를 그대로 저장
     from hw_format import build as hw_build                # noqa: E402
@@ -96,16 +96,16 @@ def main():
 
     pol, pix, label = pre.sample(args.sample)
     T = pol.shape[0]
-    assert args.step_t < T, (args.step_t, T)
-    t_sel = args.step_t
+    assert args.tstep < T, (args.tstep, T)
+    t_sel = args.tstep
 
     # ---- proc_events 의 중간/최종값 (RES 와 LayerNorm 을 따로 짚기 위해) ----
-    # MAC 피연산자만으로는 step 3~5 가 한 덩어리라 어디서 틀렸는지 안 보입니다.
+    # MAC 피연산자만으로는 명령어 3~5 가 한 덩어리라 어디서 틀렸는지 안 보입니다.
     # seq_init 출력(ReLU 뒤 실수)과 블록 출력(잔차 뒤 실수)을 받아 각각
     # int8 코드 / bf16 비트로 만들어 둡니다.
     SEQ5_STEP = 0.019990921020507812
     # 이 블록은 **타임스텝마다** 불립니다 — 호출을 순서대로 모아 두고 뒤에서
-    # `step_t` 번째를 고릅니다 (마지막 것만 남기면 t=0 을 못 봅니다).
+    # `tstep` 번째를 고릅니다 (마지막 것만 남기면 t=0 을 못 봅니다).
     box = {'seq': [], 'ev': []}
     blk0 = model.get_submodule('backbone.proc_event_blocks.0')
     blk0.seq_init.register_forward_hook(
@@ -143,7 +143,7 @@ def main():
     if args.single:
         # 통합 TB 는 타임스텝 **하나**를 돌립니다 (`n_time=1`). 골든도 같은
         # 조건으로 돌려야 latent 누적과 분류기 출력까지 그대로 대조됩니다.
-        pol, pix = pol[args.step_t:args.step_t + 1], pix[args.step_t:args.step_t + 1]
+        pol, pix = pol[args.tstep:args.tstep + 1], pix[args.tstep:args.tstep + 1]
         T = 1
     with torch.no_grad():
         _e, logits = model(pol, pix)
@@ -151,7 +151,7 @@ def main():
     pred = int(logits.float().argmax(-1)[0])
 
     tags = [m['tag'] for m in macs]
-    print(f'[golden_steps] 샘플 {args.sample}  T={T}  label={label} pred={pred}')
+    print(f'[golden_insts] 샘플 {args.sample}  T={T}  label={label} pred={pred}')
     print(f'  MAC {len(macs)}개')
 
     # ---- K144 / K160 은 유일 : T 전체에 한 번 ----
@@ -166,19 +166,19 @@ def main():
     if args.single:
         a160 = a160[None] if a160.ndim == 2 else a160
     assert a160.ndim == 3, a160.shape
-    pin_t = a160[0 if args.single else args.step_t]        # (Npad, 160)
+    pin_t = a160[0 if args.single else args.tstep]        # (Npad, 160)
 
     # 유효 토큰만 (앞쪽 0 패딩이므로 뒤에서 n_tok 개)
     off = int(pre.samples[args.sample][0])
-    n_tok = int(pre.index[off + args.step_t][1])
+    n_tok = int(pre.index[off + args.tstep][1])
     pin = pin_t[-n_tok:].astype(np.int64)
-    print(f'  타임스텝 {args.step_t} : 유효 토큰 {n_tok}  PIN {pin.shape}')
+    print(f'  타임스텝 {args.tstep} : 유효 토큰 {n_tok}  PIN {pin.shape}')
 
     # ---- 타임스텝 안의 linear_K128 순번 ----
     # 순서: proc_ev.1, proc_ev.4, in_proj.Q, in_proj.K, in_proj.V, ...
     k128 = [i for i, t in enumerate(tags) if t == 'linear_K128']
     per_t = len(k128) // T
-    base = k128[(0 if args.single else args.step_t) * per_t]
+    base = k128[(0 if args.single else args.tstep) * per_t]
     names = ['proc_ev.1', 'proc_ev.4', 'in_proj.Q', 'in_proj.K', 'in_proj.V']
     print(f'  linear_K128 {len(k128)}개 = 타임스텝당 {per_t}개')
 
@@ -192,7 +192,7 @@ def main():
 
     # 호출 t 의 텐서 (n, B, E) → (n_tok, E)
     def pick(lst):
-        a = np.squeeze(lst[0 if args.single else args.step_t].numpy())
+        a = np.squeeze(lst[0 if args.single else args.tstep].numpy())
         assert a.ndim == 2, a.shape
         return a[-n_tok:]
 
@@ -204,8 +204,8 @@ def main():
     for k, nm in enumerate(names):
         a = np.squeeze(macs[base + k]['a']).astype(np.int64)
         if a.ndim == 3:
-            a = a[0 if args.single else args.step_t]
-        # 토큰 축 step 은 유효분만, latent 축 step 은 전부
+            a = a[0 if args.single else args.tstep]
+        # 토큰 축 명령어는 유효분만, latent 축 명령어는 전부
         if a.shape[0] > 96:
             a = a[-n_tok:]
         out[nm] = a
@@ -264,13 +264,13 @@ def main():
     if 'embs_site' in box:
         mfj = json.load(open(os.path.join(
             QUANT, 'fpga_export', 'DVS128_10', 'manifest.json')))
-        rstep = next(f['lsb'] for f in mfj['nonlinear_formats']
+        rscale = next(f['lsb'] for f in mfj['nonlinear_formats']
                      if f['site'] == 'backbone.proc_embs_block.relu.in')
         y = np.squeeze(box['embs_site'].numpy())
-        out['TFFN'] = np.clip(np.round(np.maximum(y, 0.0) / rstep),
+        out['TFFN'] = np.clip(np.round(np.maximum(y, 0.0) / rscale),
                               -128, 127).astype(np.int64)
         print(f"    TFFN    a{out['TFFN'].shape}  범위 {out['TFFN'].min()}~"
-              f"{out['TFFN'].max()}  (step {rstep:.6g})  열합[0]="
+              f"{out['TFFN'].max()}  (scale {rscale:.6g})  열합[0]="
               f"{int(out['TFFN'][:, 0].sum())}")
 
     # ---- 누적 latent (LATV) — bf16 ----
@@ -322,7 +322,7 @@ def main():
     for nm, arr in out.items():
         wr = lane_words(arr)
         w_hex(os.path.join(args.dst, f'{nm}.hex'), wr)
-    meta = dict(sample=args.sample, step_t=args.step_t, n_tok=n_tok,
+    meta = dict(sample=args.sample, tstep=args.tstep, n_tok=n_tok,
                 label=label, pred=pred,
                 shapes={k: list(v.shape) for k, v in out.items()},
                 words={k: (v.shape[0] + N - 1) // N * v.shape[1]

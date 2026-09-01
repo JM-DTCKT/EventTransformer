@@ -28,10 +28,10 @@ module tb_softmax_attn;
   wire [7:0]       out_c;
   wire [N*8-1:0]   out_data;
 
-  softmax_top #(.N(N), .CMAX(CMAX)) dut (
-    .clk(clk), .rst(rst), .start(start), .C(C), .done(done),
+  Softmax_Top #(.N(N), .CMAX(CMAX)) dut (
+    .clk(clk), .rst(rst), .start(start), .n_col(C), .done(done),
     .in_valid(in_valid), .in_data(in_data),
-    .out_valid(out_valid), .out_c(out_c), .out_data(out_data));
+    .out_valid(out_valid), .out_n(out_c), .out_data(out_data));
 
   reg [N*16-1:0] score [0:LK-1];
   reg [N*8-1:0]  gold  [0:LK-1];

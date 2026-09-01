@@ -1,18 +1,16 @@
 // -----------------------------------------------------------------------------
 // Pos_Gather : positional encoding 을 **온칩 표**에서 모아 PIN 뒤쪽에 씁니다
 //
-// 전에는 호스트가 타임스텝마다 pos enc 를 워드 레이아웃으로 펴서 DDR 에 올렸고
-// 그 이미지가 **96.7 MB** 였습니다. 정보량은 표 27.6 KB + `pos_idx`(토큰당 2B,
-// 전체 0.47 MB) 뿐이라 200배를 펼쳐 보낸 셈입니다. 이 모듈이 그걸 없앱니다.
+// pos enc 는 `pos_idx` 만으로 정해지고 표는 고정입니다. 호스트가 워드 레이아웃
+// 으로 펴서 보내면 96.7 MB 인데, 표(27.6 KB) 를 PL 에 두고 타임스텝마다
+// `pos_idx`(최대 246 B) 만 받으면 됩니다.
 //
-// ## 왜 쌌나 (처음엔 비싸다고 봤습니다)
+// ## 레인마다 다른 주소가 필요한데도 싼 이유
 //
-// A_Mem 워드는 32레인이 서로 다른 토큰이라 "레인마다 다른 주소"가 필요합니다.
-// 워드 하나를 만들 때마다 32번 읽으면 타일당 64x32 = 2,048 사이클이라 비쌉니다.
-//
-// 그런데 표를 **행 단위로 넓게**(한 행 = 64특징 = 512비트) 두면 **한 토큰의 64개
-// 값이 한 번의 읽기**로 나옵니다. 그 뒤는 축을 돌리는 문제이고, 그건 이미
-// `Transpose32`(V 전용 corner-turn)로 풀어 둔 것과 같습니다.
+// A_Mem 워드는 32레인이 서로 다른 토큰이라, 워드 하나를 만들 때마다 표를 32번
+// 읽으면 타일당 64x32 = 2,048 사이클입니다. 대신 표를 **행 단위로 넓게**
+// (한 행 = 64특징 = 512비트) 두면 **한 토큰의 64개 값이 한 번의 읽기**로
+// 나옵니다. 그 뒤는 `Transpose32` 와 같은 축 변환 문제입니다.
 //
 //     타일 하나(토큰 32개)
 //       ① 표에서 32행 읽기       96 사이클   (토큰당 3위상 — BRAM 지연)
@@ -20,21 +18,21 @@
 //       ③ A_Mem 에 64워드 쓰기   64 사이클   (레인 = 토큰)
 //                              ~160 사이클/타일
 //
-// 타임스텝당 최대 4타일 = 650 사이클 남짓. 타임스텝 하나가 53만 사이클이니
+// 타임스텝당 최대 4타일 = 650 사이클 남짓 — 타임스텝 하나가 53만 사이클이니
 // **0.1 %** 입니다.
 //
 // ## 쓰는 곳
 //
-//   PIN[a_base + mt*ostr + 96 + d]  레인 i = TBL[pos_idx[mt*32+i]][d]
+//   PIN[a_base + row_tile*ostr + 96 + d]  레인 i = 표[pos_idx[row_tile*32+i]][d]
 //
 // 앞 96워드는 `event_projection` 이 채웁니다 — 그래서 stride 가 160 입니다.
 // 유효 토큰(n_tok)을 넘는 레인은 0 으로 둡니다.
 //
-// ## pos_idx 는 A_Mem 에서
-//
-// 타임스텝당 최대 123개(246 B)라 따로 포트를 두지 않고 A_Mem 의 작은 영역을
-// 씁니다. 워드 mt 의 레인 i = 토큰 mt*32+i 의 인덱스 (int16).
+// `pos_idx` 는 타임스텝당 최대 123개(246 B)라 따로 포트를 두지 않고 A_Mem 의
+// 작은 영역에서 읽습니다 (워드 row_tile 의 레인 i = 토큰 row_tile*32+i 의 인덱스).
 // -----------------------------------------------------------------------------
+`timescale 1ns/1ps
+
 module Pos_Gather #(
     parameter N      = 32,        // 레인 = 토큰
     parameter FEAT   = 64,        // pos enc 특징 수
@@ -71,96 +69,93 @@ module Pos_Gather #(
     // =========================================================================
     // 표 : 441행 x 64바이트. 행 하나가 한 토큰의 pos enc 전부입니다.
     // =========================================================================
-    reg [FEAT*8-1:0] tbl [0:(1<<AW_T)-1];
-    reg [FEAT*8-1:0] tbl_q;
-    reg [AW_T-1:0]   tbl_a;
+    reg [FEAT*8-1:0] pos_tbl [0:(1<<AW_T)-1];
+    reg [FEAT*8-1:0] pos_tbl_q;
+    reg [AW_T-1:0]   pos_tbl_addr;
     always @(posedge clk) begin
-        if (ld_we) tbl[ld_addr] <= ld_data;
-        tbl_q <= tbl[tbl_a];        // 주소를 잡은 **다음** 사이클에 나옵니다
+        if (ld_we) pos_tbl[ld_addr] <= ld_data;
+        pos_tbl_q <= pos_tbl[pos_tbl_addr];        // 주소를 잡은 **다음** 사이클에 나옵니다
     end
 
     // 32행 x 64바이트 전치 버퍼. 열 d 를 읽으면 32레인이 나옵니다.
-    reg [FEAT*8-1:0] buf_r [0:N-1];
+    reg [FEAT*8-1:0] row_buf [0:N-1];
 
-    localparam S_IDLE=3'd0, S_IDX=3'd1, S_ROW=3'd2, S_OUT=3'd3, S_DONE=3'd4;
-    reg [2:0]        st;
-    reg [5:0]        mt;           // 행타일
-    reg [5:0]        li;           // 타일 안 레인
-    reg [6:0]        di;           // 특징
+    localparam ST_IDLE=3'd0, ST_IDX=3'd1, ST_ROW=3'd2, ST_OUT=3'd3, ST_DONE=3'd4;
+    reg [2:0]        state;
+    reg [5:0]        row_tile;           // 행타일
+    reg [5:0]        lane;           // 타일 안 레인
+    reg [6:0]        feat;           // 특징
     reg [1:0]        ph;
-    reg [N*16-1:0]   idx_q;        // 이 타일의 pos_idx 32개
-    wire [5:0]       mt_last = (n_tok > 0) ? ((n_tok - 1'b1) >> 5) : 6'd0;
+    reg [N*16-1:0]   idx_word;        // 이 타일의 pos_idx 32개
+    wire [5:0]       row_tile_last = (n_tok > 0) ? ((n_tok - 1'b1) >> 5) : 6'd0;
 
     // 열 d 를 32레인으로 (유효 토큰 밖은 0)
     integer c;
-    reg [N*16-1:0] col_w;
+    reg [N*16-1:0] col_word;
     always @* begin
-        col_w = {(N*16){1'b0}};
+        col_word = {(N*16){1'b0}};
         for (c = 0; c < N; c = c + 1)
-            if ({mt, 5'd0} + c[5:0] < n_tok)
-                col_w[c*16 +: 16] = {{8{buf_r[c][di[5:0]*8+7]}},
-                                     buf_r[c][di[5:0]*8 +: 8]};
+            if ({row_tile, 5'd0} + c[5:0] < n_tok)
+                col_word[c*16 +: 16] = {{8{row_buf[c][feat[5:0]*8+7]}},
+                                     row_buf[c][feat[5:0]*8 +: 8]};
     end
 
     integer z;
     always @(posedge clk) begin
         if (rst) begin
-            st <= S_IDLE; done <= 1'b0; mt <= 0; li <= 0; di <= 0; ph <= 0;
+            state <= ST_IDLE; done <= 1'b0; row_tile <= 0; lane <= 0; feat <= 0; ph <= 0;
             rd_en <= 1'b0; we_en <= 1'b0;
         end else begin
             rd_en <= 1'b0; we_en <= 1'b0;
-            case (st)
-                S_IDLE: begin
+            case (state)
+                ST_IDLE: begin
                     done <= 1'b0;
-                    if (start) begin mt <= 0; ph <= 0; st <= S_IDX; end
+                    if (start) begin row_tile <= 0; ph <= 0; state <= ST_IDX; end
                 end
-                // 이 타일의 pos_idx 워드 하나를 읽습니다.
-                // `rd_en`/`rd_addr` 이 **레지스터 출력**이라 BRAM 이 주소를 보는
-                // 것이 한 사이클 뒤입니다. 그래서 3위상 (발행 → 대기 → 수신)
-                // 입니다 — 두 위상으로 두면 직전 주소의 데이터를 잡습니다.
-                S_IDX: begin
+                // 이 타일의 pos_idx 워드 하나를 읽습니다. `rd_en`/`rd_addr` 이
+                // 레지스터 출력이라 BRAM 이 주소를 보는 것이 한 사이클 뒤입니다
+                // → 3위상 (발행 → 대기 → 수신).
+                ST_IDX: begin
                     if (ph == 2'd0) begin
                         rd_en   <= 1'b1;
-                        rd_addr <= idx_base + {{(AW_A-6){1'b0}}, mt};
+                        rd_addr <= idx_base + {{(AW_A-6){1'b0}}, row_tile};
                     end
                     ph <= ph + 1'b1;
                     if (ph == 2'd2) begin
-                        idx_q <= rd_data;
-                        li <= 0; ph <= 0; st <= S_ROW;
+                        idx_word <= rd_data;
+                        lane <= 0; ph <= 0; state <= ST_ROW;
                     end
                 end
                 // 토큰마다 표에서 한 행씩 (같은 이유로 3위상)
-                S_ROW: begin
-                    if (ph == 2'd0) tbl_a <= idx_q[li*16 +: AW_T];
+                ST_ROW: begin
+                    if (ph == 2'd0) pos_tbl_addr <= idx_word[lane*16 +: AW_T];
                     ph <= ph + 1'b1;
                     if (ph == 2'd2) begin
-                        buf_r[li[4:0]] <= tbl_q;
+                        row_buf[lane[4:0]] <= pos_tbl_q;
                         ph <= 0;
-                        if (li == N - 1) begin di <= 0; st <= S_OUT; end
-                        else li <= li + 1'b1;
+                        if (lane == N - 1) begin feat <= 0; state <= ST_OUT; end
+                        else lane <= lane + 1'b1;
                     end
                 end
                 // 특징마다 워드 하나 (레인 = 토큰)
-                S_OUT: begin
+                ST_OUT: begin
                     we_en   <= 1'b1;
-                    // `di` 는 7비트입니다 — `di[AW_A-1:0]` 처럼 범위를 넘겨
-                    // 잘라 쓰면 Verilog 는 **조용히 X** 를 줍니다 (주소 전체가 X
-                    // 가 돼 PIN 뒤쪽이 통째로 안 써졌습니다). 이 프로젝트에서
-                    // 세 번째로 만난 같은 함정입니다.
-                    we_addr <= a_base + mt * ostr[AW_A-1:0]
+                    // [함정] `feat` 는 7비트입니다. `feat[AW_A-1:0]` 처럼 폭을
+                    // 넘겨 잘라 쓰면 Verilog 가 **조용히 X** 를 줍니다.
+                    we_addr <= a_base + row_tile * ostr[AW_A-1:0]
                              + (ostr[AW_A-1:0] - FEAT)
-                             + {{(AW_A-7){1'b0}}, di};
-                    we_data <= col_w;
-                    if (di == FEAT - 1) begin
-                        if (mt == mt_last) st <= S_DONE;
-                        else begin mt <= mt + 1'b1; ph <= 0; st <= S_IDX; end
-                    end else di <= di + 1'b1;
+                             + {{(AW_A-7){1'b0}}, feat};
+                    we_data <= col_word;
+                    if (feat == FEAT - 1) begin
+                        if (row_tile == row_tile_last) state <= ST_DONE;
+                        else begin row_tile <= row_tile + 1'b1; ph <= 0; state <= ST_IDX; end
+                    end else feat <= feat + 1'b1;
                 end
-                S_DONE: begin
+                ST_DONE: begin
                     done <= 1'b1;
-                    if (!start) st <= S_IDLE;
+                    if (!start) state <= ST_IDLE;
                 end
-                default: st <= S_IDLE;
+                default: state <= ST_IDLE;
             endcase
         end
     end

@@ -1,22 +1,15 @@
 // -----------------------------------------------------------------------------
-// layernorm_top : `LAYERNORM/layernorm_unit` 래퍼 — A_Mem 읽기 + affine + 재양자화
+// LayerNorm_Top : `LayerNorm_Unit` 래퍼 — A_Mem 읽기 + affine + 재양자화
 //
-// 새 코어는 **정규화만** 합니다 (BF16 열 in → signed Q4.11 열 out). EvT 가
-// 필요로 하는 나머지 셋을 여기서 붙입니다:
+// 코어는 **정규화만** 합니다 (bf16 또는 Q4.11 열 in → signed Q4.11 열 out).
+// EvT 가 필요로 하는 나머지 셋을 여기서 붙입니다:
 //
 //   ① A_Mem 읽기   코어는 스트림만 받습니다. 행타일 M/32 개를 **끊지 않고**
-//                  연달아 밀어 넣어야 3단 Tile 파이프라인이 겹칩니다.
-//   ② affine       gamma/beta 는 PG_Mem 에 있습니다. 코어 주석은 "다음 Linear 에
-//                  접어라" 지만, 그러면 가중치 양자화 격자가 바뀌어 골든과
-//                  어긋납니다. 여기서 예전 판과 똑같이 `LN_Affine` 을 씁니다.
-//   ③ 재양자화     Q4.11 → int8 (스칼라 M, shift). 예전 판과 동일.
-//
-// ## 왜 바꿨나
-//
-// 예전 판은 3패스(Σx → Σctr² → xhat)로 원소당 4~6 사이클, 타일당 14E = 1,792
-// 사이클이었습니다. 타임스텝에 LayerNorm 이 13번 x 3타일이라 약 7만 사이클입니다.
-// 새 코어는 수신하면서 Σx·Σx² 를 같이 구하고 Tile 3개를 겹쳐 타일당 133 사이클
-// 입니다.
+//                  연달아 밀어 넣어야 코어의 3단 Tile 파이프라인이 겹칩니다.
+//   ② affine       gamma/beta 를 `LayerNorm_Affine` 으로 적용합니다. 다음 Linear
+//                  의 가중치에 접어 넣을 수도 있지만, 그러면 가중치 양자화
+//                  격자가 바뀌어 골든과 어긋납니다.
+//   ③ 재양자화     Q4.11 → int8 (스칼라 mult, shift)
 //
 // ## in_shift — 고정소수점 창
 //
@@ -27,9 +20,11 @@
 //
 //     골든 `.in` frac_bits = f  →  표현 범위 2^(15-f)  →  xsh = f - 8
 //
-// (여유 1비트. `schedule_evt.py` 가 manifest 에서 계산해 GSH 필드로 실어 옵니다.)
+// (여유 1비트. `sw/schedule_evt.py` 가 manifest 에서 계산해 SHIFT2 로 실어 옵니다.)
 // -----------------------------------------------------------------------------
-module layernorm_top #(
+`timescale 1ns/1ps
+
+module LayerNorm_Top #(
     parameter N      = 32,          // 레인 = 행
     parameter E      = 128,         // 정규화 축 (컴파일타임 — 코어 D)
     parameter DIM_W  = 16,
@@ -52,9 +47,9 @@ module layernorm_top #(
     input  wire [N*16-1:0]      rd_data,
 
     // gamma/beta (특징 k 별, 전 레인 공유)
-    output wire [DIM_W-1:0]     p_addr,
-    input  wire signed [15:0]   p_gamma,    // Q1.14
-    input  wire signed [15:0]   p_beta,     // Q4.11
+    output wire [DIM_W-1:0]     af_addr,
+    input  wire signed [15:0]   af_gamma,    // Q1.14
+    input  wire signed [15:0]   af_beta,     // Q4.11
 
     // Q4.11 → int8
     input  wire signed [31:0]   mult,
@@ -80,26 +75,21 @@ module layernorm_top #(
     reg              rrun, rd_v;
     wire             core_iready;
 
-    // **주소를 조합으로 내고 매 사이클 전진합니다.**
-    //
-    // 처음엔 `in_ready` 를 보고 멈췄다 가게 했는데, 주소가 레지스터라 데이터가
-    // 2사이클 뒤에 오는 바람에 수락 판정과 어긋나 **첫 열이 중복**되고 이후가
-    // 한 칸씩 밀렸습니다 (타일 0 은 통계가 조금만 흔들려 거의 맞고, 타일 1
-    // 부터 완전히 달라졌습니다).
-    //
-    // 우리 쓰임에서는 멈출 일이 없습니다 — 코어 슬롯이 3개이고 LN 한 번의
-    // 행타일이 최대 3개(M<=96)라 `in_ready` 가 내려가지 않습니다. 그래서 흐름을
-    // 끊지 않고, 혹시 내려가면 `stall_err` 로 드러나게 해 둡니다.
+    // **주소를 조합으로 내고 매 사이클 전진합니다** — `in_ready` 를 보고 멈추지
+    // 않습니다. 이 설계에서는 멈출 일이 없기 때문입니다: 코어 슬롯이 3개이고
+    // LN 한 번의 행타일이 최대 3개(M<=96)라 `in_ready` 가 안 내려갑니다.
+    // [함정] 멈추게 만들면 주소가 레지스터라 데이터가 2사이클 뒤에 와서 수락
+    // 판정과 어긋나 첫 열이 중복되고 이후가 한 칸씩 밀립니다. 혹시 내려가면
+    // `stall_err` 로 드러나게 해 두었습니다.
     assign rd_en_w   = rrun;
     assign rd_addr_w = a_base + rmt * E[AW-1:0] + rk[AW-1:0];
 
     reg stall_err;
     reg [N*16-1:0] rd_data_q;
     reg            rd_v_q;
-    // `rrun` 은 **마지막 주소를 낸 순간** 내려가는데 `done` 은 출력이 5단 뒤라
-    // 아직 0 입니다. 그 사이에 `start` 가 계속 1 이면 같은 step 이 **다시
-    // 시작**합니다 (399 열이 나왔습니다). 한 번 걸면 `start` 가 내려갈 때까지
-    // 다시 안 걸리게 래치합니다.
+    // [함정] `rrun` 은 마지막 주소를 낸 순간 내려가는데 `done` 은 출력이 5단 뒤라
+    // 아직 0 입니다. 그 사이에 `start` 가 계속 1 이면 같은 명령어가 **다시
+    // 시작**합니다. 한 번 걸면 `start` 가 내려갈 때까지 다시 안 걸리게 래치합니다.
     reg armed;
     always @(posedge clk) begin
         if (rst) begin
@@ -109,12 +99,9 @@ module layernorm_top #(
         end else begin
             if (!start) armed <= 1'b0;
             rd_v <= rd_en_w;                     // A_Mem 1사이클 뒤 데이터
-            // ---- 코어 입력 파이프 한 단 ----
-            // A_Mem BRAM 출력 → (깊이 캐스케이드 + 팬아웃 98 배선) → 코어의
-            // `bf16_to_fix`/`Q411_To_Fix` → 첫 파이프 레지스터가 한 사이클이라
-            // 150 MHz 에서 7.246 ns 였습니다.  여기서 끊으면 BRAM·배선(2.7 ns)과
-            // 포맷 변환(4.5 ns)이 갈립니다.  값은 안 바뀌고 LN step 당 1사이클만
-            // 늘어납니다 (13 step x 20 타임스텝 = 241 사이클/샘플, 0.015 %).
+            // [타이밍] BRAM 출력 → 배선 → 코어의 포맷 변환기 → 첫 파이프
+            // 레지스터가 한 사이클이었습니다 (7.2 ns). 여기서 끊으면 BRAM·배선과
+            // 포맷 변환이 갈립니다. LN 명령어당 1사이클만 늘어납니다 (0.015 %).
             rd_v_q    <= rd_v;
             rd_data_q <= rd_data;
             if (rd_v_q && !core_iready) stall_err <= 1'b1;  // 있으면 안 되는 일
@@ -137,7 +124,7 @@ module layernorm_top #(
     wire            core_ov, core_olast;
     wire [N*16-1:0] core_ocol;
 
-    layernorm_unit #(.LANE(N), .D(E), .DLOG(7), .XSW(XSW), .SRAM_LAT(1), .NB(3))
+    LayerNorm_Unit #(.LANE(N), .D(E), .DLOG(7), .XSW(XSW), .SRAM_LAT(1), .NB(3))
     u_core (
         .clk(clk), .rst_n(~rst),
         .in_valid(rd_v_q), .in_ready(core_iready),
@@ -148,7 +135,7 @@ module layernorm_top #(
     // =========================================================================
     // affine → 재양자화. 출력 순서가 곧 (타일, 특징) 이라 세면 됩니다.
     // =========================================================================
-    // step 마다 0 부터 세야 합니다. 안 그러면 두 번째 LN 부터 타일 번호가
+    // 명령어마다 0 부터 세야 합니다 — 안 그러면 두 번째 LN 부터 타일 번호가
     // 이어져 쓰기 주소도 `done` 판정도 어긋납니다.
     reg [5:0]       omt;
     reg [DIM_W-1:0] ok;
@@ -159,10 +146,10 @@ module layernorm_top #(
             else ok <= ok + 1'b1;
         end
     end
-    assign p_addr = ok;        // gamma/beta 는 특징 k 로 색인
+    assign af_addr = ok;        // gamma/beta 는 특징 k 로 색인
 
-    // PG_Mem 은 주소를 준 **다음** 사이클에 답합니다. 그래서 코어 출력을 한 단
-    // 늦춰 gamma/beta 와 짝을 맞춥니다 (안 맞추면 한 특징씩 밀린 계수를 곱합니다).
+    // Affine_Mem 은 주소를 준 **다음** 사이클에 답합니다. 코어 출력을 한 단 늦춰
+    // gamma/beta 와 짝을 맞춥니다 (안 맞추면 한 특징씩 밀린 계수를 곱합니다).
     reg              core_ov_d;
     reg [N*16-1:0]   core_ocol_d;
     always @(posedge clk) begin
@@ -176,9 +163,9 @@ module layernorm_top #(
     generate
         for (g = 0; g < N; g = g + 1) begin : LANE
             wire signed [15:0] yaff;
-            LN_Affine u_aff (
+            LayerNorm_Affine u_aff (
                 .clk(clk), .rst(rst), .in_valid(core_ov_d),
-                .xhat(core_ocol_d[g*16 +: 16]), .gamma(p_gamma), .beta(p_beta),
+                .xhat(core_ocol_d[g*16 +: 16]), .gamma(af_gamma), .beta(af_beta),
                 .out_valid(av[g]), .y(yaff));
 
             wire signed [7:0] y8;
@@ -191,8 +178,8 @@ module layernorm_top #(
         end
     endgenerate
 
-    // 지연만큼 (타일, 특징) 을 늦춥니다 — 정렬 1단 + LN_Affine 2단 + Requant 2단
-    localparam LAT = 6;   // 정렬 1 + LN_Affine 2 + Requant_Int **3**
+    // 지연만큼 (타일, 특징) 을 늦춥니다 — 정렬 1 + LayerNorm_Affine 2 + Requant_Int 3
+    localparam LAT = 6;   // 정렬 1 + LayerNorm_Affine 2 + Requant_Int **3**
     reg [5:0]       mq [0:LAT-1];
     reg [DIM_W-1:0] kq [0:LAT-1];
     integer z;

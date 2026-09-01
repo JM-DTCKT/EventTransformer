@@ -31,9 +31,9 @@ if {[catch {state} st]} { set st "?" }
 puts "target state: $st"
 
 put $data/wmem.bin                      0x10000000
-put $data/pbmem.bin                     0x10100000
-put $data/pgmem.bin                     0x10110000
-put $data/stepmem.bin                   0x10120000
+put $data/rqmem.bin                     0x10100000
+put $data/afmem.bin                     0x10110000
+put $data/instmem.bin                   0x10120000
 put $data/latinit.bin                   0x10130000
 put $data/bkv.bin                       0x10140000
 put $data/posmem.bin                    0x10150000
@@ -44,5 +44,5 @@ put $data/board/board_samples.int32.bin 0x40100000
 
 # 올라갔는지 한 군데만 확인 (fpga_nl 에서 이 한 줄이 여러 번 살렸습니다)
 puts "\nall images written"
-puts "verify: mrd 0x10120000 (first stepmem word)"
+puts "verify: mrd 0x10120000 (first instmem word)"
 mrd 0x10120000 4

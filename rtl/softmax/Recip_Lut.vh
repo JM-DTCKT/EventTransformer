@@ -1,12 +1,12 @@
 // ============================================================================
-//  recip_lut.vh -- 역수 유닛 PWL LUT        (AUTO-GENERATED, do not hand-edit)
+//  Recip_Lut.vh -- 역수 유닛 PWL LUT        (AUTO-GENERATED, do not hand-edit)
 // ----------------------------------------------------------------------------
 //  r(f) = 1/(1+f) ,  f in [0,1)  ->  m = 1+f in [1,2),  r in (0.5,1],  UQ1.17
 //  128 세그먼트 균일분할, 세그먼트 내 위치 16b  (= (SW-1)-SEGB, SW=24)
 //     r = rcp_base_rom[seg] + ((rcp_delta_rom[seg]*frac + (1<<15)) >>> 16)
 //  ROM 폭은 실제 값 범위에 맞춰 최소화 : base 18b(unsigned), delta 11b(signed)
 //  최대 근사오차 = 2.063e-05  (상대오차 <= 4.126e-05)
-//  * 세그먼트 수/RF/EF 를 바꾸면 recip_unit.v 의 SEGB 와 함께 재생성해야 한다.
+//  * 세그먼트 수/RF/EF 를 바꾸면 Recip_Unit.v 의 SEGB 와 함께 재생성해야 한다.
 // ============================================================================
 localparam integer RCP_BW = 18;   // base ROM 폭 (unsigned)
 localparam integer RCP_DW = 11;   // delta ROM 폭 (signed)

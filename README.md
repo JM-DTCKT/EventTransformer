@@ -138,9 +138,9 @@ IDLE → TLOAD → FETCH → DEC → GCONST → RUN → WAIT → NEXT → … �
 |---|---|
 | **TLOAD** | 타임스텝 시작 — 입력 활성값 · `pos_idx` 적재 |
 | **FETCH** | `Inst_Mem` 에서 256비트 inst 워드 읽기 |
-| **DEC** | `q_kind`·`q_cons`·`q_AIN`·`q_AOUT` 등으로 펼침 |
+| **DEC** | `op_kind`·`op_fmt`·`op_ain`·`op_aout` 등으로 펼침 |
 | **GCONST** | 상수(bias · 곱수) 준비 3사이클 |
-| **RUN** | `q_kind` 에 따라 해당 유닛 기동 |
+| **RUN** | `op_kind` 에 따라 해당 유닛 기동 |
 | **WAIT** | 유닛 완료 대기 (RES · MEAN 은 여기서 직접 위상 기계를 돌림) |
 | **NEXT** | inst 포인터 `sp` 증가 |
 | **TSTEP** | 타임스텝 경계 — latent 이월 |
@@ -167,20 +167,20 @@ PS 가 해당 타임스텝의 X 타일을 DMA 로 채우고 `tok_ack` 로 답합
 `EvT_Engine.v` 디코더와 한 벌입니다.
 
 ```
-[ 31: 0] KIND[3:0] CONS[5:4] ACT[7:6] VAR[11:8] FLAG[15:12]
-         SHIFT[21:16] GSH[27:22] FLAG2[31:28]
+[ 31: 0] KIND[3:0] FMT[5:4] ACT[7:6] VAR[11:8] FLAG[15:12]
+         SHIFT[21:16] SHIFT2[27:22] FLAG2[31:28]
 [ 63:32] M        [ 95:64] K        [127:96] NOUT
 [159:128] AIN     [191:160] BIN     [223:192] AOUT
-[255:224] PB[15:0] | OSTR[31:16]
+[255:224] RQ_BASE[15:0] | OSTR[31:16]
 
 KIND  0 GEMM  1 LN  2 SMAX  3 RES  4 MEAN  5 ARGMAX  6 POS
-CONS  0 int8(+ACT)  1 Q4.11→GELU→int8  2 bf16  3 Q6.9(softmax 직결)
+FMT   0 int8(+ACT)  1 Q4.11→GELU→int8  2 bf16  3 Q6.9(softmax 직결)
 VAR   [0] M←n_tok  [1] NOUT←Lk  [2] K←Lk  [3] C←Lk
 FLAG  [0] Transpose32 경유  [1] head-major(OSTR=head stride)  [2] B는 A_Mem
       [3] raw16 — Q4.11 을 int8 로 안 내리고 16비트 그대로 저장
 FLAG2 [0] LayerNorm 입력이 Q4.11 정수 코드
-      [1] RES 두 피연산자가 정수 코드 — PB/OSTR 의 fx 상수로 스케일
-      [2] B 에 bias 토큰이 붙음 (AOUT=bias_k, OSTR=bias_v, PB=스칼라)
+      [1] RES 두 피연산자가 정수 코드 — RQ_BASE/OSTR 의 정수 scale 로 환산
+      [2] B 에 bias 토큰이 붙음 (AOUT=bias_k, OSTR=bias_v, RQ_BASE=스칼라)
       [3] 활성함수 뒤 2차 재양자화
 ```
 
@@ -195,7 +195,7 @@ FLAG2 [0] LayerNorm 입력이 Q4.11 정수 코드
 ```
 rtl/                                            29 .v + 4 .vh, 5,275 줄, 9 디렉토리
 │
-├── top.v                     top          286  보드 최상위 — AXI4-Lite + AXI-Stream
+├── Top.v                     top          286  보드 최상위 — AXI4-Lite + AXI-Stream
 │
 ├── core/                                       엔진 데이터패스
 │   ├── EvT_Engine.v          EvT_Engine  1029  inst 실행 FSM · A_Mem 포트 중재
@@ -210,28 +210,28 @@ rtl/                                            29 .v + 4 .vh, 5,275 줄, 9 디�
 │
 ├── gemm_core/                                  32×32 시스톨릭 배열
 │   ├── Gemm_Core.v           Gemm_Core    339  타일 순서기 · 드레인
-│   ├── PE_Array_Pp.v         PE_Array_Pp   59  mesh
-│   ├── PE_OS_Pp.v            PE_OS_Pp     106  PE — DSP 1,024개의 실체
+│   ├── PE_Array.v         PE_Array   59  mesh
+│   ├── PE_OS.v            PE_OS     106  PE — DSP 1,024개의 실체
 │   └── Skew_Buf.v            Skew_Buf      67  입력 스큐
 │
 ├── layernorm/
-│   ├── layernorm_top.v       …            216  엔진 어댑터
-│   ├── layernorm_unit.v      …            572  코어 — 3타일 파이프라인
-│   ├── LN_Affine.v           LN_Affine     90  gamma / beta
-│   ├── rsqrt_unit.v          rsqrt_unit   140  역제곱근
-│   └── rsqrt_lut.vh                       274  PWL 세그먼트 표
+│   ├── LayerNorm_Top.v       …            216  엔진 어댑터
+│   ├── LayerNorm_Unit.v      …            572  코어 — 3타일 파이프라인
+│   ├── LayerNorm_Affine.v           LayerNorm_Affine     90  gamma / beta
+│   ├── Rsqrt_Unit.v          Rsqrt_Unit   140  역제곱근
+│   └── Rsqrt_Lut.vh                       274  PWL 세그먼트 표
 │
 ├── softmax/
-│   ├── softmax_top.v         …            124  엔진 어댑터
-│   ├── softmax_unit.v        …            433  코어 — 수신 중 max 확정
-│   ├── exp2_unit.v           exp2_unit    130  2ˣ — 레인당 1벌
-│   ├── recip_unit.v          recip_unit   123  역수 — 행별 1벌
-│   ├── exp2_lut.vh                        144
-│   └── recip_lut.vh                       144
+│   ├── Softmax_Top.v         …            124  엔진 어댑터
+│   ├── Softmax_Unit.v        …            433  코어 — 수신 중 max 확정
+│   ├── Exp2_Unit.v           Exp2_Unit    130  2ˣ — 레인당 1벌
+│   ├── Recip_Unit.v          Recip_Unit   123  역수 — 행별 1벌
+│   ├── Exp2_Lut.vh                        144
+│   └── Recip_Lut.vh                       144
 │
 ├── gelu/
-│   ├── gelu_pwl.v            gelu_pwl     113  PWL GELU — Q4.11 → Q4.11
-│   └── gelu_lut.vh                         72  base / delta 64쌍
+│   ├── Gelu_Pwl.v            Gelu_Pwl     113  PWL GELU — Q4.11 → Q4.11
+│   └── Gelu_Lut.vh                         72  base / delta 64쌍
 │
 ├── activation/
 │   └── Activation.v          Activation    80  ReLU — 32레인 일괄
@@ -244,7 +244,7 @@ rtl/                                            29 .v + 4 .vh, 5,275 줄, 9 디�
     ├── Fp32_Add.v            Fp32_Add     161  FP32 가산기 — 잔차 경로
     ├── Fp32_To_Bf16.v        …             55
     ├── Int32_To_Bf16.v       …             50
-    ├── bf16_to_fix.v         bf16_to_fix   84  LayerNorm 입력 변환
+    ├── Bf16_To_Fix.v         Bf16_To_Fix   84  LayerNorm 입력 변환
     └── Q411_To_Fix.v         Q411_To_Fix   86  LayerNorm 입력 변환
 ```
 
@@ -261,17 +261,17 @@ rtl/                                            29 .v + 4 .vh, 5,275 줄, 9 디�
 ```
 top
  └─ EvT_Engine
-     ├─ Gemm_Core ────── PE_Array_Pp ── PE_OS_Pp × 1,024
+     ├─ Gemm_Core ────── PE_Array ── PE_OS × 1,024
      │                └─ Skew_Buf
      ├─ Format_Cast_Act ─┬─ Requant_Int · Requant_Bf16   ← 32 레인
-     │                   ├─ gelu_pwl
+     │                   ├─ Gelu_Pwl
      │                   └─ Activation
-     ├─ layernorm_top ── layernorm_unit ── rsqrt_unit
-     ├─ softmax_top ──── softmax_unit ──┬─ exp2_unit × 32
-     │                                  └─ recip_unit
+     ├─ LayerNorm_Top ── LayerNorm_Unit ── Rsqrt_Unit
+     ├─ Softmax_Top ──── Softmax_Unit ──┬─ Exp2_Unit × 32
+     │                                  └─ Recip_Unit
      ├─ Pos_Gather · Transpose32 · Fp32_Add
      ├─ Axis_Loader · Axis_Dump
-     └─ Bram_Sdp × 5    A_Mem 미러 2 · W · PB · PG · Inst
+     └─ Bram_Sdp × 5    A_Mem 미러 2 · W · Requant · Affine · Inst
 ```
 
 ---
@@ -306,11 +306,11 @@ GEMM 이 뱉는 INT32 누산값을 다음 레이어가 원하는 포맷으로 �
 역양자화·재양자화 + 포맷 변환 + 활성함수를 한 파이프라인에 융합해 **추가 사이클 없이**
 GEMM 출력에 붙어 흐릅니다.
 
-| `CONS` | 경로 | 단수 |
+| `FMT` | 경로 | 단수 |
 |---|---|---|
 | 0 INT8 | requant → [ReLU] → int8 | 3 |
 | 1 Q4.11 | requant → **GELU** → requant → int8 | 9 |
-| 2 BF16 | bf16((acc+b) × step) | 2 |
+| 2 BF16 | bf16((acc+b) × scale) | 2 |
 | 3 Q6.9 | requant → Q6.9 → softmax 직결 | — |
 
 경로마다 길이가 달라, 엔진이 지연선으로 쓰기 주소를 2~9사이클 늦춥니다. GEMM 이 한
@@ -374,7 +374,7 @@ output-stationary 시스톨릭 GEMM. 타일 순서기와 드레인을 담당합�
 공용 타일 순서기(`CLR→STREAM→RD→NEXT`)는 타일이 겹칠 수 없어 쓰지 않고, 여기서만
 쓰는 순서기를 직접 둡니다.
 
-**`PE_Array_Pp`**
+**`PE_Array`**
 
 정방 mesh. A 는 좌→우, B 는 위→아래로 흐르고, 여기에 **파면 두 개가 더** 흐릅니다:
 
@@ -385,7 +385,7 @@ snap   좌→우    마찬가지
 
 둘 다 A 와 같은 속도라 PE[i][j] 는 **자기가 확정되는 사이클에** 값을 받습니다.
 
-**`PE_OS_Pp`** — DSP 1,024개의 실체
+**`PE_OS`** — DSP 1,024개의 실체
 
 원본 `PE_OS` 는 누산기가 DSP48E2 의 P 하나뿐이라, 컬럼을 다 뽑아낼 때까지 다음 타일을
 시작할 수 없었습니다. 타일 주기 `K+114` 중 실제 곱셈은 `K` 뿐이었습니다.
@@ -405,10 +405,10 @@ shadow  : 직전 타일의 최종값을 들고 있음   (pong)  ← 읽어내기
 
 ### `layernorm/`
 
-**`layernorm_top`** — 엔진 어댑터. A_Mem 읽기, affine, 재양자화를 붙여 엔진 규약에
+**`LayerNorm_Top`** — 엔진 어댑터. A_Mem 읽기, affine, 재양자화를 붙여 엔진 규약에
 맞춥니다.
 
-**`layernorm_unit`** — 32행 타일 단위 D축 LayerNorm (bf16 in / Q4.11 out).
+**`LayerNorm_Unit`** — 32행 타일 단위 D축 LayerNorm (bf16 in / Q4.11 out).
 
 ```
 for r in 0..31:  y[r][0..127] = (x[r][.] - mu[r]) / sqrt(var[r] + eps)
@@ -432,7 +432,7 @@ var = 2^-(2IF+2DLOG) · ( (SQ << DLOG) - SX·SX )
 괄호 안이 오차 없는 정수식이라 Cauchy-Schwarz 에 의해 **결과가 절대 음수가 되지
 않습니다.** 나눗셈도 없습니다 — `mu` 는 `SX` 를 소수점만 바꿔 읽은 값입니다.
 
-**`LN_Affine`** — 곱셈기 1개 + 고정 시프트.
+**`LayerNorm_Affine`** — 곱셈기 1개 + 고정 시프트.
 
 ```
 y = sat( (xhat·gamma + (beta << BSHIFT) + (1 << (OSHIFT-1))) >> OSHIFT )
@@ -440,32 +440,32 @@ y = sat( (xhat·gamma + (beta << BSHIFT) + (1 << (OSHIFT-1))) >> OSHIFT )
 
 세 피연산자가 전부 고정소수점 코드라 스케일이 정적으로 정해집니다.
 
-**`rsqrt_unit`** — 정규화 + PWL LUT 방식의 역제곱근. `layernorm_unit` 만 씁니다.
+**`Rsqrt_Unit`** — 정규화 + PWL LUT 방식의 역제곱근. `LayerNorm_Unit` 만 씁니다.
 
 ### `softmax/`
 
-**`softmax_top`** — 엔진 어댑터. 인터페이스가 예전 판과 한 글자도 다르지 않아
+**`Softmax_Top`** — 엔진 어댑터. 인터페이스가 예전 판과 한 글자도 다르지 않아
 `EvT_Engine` 은 안쪽 코어가 바뀐 줄 모릅니다.
 
-**`softmax_unit`** — 32행 타일 단위 T축 softmax (Q6.9 in / Q1.14 out).
+**`Softmax_Unit`** — 32행 타일 단위 T축 softmax (Q6.9 in / Q1.14 out).
 
-`layernorm_unit` 과 같은 구조로 매 클럭 한 열(512b)을 받고, **수신하면서 max 를 확정**
+`LayerNorm_Unit` 과 같은 구조로 매 클럭 한 열(512b)을 받고, **수신하면서 max 를 확정**
 합니다. 별도 패스가 없습니다.
 
 예전 판은 레인 하나를 시분할해 `4·N·C ≈ 6,800` 사이클이 들었고 이를 36번 돌아
 **타임스텝 53만 사이클 중 약 24만**을 softmax 가 썼습니다. 새 코어가 그걸 없앴습니다.
 
-**`exp2_unit`** — softmax 의 exp 입력은 항상 `z = x − max ≤ 0` 이라 `exp(z) ∈ (0,1]`
+**`Exp2_Unit`** — softmax 의 exp 입력은 항상 `z = x − max ≤ 0` 이라 `exp(z) ∈ (0,1]`
 입니다. 자연지수를 그대로 근사하지 않고 **base-2 로 바꾼 뒤 "정수부는 시프트,
 소수부만 LUT"** 로 처리합니다. 레인당 1벌씩 32개.
 
-**`recip_unit`** — 나눗셈 `y_i = e_i / S` 를 "역수 한 번 + 곱셈 N 번"으로 바꿉니다.
+**`Recip_Unit`** — 나눗셈 `y_i = e_i / S` 를 "역수 한 번 + 곱셈 N 번"으로 바꿉니다.
 `S` 는 exp 결과의 합이라 범위가 넓은데, **2의 거듭제곱으로 정규화해 LUT 정의역을
 [1,2) 로 좁힙니다.** 행별 1벌.
 
 ### `gelu/`
 
-**`gelu_pwl`** — Q4.11 → Q4.11 구간선형 GELU. `gelu_lut.vh` 에 base/delta 64쌍이
+**`Gelu_Pwl`** — Q4.11 → Q4.11 구간선형 GELU. `Gelu_Lut.vh` 에 base/delta 64쌍이
 들어 있고, `Format_Cast_Act` 의 Q4.11 경로에서 32레인 병렬로 씁니다.
 
 ### `activation/`
@@ -498,10 +498,10 @@ M   : 오프라인 상수.  M[c] = round(s_x · s_w[c] / lsb_out · 2^sh)
 | **`Fp32_Add`** | FP32 가산기 2단. 잔차 경로에서 씀. 1단은 크기 비교 → 지수 정렬(배럴 시프터) → 가감산, 2단은 정규화 |
 | **`Fp32_To_Bf16`** | FP32 → bf16 (상위 16비트 + 반올림) |
 | **`Int32_To_Bf16`** | INT32 → bf16 (LZC + 정규화) |
-| **`bf16_to_fix`** | bf16 → 고정소수점. `sh = e + SH_OFS + xsh` 라 **입력 지수에 의존** |
+| **`Bf16_To_Fix`** | bf16 → 고정소수점. `sh = e + SH_OFS + xsh` 라 **입력 지수에 의존** |
 | **`Q411_To_Fix`** | Q4.11 → 고정소수점. `sh = SH_OFS + xsh` 로 **입력과 무관** |
 
-`bf16_to_fix` 와 `Q411_To_Fix` 는 `layernorm_unit` 의 입력단에서 **병렬로 놓고 mux 로
+`Bf16_To_Fix` 와 `Q411_To_Fix` 는 `LayerNorm_Unit` 의 입력단에서 **병렬로 놓고 mux 로
 고릅니다.** 예전에는 Q4.11 을 bf16 으로 올려서 넣었는데, 그러면 정규화(LZC + 좌시프트)와
 역정규화(우시프트)가 한 사이클에 **직렬**로 놓여 8.475 ns 가 됐습니다. 각자 목표
 포맷까지 바로 가서 mux 로 합치면 깊이가 절반이 됩니다.
@@ -514,8 +514,8 @@ M   : 오프라인 상수.  M[c] = round(s_x · s_w[c] / lsb_out · 2^sh)
 |---|---|---|
 | **A_Mem** | 512b × 8,192 **× 2 미러** | 7,649 워드 |
 | W_Mem | 256b × 16,384 | 14,000 워드 (437 KB) |
-| PB_Mem | 256b × 1,024 | 860 워드 |
-| PG_Mem | 256b × 256 | 208 워드 |
+| Requant_Mem | 256b × 1,024 | 860 워드 |
+| Affine_Mem | 256b × 256 | 208 워드 |
 | Inst_Mem | 256b × 256 | 123 워드 |
 
 ### A_Mem 이 미러 2벌인 이유
@@ -533,9 +533,9 @@ u_amem1   쓰기 aw_*  ·  읽기 br_*     GEMM(B) · RES(B)
 TDP(True Dual Port)로 바꿔도 포트 수는 그대로이고 포트 폭이 72b → 36b 로 절반이 돼
 이득이 없습니다.
 
-### PB_Mem 은 "레이어 채널 + 뒤에 한 칸"
+### Requant_Mem 은 "레이어 채널 + 뒤에 한 칸"
 
-엔진은 inst 시작(`S_GCONST`)에 `PB + NOUT` 을 한 번 읽습니다. 그 한 칸이 **레이어마다**
+엔진은 명령어 시작(`ST_CONST`)에 `RQ_BASE + NOUT` 을 한 번 읽습니다. 그 한 칸이 **레이어마다**
 있어야 합니다 — 없으면 다음 레이어의 채널 0 을 읽습니다(실제로 그랬고 결과가 −128 로
 포화했습니다).
 
@@ -546,8 +546,9 @@ TDP(True Dual Port)로 바꿔도 포트 수는 그대로이고 포트 폭이 72b
 | `proc_embs.linear1` | 평균(1/96) + 다음 격자 재양자화를 **한 곱수로** |
 | 각 블록 `linear1` | 안 씀 — Q4.11 16비트를 그대로 저장(raw16) |
 
-LayerNorm 은 메모리를 **둘** 씁니다 — PG(gamma/beta, 특징별)와 PB(재양자화 스칼라
-하나). 베이스가 다르므로 필드도 둘입니다: `PB` = 스칼라 자리, `OSTR` = PG 베이스.
+LayerNorm 은 메모리를 **둘** 씁니다 — Affine_Mem(gamma/beta, 특징별)과 Requant_Mem(재양자화
+스칼라 하나). 베이스가 다르므로 필드도 둘입니다: `RQ_BASE` = 스칼라 자리,
+`OSTR` = Affine_Mem 베이스.
 
 ---
 

@@ -1,5 +1,5 @@
 // -----------------------------------------------------------------------------
-// PE_Array_Pp : 정방 mesh 에 **파면 두 개가 더 흐릅니다**
+// PE_Array : 정방 mesh 에 **파면 두 개가 더 흐릅니다**
 //
 //   A     좌→우   amesh[i][j]
 //   B     위→아래 bmesh[i][j]
@@ -7,12 +7,14 @@
 //   snap  좌→우   smesh[i][j]      ← 마찬가지
 //
 // 둘 다 A 와 같은 속도로 흐르므로 PE[i][j] 는 **자기가 확정되는 사이클에** 값을
-// shadow 로 복사하고, 그 다음 사이클에 P 를 비웁니다. 자세한 것은 `PE_OS_Pp.v`.
+// shadow 로 복사하고, 그 다음 사이클에 P 를 비웁니다. 자세한 것은 `PE_OS.v`.
 //
 // `clr_edge` / `snap_edge` 는 `Gemm_Core` 의 32탭 시프트 레지스터가 만듭니다
 // (A 의 `Skew_Buf` 와 같은 삼각형 지연을 1비트로 한 것).
 // -----------------------------------------------------------------------------
-module PE_Array_Pp #(
+`timescale 1ns/1ps
+
+module PE_Array #(
     parameter N      = 32,
     parameter ACT_W  = 8,
     parameter PSUM_W = 32
@@ -44,7 +46,7 @@ module PE_Array_Pp #(
         for (i = 0; i < N; i = i + 1) begin : ROW
             for (j = 0; j < N; j = j + 1) begin : COL
                 wire signed [PSUM_W-1:0] acc_ij;
-                PE_OS_Pp #(.ACT_W(ACT_W), .PSUM_W(PSUM_W)) u_pe (
+                PE_OS #(.ACT_W(ACT_W), .PSUM_W(PSUM_W)) u_pe (
                     .clk(clk), .rst(rst), .ce(ce),
                     .clr_in (cmesh[i][j]), .clr_out (cmesh[i][j+1]),
                     .snap_in(smesh[i][j]), .snap_out(smesh[i][j+1]),

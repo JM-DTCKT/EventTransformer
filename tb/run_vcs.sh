@@ -12,7 +12,7 @@ TB="${1:-tb_evt}"
 # 타임스탬프를 봅니다). 그러면 이번엔 "바이너리 없음"으로 조용히 실패합니다.
 rm -rf "$BUILD/simv_$TB" "$BUILD/simv_$TB.daidir"
 echo ">> compile $TB"
-# EVT_PROF=1 ./run_vcs.sh tb_evt  -> 끝에 step 별 사이클 표를 찍습니다
+# EVT_PROF=1 ./run_vcs.sh tb_evt  -> 끝에 명령어별 사이클 표를 찍습니다
 vcs -full64 -sverilog -timescale=1ns/1ps -notice ${EVT_PROF:++define+EVT_PROF} \
     -y "$U" +libext+.v +incdir+"${U}_dr" +incdir+. +incdir+../rtl +incdir+../rtl/gelu +incdir+../rtl/softmax +incdir+../rtl/layernorm \
     $TB.v ../rtl/*.v ../rtl/*/*.v "$XILINX_VIVADO/data/verilog/src/glbl.v" \

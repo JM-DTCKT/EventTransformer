@@ -1,79 +1,88 @@
-// ============================================================================
-//  softmax_unit.v    --  32행 Tile 단위 T-축 softmax  (Q6.9 in / signed Q1.14 out)
-// ----------------------------------------------------------------------------
-//  attention 의 QK^T 결과 (Tile_M x T) 에 대해 **T 축(키 축)** 으로 softmax 한다.
-//  Tensor Core 출력을 **열 단위(32원소)** 로 받아 32 x T Tile 을 모으고,
-//  32개 행의 softmax 를 한꺼번에 처리한다.
+// -----------------------------------------------------------------------------
+// Softmax_Unit : 32행 Tile 단위 T-축 softmax  (Q6.9 in / signed Q1.14 out)
 //
-//     for r in 0..Tile_M-1:  y[r][0..T-1] = softmax( x[r][0..T-1] )
+// attention 의 QK^T 결과 (LANE x T) 에 대해 **T 축(키 축)** 으로 softmax 한다.
+// GEMM 코어 출력을 **열 단위(32원소)** 로 받아 32 x T Tile 을 모으고,
+// 32개 행의 softmax 를 한꺼번에 처리한다.
 //
-//  [입력]  매 clk "한 열" = 32행 각각의 원소 1개  (Tile_M x DW = 512-bit)
-//    · 열 하나가 32행에 1원소씩이므로 **부분 beat 가 없다** -> keep 마스크 불필요
-//    · T 는 런타임 가변(<= TMAX). 마지막 열에 in_last 를 실어준다.
+//    for r in 0..LANE-1:  y[r][0..T-1] = softmax( x[r][0..T-1] )
 //
-//  [핵심 1] 수신하면서 max 를 같이 구한다
-//    데이터가 어차피 버스를 지나가므로 **비교기 Tile_M개**만 얹으면 추가 사이클/추가
-//    메모리 읽기 없이 행별 max 가 확정된다.  -> 이후 단계엔 max 로직이 아예 없다.
+// ## 입력
 //
-//      rmax[r] <= (t==0) ? x[r] : max(rmax[r], x[r])     매 clk Tile_M개 동시
+// 매 clk "한 열" = 32행 각각의 원소 1개  (LANE x DW = 512-bit)
+// · 열 하나가 32행에 1원소씩이므로 **부분 beat 가 없다** -> keep 마스크 불필요
+// · T 는 런타임 가변(<= TMAX). 마지막 열에 in_last 를 실어준다.
 //
-//  [핵심 2] 3개의 독립 FSM 을 Tile 단위로 파이프라인
-//    한 Tile 안에서는 max 가 전역 의존성이라 RECV 와 EXP 를 겹칠 수 없다.
-//    대신 **서로 다른 Tile** 을 세 단계가 동시에 처리한다.
+// ## 수신하면서 max 를 같이 구한다
 //
-//      Tile k+2 :  [S1 RECV  T=324 clk ]
-//      Tile k+1 :               [S2 EXP+RCP  1+(T+L+4)+(Tile_M+3) = 365 clk ]
-//      Tile k   :                            [S3 MUL  1+(T+L) = 326 clk ]
-//                 주기 = max(324, 365, 326) = 365 clk    (L = BRAM_LAT = 1)
+// 데이터가 어차피 버스를 지나가므로 **비교기 LANE개**만 얹으면 추가 사이클/추가
+// 메모리 읽기 없이 행별 max 가 확정된다.  -> 이후 단계엔 max 로직이 아예 없다.
 //
-//    S1 RECV    : in_col -> xbuf[뱅크] + rmax 갱신                    T clk
-//    S2 EXP+RCP : z = x - rmax[r] -> exp2_unit xTile_M -> ebuf[뱅크] T+L+4 clk
-//                 (BRAM 읽기 L단 + exp 파이프 4단)
-//                 행별 sum Tile_M개 누산, 이어서 행별 1/S 를 recip 1개로  Tile_M+3 clk
-//    S3 MUL     : y = e * R[r] >> (p[r]+3) -> out_col              T+L clk
+//     rmax[r] <= (t==0) ? x[r] : max(rmax[r], x[r])     매 clk LANE개 동시
 //
-//  [버퍼를 몇 벌 두는가]  "생산자와 소비자가 서로 다른 Tile 을 동시에 다루는가"
-//    xbuf : S1(Tile k+2 수신) ‖ S2(Tile k+1 소비) -> 다른 Tile -> **2 뱅크**
-//           뱅크 하나 = TMAX word x (Tile_M*DW) = 32 x T 원소 전부 = 166 kbit
-//    ebuf : S2(Tile k+1 생산) ‖ S3(Tile k 소비)   -> 다른 Tile -> **2 뱅크**
-//           뱅크 하나 = TMAX word x (Tile_M*EW)                     = 176 kbit
-//    rr/pp/etlen 도 Tile 별 상태라 2벌 (작음)
-//    합계 : xbuf 332 kbit + ebuf 352 kbit = 684 kbit
+// ## 3개의 독립 FSM 을 Tile 단위로 파이프라인
 //
-//    ebuf 를 2벌로 둔 이유는 **S2 와 S3 가 서로 다른 연산기를 쓰는데 1벌이면
-//    직렬화되기 때문**이다.  1벌일 때는 EXP 동안 곱셈기 32개가, MUL 동안 exp
-//    유닛 32개가 놀아서 가동률이 ~48% 였다.  2벌이면 둘 다 ~90% 로 올라간다.
+// 한 Tile 안에서는 max 가 전역 의존성이라 RECV 와 EXP 를 겹칠 수 없다.
+// 대신 **서로 다른 Tile** 을 세 단계가 동시에 처리한다.
 //
-//  [메모리 추론]  xbuf + ebuf = 684 kbit 라 FF 로는 불가능하다 (68만 개).
-//    둘 다 **등록형 read** 로 작성해 BRAM(simple dual-port) 으로 추론되게 했다.
-//    조합 read 로 두면 distributed RAM 이 되어 LUT 을 수천 개 먹는다.
-//    읽기 지연은 파라미터 BRAM_LAT 로 조절한다 :
-//      1 = BRAM 코어만        -> 주기 365, e2e(3) = 1,745 clk   (기본)
-//      2 = 출력 레지스터까지  -> 주기 366, e2e(3) = 1,749 clk
-//    차이가 4 clk (0.2%) 뿐이므로 **사이클이 아니라 타이밍 클로저로 정한다**.
-//    ~400MHz 까지는 1 로 충분하고, 500MHz 에서 WNS 가 음수면 2 로 올리면 된다
-//    (BRAM 출력 레지스터 사용).  파라미터 한 줄이라 합성 후 뒤집어도 된다.
+//     Tile k+2 :  [S1 RECV  T=324 clk ]
+//     Tile k+1 :               [S2 EXP+RCP  1+(T+L+4)+(LANE+3) = 365 clk ]
+//     Tile k   :                            [S3 MUL  1+(T+L) = 326 clk ]
+//                주기 = max(324, 365, 326) = 365 clk    (L = BRAM_LAT = 1)
 //
-//  [고정소수점 포맷]
-//    x (in_col)   signed   Q6.9    16b   범위 [-64, 64),  LSB 2^-9 = 1.95e-3
-//    z (내부)     signed   Q7.9    17b   = x - max,  범위 (-128, 0]
-//    e (내부)     unsigned UQ1.16  17b   exp 결과 (0,1],  1.0 = 2^16
-//    S (내부)     unsigned UQ10.16 26b   sum(e), 범위 [1, TMAX]
-//    R (내부)     unsigned UQ1.17  18b   1/m  (m = S/2^p, m in [1,2))
-//    y (out_col)  **signed** Q1.14 16b   범위 [0,1],      1.0 = 2^14 = 16'h4000
-//                 (부호 1 + 정수 1 + 소수 14).  softmax 출력은 항상 >= 0 이고
-//                 y <= 1.0 = 0x4000 < 0x8000 이므로 **부호비트가 절대 서지 않는다**
-//                 -> 포화(saturation) 로직 불필요.  TB 에서 전 원소 검증한다.
+// S1 RECV    : in_col -> xbuf[뱅크] + rmax 갱신                    T clk
+// S2 EXP+RCP : z = x - rmax[r] -> Exp2_Unit xLANE -> ebuf[뱅크] T+L+4 clk
+//                (BRAM 읽기 L단 + exp 파이프 4단)
+//                행별 sum LANE개 누산, 이어서 행별 1/S 를 recip 1개로  LANE+3 clk
+// S3 MUL     : y = e * R[r] >> (p[r]+3) -> out_col              T+L clk
 //
-//    y = e/S = e*R*2^-p  이므로  y_out = (e*R) >> (p + RF - OF) = >> (p+3)
-//    * e(17b) x R(18b) = 18s x 19s -> DSP48 (25x18 / 27x18) 1개에 정확히 들어간다.
-//    * 시프트량 p 는 **행마다 다르므로** lane 별 배럴 시프터가 필요하다
-//      (p in [16,24] -> sh in [19,27], 9가지뿐이라 9:1 mux 규모).
-// ============================================================================
+// ## 버퍼를 몇 벌 두는가
+//
+// "생산자와 소비자가 서로 다른 Tile 을 동시에 다루는가"
+// xbuf : S1(Tile k+2 수신) ‖ S2(Tile k+1 소비) -> 다른 Tile -> **2 뱅크**
+//          뱅크 하나 = TMAX word x (LANE*DW) = 32 x T 원소 전부 = 166 kbit
+// ebuf : S2(Tile k+1 생산) ‖ S3(Tile k 소비)   -> 다른 Tile -> **2 뱅크**
+//          뱅크 하나 = TMAX word x (LANE*EW)                     = 176 kbit
+// rr/pp/etlen 도 Tile 별 상태라 2벌 (작음)
+// 합계 : xbuf 332 kbit + ebuf 352 kbit = 684 kbit
+//
+// ebuf 를 2벌로 둔 이유는 **S2 와 S3 가 서로 다른 연산기를 쓰는데 1벌이면
+// 직렬화되기 때문**이다.  1벌일 때는 EXP 동안 곱셈기 32개가, MUL 동안 exp
+// 유닛 32개가 놀아서 가동률이 ~48% 였다.  2벌이면 둘 다 ~90% 로 올라간다.
+//
+// ## 메모리 추론
+//
+// xbuf + ebuf = 684 kbit 라 FF 로는 불가능하다 (68만 개).
+// 둘 다 **등록형 read** 로 작성해 BRAM(simple dual-port) 으로 추론되게 했다.
+// 조합 read 로 두면 distributed RAM 이 되어 LUT 을 수천 개 먹는다.
+// 읽기 지연은 파라미터 BRAM_LAT 로 조절한다 :
+//     1 = BRAM 코어만        -> 주기 365, e2e(3) = 1,745 clk   (기본)
+//     2 = 출력 레지스터까지  -> 주기 366, e2e(3) = 1,749 clk
+// 차이가 4 clk (0.2%) 뿐이므로 **사이클이 아니라 타이밍 클로저로 정한다**.
+// ~400MHz 까지는 1 로 충분하고, 500MHz 에서 WNS 가 음수면 2 로 올리면 된다
+// (BRAM 출력 레지스터 사용).  파라미터 한 줄이라 합성 후 뒤집어도 된다.
+//
+// ## 고정소수점 포맷
+//
+// x (in_col)   signed   Q6.9    16b   범위 [-64, 64),  LSB 2^-9 = 1.95e-3
+// z (내부)     signed   Q7.9    17b   = x - max,  범위 (-128, 0]
+// e (내부)     unsigned UQ1.16  17b   exp 결과 (0,1],  1.0 = 2^16
+// S (내부)     unsigned UQ10.16 26b   sum(e), 범위 [1, TMAX]
+// R (내부)     unsigned UQ1.17  18b   1/m  (m = S/2^p, m in [1,2))
+// y (out_col)  **signed** Q1.14 16b   범위 [0,1],      1.0 = 2^14 = 16'h4000
+//                (부호 1 + 정수 1 + 소수 14).  softmax 출력은 항상 >= 0 이고
+//                y <= 1.0 = 0x4000 < 0x8000 이므로 **부호비트가 절대 서지 않는다**
+//                -> 포화(saturation) 로직 불필요.  TB 에서 전 원소 검증한다.
+//
+// y = e/S = e*R*2^-p  이므로  y_out = (e*R) >> (p + RF - OF) = >> (p+3)
+// * e(17b) x R(18b) = 18s x 19s -> DSP48 (25x18 / 27x18) 1개에 정확히 들어간다.
+// * 시프트량 p 는 **행마다 다르므로** lane 별 배럴 시프터가 필요하다
+//     (p in [16,24] -> sh in [19,27], 9가지뿐이라 9:1 mux 규모).
+// -----------------------------------------------------------------------------
 `timescale 1ns/1ps
 
-module softmax_unit #(
-    parameter integer Tile_M = 32,   // Tile 행 수 (= Tensor Core 타일 행 수)
+module Softmax_Unit #(
+    parameter integer LANE = 32,   // Tile 행 수 (= GEMM 코어 타일 행 수)
     parameter integer TMAX   = 324,  // 최대 T (정규화 축 길이)
     parameter integer DW     = 16,   // 입력 원소 폭 (signed Q6.9)
     parameter integer IF     = 9,    // 입력 소수부 비트수
@@ -88,20 +97,20 @@ module softmax_unit #(
 )(
     input                        clk,
     input                        rst_n,
-    // ---- 입력 : 매 clk 한 열(Tile_M원소), T 회 ----
+    // ---- 입력 : 매 clk 한 열(LANE원소), T 회 ----
     input                        in_valid,
     output                       in_ready,
-    input       [Tile_M*DW-1:0]       in_col,    // Q6.9 x Tile_M (행 r = in_col[r*DW +: DW])
+    input       [LANE*DW-1:0]       in_col,    // Q6.9 x LANE (행 r = in_col[r*DW +: DW])
     input                        in_last,   // 이 Tile 의 마지막 열
-    // ---- 출력 : 매 clk 한 열(Tile_M원소), T 회 ----
+    // ---- 출력 : 매 clk 한 열(LANE원소), T 회 ----
     output reg                   out_valid,
-    output reg  [Tile_M*OW-1:0]       out_col,   // signed Q1.14 x Tile_M (원소 r = [r*OW +: OW])
+    output reg  [LANE*OW-1:0]       out_col,   // signed Q1.14 x LANE (원소 r = [r*OW +: OW])
     output reg                   out_last
 );
     // ---- width 파라미터 ----------------------------------------------------
     localparam integer TW     = $clog2(TMAX);          // = 9,  열 인덱스 폭
     localparam integer TCW    = TW + 1;                // = 10, 열 카운터 폭
-    localparam integer MW     = $clog2(Tile_M);        // = 5,  행 인덱스 폭
+    localparam integer MW     = $clog2(LANE);        // = 5,  행 인덱스 폭
     localparam integer MCW    = MW + 1;                // = 6,  행 카운터 폭
     localparam integer ZW     = DW + 1;                // = 17, z = x - max 폭
     localparam integer SW     = EF + TW + 1;           // = 26, S = sum(e) 폭
@@ -141,18 +150,18 @@ module softmax_unit #(
     end
 
     // ======================================================================
-    //  S1 : 수신 + running max   (Tensor Core 와 독립적으로 굴러감)
+    //  S1 : 수신 + running max   (뒤 단계와 독립적으로 굴러감)
     // ======================================================================
-    reg  [DW-1:0]   rmax [0:1][0:Tile_M-1];      // 행별 max (수신 중 갱신)
+    reg  [DW-1:0]   rmax [0:1][0:LANE-1];      // 행별 max (수신 중 갱신)
     reg  [TCW-1:0]  tlen [0:1];             // 뱅크별 유효 열 수 T
     reg  [TCW-1:0]  wptr;                   // 수신 열 포인터
 
-    wire signed [DW-1:0] xcol     [0:Tile_M-1];
-    wire signed [DW-1:0] rmax_nxt [0:Tile_M-1];
+    wire signed [DW-1:0] xcol     [0:LANE-1];
+    wire signed [DW-1:0] rmax_nxt [0:LANE-1];
     generate
-        for (gr = 0; gr < Tile_M; gr = gr + 1) begin : g_rmax
+        for (gr = 0; gr < LANE; gr = gr + 1) begin : g_rmax
             assign xcol[gr] = in_col[gr*DW +: DW];
-            // 첫 열이면 그대로, 아니면 기존 rmax 와 비교 (비교기 Tile_M개)
+            // 첫 열이면 그대로, 아니면 기존 rmax 와 비교 (비교기 LANE개)
             assign rmax_nxt[gr] = (wptr == {TCW{1'b0}}) ? xcol[gr]
                                 : (($signed(xcol[gr]) > $signed(rmax[wbank][gr]))
                                    ? xcol[gr] : rmax[wbank][gr]);
@@ -163,13 +172,13 @@ module softmax_unit #(
         if (!rst_n) begin
             wbank <= 1'b0;
             wptr  <= {TCW{1'b0}};
-            for (i = 0; i < Tile_M; i = i + 1) begin
+            for (i = 0; i < LANE; i = i + 1) begin
                 rmax[0][i] <= XMIN; rmax[1][i] <= XMIN;
             end
             tlen[0] <= {TCW{1'b0}};  tlen[1] <= {TCW{1'b0}};
         end else if (recv_hs) begin
-            for (i = 0; i < Tile_M; i = i + 1)
-                rmax[wbank][i] <= rmax_nxt[i];               // 비교기 Tile_M개
+            for (i = 0; i < LANE; i = i + 1)
+                rmax[wbank][i] <= rmax_nxt[i];               // 비교기 LANE개
             wptr <= wptr + 1'b1;
             if (in_last) begin                                // Tile 완성
                 tlen[wbank] <= wptr + 1'b1;
@@ -187,10 +196,10 @@ module softmax_unit #(
     reg  [1:0]      estate;
     reg  [TCW-1:0]  ei, ec, etc_;           // 투입/수집 열 포인터, 이번 Tile 의 T
     reg  [MCW-1:0]  qi, qc;                 // 역수 투입/수집 행 포인터
-    reg  [SW-1:0]   sum  [0:Tile_M-1];           // 행별 분모 (S2 안에서만 사용)
+    reg  [SW-1:0]   sum  [0:LANE-1];           // 행별 분모 (S2 안에서만 사용)
 
-    reg  [RW-1:0]   rr    [0:1][0:Tile_M-1];     // 행별 1/m   (Tile 별 상태)
-    reg  [PW-1:0]   pp    [0:1][0:Tile_M-1];     // 행별 p     (Tile 별 상태)
+    reg  [RW-1:0]   rr    [0:1][0:LANE-1];     // 행별 1/m   (Tile 별 상태)
+    reg  [PW-1:0]   pp    [0:1][0:LANE-1];     // 행별 p     (Tile 별 상태)
     reg  [TCW-1:0]  etlen [0:1];            // 뱅크별 T
 
     wire [TW-1:0] e_rd = (ei < etc_) ? ei[TW-1:0] : {TW{1'b0}};
@@ -212,11 +221,11 @@ module softmax_unit #(
     // **뱅크 차원을 주소로 펴 둡니다.** `[0:1][0:TMAX-1]` 처럼 2차원으로 두면
     // Vivado 가 3D-RAM 으로 보고 BRAM 추론을 포기해 **FF 132,096개**로 깔립니다
     // (Synth 8-11357). 그러면 배선이 혼잡도 6 으로 실패합니다.
-    // `layernorm_unit` 의 `xbuf [0:NB*D-1]` 과 같은 형태입니다.
+    // `LayerNorm_Unit` 의 `xbuf [0:NB*D-1]` 과 같은 형태입니다.
     // 주소를 `{뱅크, 열}` 로 이으므로 깊이는 2^(TW+1) 입니다 (TMAX 가 2의
     // 거듭제곱이 아니면 남는 자리가 생기지만 BRAM 한 벌 안이라 무해합니다).
-    reg [Tile_M*DW-1:0] xbuf [0:(2<<TW)-1];     // 입력 Tile
-    reg [Tile_M*DW-1:0] xrd_c;   // BRAM 코어 출력 레지스터 (= 읽기 1단째, 필수)
+    reg [LANE*DW-1:0] xbuf [0:(2<<TW)-1];     // 입력 Tile
+    reg [LANE*DW-1:0] xrd_c;   // BRAM 코어 출력 레지스터 (= 읽기 1단째, 필수)
     reg                 xrv_c;
 
     always @(posedge clk) begin
@@ -230,11 +239,11 @@ module softmax_unit #(
         else        xrv_c <= e_iv;
     end
 
-    wire [Tile_M*DW-1:0] xrd;
+    wire [LANE*DW-1:0] xrd;
     wire                 xrv;
     generate
         if (BRAM_LAT >= 2) begin : g_xoreg  // 선택적 출력 레지스터 추가 -> 총 2단
-            reg [Tile_M*DW-1:0] xrd_r;
+            reg [LANE*DW-1:0] xrd_r;
             reg                 xrv_r;
             always @(posedge clk) xrd_r <= xrd_c;
             always @(posedge clk or negedge rst_n)
@@ -245,17 +254,17 @@ module softmax_unit #(
         end
     endgenerate
 
-    wire [Tile_M-1:0]    exp_ov_v;
-    wire [EW-1:0]   exp_e_v [0:Tile_M-1];
-    wire [Tile_M*EW-1:0] e_pack;
+    wire [LANE-1:0]    exp_ov_v;
+    wire [EW-1:0]   exp_e_v [0:LANE-1];
+    wire [LANE*EW-1:0] e_pack;
     generate
-        for (gr = 0; gr < Tile_M; gr = gr + 1) begin : g_lane
+        for (gr = 0; gr < LANE; gr = gr + 1) begin : g_lane
             wire signed [DW-1:0] xr = xrd[gr*DW +: DW];   // BRAM 출력 (1 clk 지연)
             wire signed [DW-1:0] mr = rmax[xrb][gr];      // ES_EXP 동안 상수
             // 17비트 부호확장 후 뺄셈 : z <= 0 보장
             wire signed [ZW-1:0] zr = {xr[DW-1], xr} - {mr[DW-1], mr};
 
-            exp2_unit #(.ZW(ZW), .ZF(IF), .EW(EW), .EF(EF)) u_exp (
+            Exp2_Unit #(.ZW(ZW), .ZF(IF), .EW(EW), .EF(EF)) u_exp (
                 .clk(clk), .rst_n(rst_n),
                 .in_valid(xrv), .z(zr),
                 .out_valid(exp_ov_v[gr]), .e(exp_e_v[gr])
@@ -265,26 +274,26 @@ module softmax_unit #(
     endgenerate
     wire e_ov = exp_ov_v[0];                 // 전 lane lockstep
 
-    // 역수 유닛 1개를 Tile_M회 파이프라인
-    wire          rcp_iv = (estate == ES_RCP) && (qi < Tile_M);
+    // 역수 유닛 1개를 LANE회 파이프라인
+    wire          rcp_iv = (estate == ES_RCP) && (qi < LANE);
     wire [SW-1:0] rcp_s  = sum[qi[MW-1:0]];
     wire          rcp_ov;
     wire [RW-1:0] rcp_r;
     wire [PW-1:0] rcp_p;
-    recip_unit #(.SW(SW), .RW(RW), .RF(RF), .PW(PW)) u_rcp (
+    Recip_Unit #(.SW(SW), .RW(RW), .RF(RF), .PW(PW)) u_rcp (
         .clk(clk), .rst_n(rst_n),
         .in_valid(rcp_iv), .s(rcp_s),
         .out_valid(rcp_ov), .r(rcp_r), .p(rcp_p)
     );
 
-    assign exp_done = (estate == ES_RCP) && rcp_ov && (qc == Tile_M-1);
+    assign exp_done = (estate == ES_RCP) && rcp_ov && (qc == LANE-1);
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             estate <= ES_IDLE;
             xrb <= 1'b0; ewb <= 1'b0;
             ei <= 0; ec <= 0; etc_ <= 0; qi <= 0; qc <= 0;
-            for (i = 0; i < Tile_M; i = i + 1) sum[i] <= {SW{1'b0}};
+            for (i = 0; i < LANE; i = i + 1) sum[i] <= {SW{1'b0}};
             etlen[0] <= 0; etlen[1] <= 0;
         end else begin
             case (estate)
@@ -292,14 +301,14 @@ module softmax_unit #(
             ES_IDLE: if (xfull[xrb] && !efull[ewb]) begin
                 etc_ <= tlen[xrb];
                 ei <= 0; ec <= 0;
-                for (i = 0; i < Tile_M; i = i + 1) sum[i] <= {SW{1'b0}};
+                for (i = 0; i < LANE; i = i + 1) sum[i] <= {SW{1'b0}};
                 estate <= ES_EXP;
             end
             // ---- exp + 행별 sum 누산
             ES_EXP: begin
                 if (ei < etc_) ei <= ei + 1'b1;              // 매 clk 한 열 투입
                 if (e_ov) begin                               // 5 clk 뒤부터 수집
-                    for (i = 0; i < Tile_M; i = i + 1)             // 행별 독립 누산
+                    for (i = 0; i < LANE; i = i + 1)             // 행별 독립 누산
                         sum[i] <= sum[i] + {{(SW-EW){1'b0}}, exp_e_v[i]};
                     ec <= ec + 1'b1;
                     if (ec == etc_ - 1'b1) begin
@@ -307,14 +316,14 @@ module softmax_unit #(
                     end
                 end
             end
-            // ---- 행별 1/S (Tile_M개 파이프라인)
+            // ---- 행별 1/S (LANE개 파이프라인)
             ES_RCP: begin
-                if (qi < Tile_M) qi <= qi + 1'b1;
+                if (qi < LANE) qi <= qi + 1'b1;
                 if (rcp_ov) begin
                     rr[ewb][qc[MW-1:0]] <= rcp_r;
                     pp[ewb][qc[MW-1:0]] <= rcp_p;
                     qc <= qc + 1'b1;
-                    if (qc == Tile_M-1) begin                      // exp_done 펄스
+                    if (qc == LANE-1) begin                      // exp_done 펄스
                         etlen[ewb] <= etc_;
                         xrb    <= ~xrb;                       // xbuf 뱅크 넘김
                         ewb    <= ~ewb;                       // ebuf 뱅크 넘김
@@ -341,8 +350,8 @@ module softmax_unit #(
     // ==================================================================
     //  ebuf : simple dual-port BRAM   (write = S2,  등록형 read = S3)
     // ==================================================================
-    reg [Tile_M*EW-1:0] ebuf [0:(2<<TW)-1];     // exp 결과
-    reg [Tile_M*EW-1:0] ea_c;    // BRAM 코어 출력 레지스터 (= 읽기 1단째, 필수)
+    reg [LANE*EW-1:0] ebuf [0:(2<<TW)-1];     // exp 결과
+    reg [LANE*EW-1:0] ea_c;    // BRAM 코어 출력 레지스터 (= 읽기 1단째, 필수)
     always @(posedge clk) begin
         if (e_ov) ebuf[{ewb, ec[TW-1:0]}] <= e_pack; // write 포트
         ea_c <= ebuf[{erb, m_rd}];   // read 포트 : 주소 제시 -> 다음 clk 에 데이터
@@ -358,11 +367,11 @@ module softmax_unit #(
         end
     end
 
-    wire [Tile_M*EW-1:0] ea;
+    wire [LANE*EW-1:0] ea;
     wire                 va, la;
     generate
         if (BRAM_LAT >= 2) begin : g_eoreg  // 선택적 출력 레지스터 추가 -> 총 2단
-            reg [Tile_M*EW-1:0] ea_r;
+            reg [LANE*EW-1:0] ea_r;
             reg                 va_r, la_r;
             always @(posedge clk) ea_r <= ea_c;
             always @(posedge clk or negedge rst_n)
@@ -374,9 +383,9 @@ module softmax_unit #(
         end
     endgenerate
 
-    wire [Tile_M*OW-1:0] y_pack;
+    wire [LANE*OW-1:0] y_pack;
     generate
-        for (gr = 0; gr < Tile_M; gr = gr + 1) begin : g_omul
+        for (gr = 0; gr < LANE; gr = gr + 1) begin : g_omul
             wire [EW-1:0]  e_r = ea[gr*EW +: EW];
             // e(17b) x R(18b) -> DSP48 1개.  R 과 p 는 행마다 다름.
             wire [PDW-1:0] prd = e_r * rr[erb][gr];
@@ -395,7 +404,7 @@ module softmax_unit #(
             erb       <= 1'b0;
             mi <= 0; mtc <= 0;
             out_valid <= 1'b0;
-            out_col   <= {(Tile_M*OW){1'b0}};
+            out_col   <= {(LANE*OW){1'b0}};
             out_last  <= 1'b0;
         end else begin
             out_valid <= 1'b0;
@@ -425,9 +434,9 @@ module softmax_unit #(
 
     // ---- 파라미터 정합성 체크 (합성 무관) ---------------------------------
     initial begin
-        if (SH_OFF < 1)   $display("ERROR: softmax_unit RF(%0d) must be > OF(%0d)", RF, OF);
-        if (SW < EF + TW) $display("ERROR: softmax_unit SW too small");
-        if (EW != EF+1)   $display("ERROR: softmax_unit EW must be EF+1");
-        if (RW != RF+1)   $display("ERROR: softmax_unit RW must be RF+1");
+        if (SH_OFF < 1)   $display("ERROR: Softmax_Unit RF(%0d) must be > OF(%0d)", RF, OF);
+        if (SW < EF + TW) $display("ERROR: Softmax_Unit SW too small");
+        if (EW != EF+1)   $display("ERROR: Softmax_Unit EW must be EF+1");
+        if (RW != RF+1)   $display("ERROR: Softmax_Unit RW must be RF+1");
     end
 endmodule
