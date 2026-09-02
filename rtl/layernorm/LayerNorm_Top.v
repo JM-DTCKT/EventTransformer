@@ -124,7 +124,12 @@ module LayerNorm_Top #(
     wire            core_ov, core_olast;
     wire [N*16-1:0] core_ocol;
 
-    LayerNorm_Unit #(.LANE(N), .D(E), .DLOG(7), .XSW(XSW), .SRAM_LAT(1), .NB(3))
+    // [타이밍] SRAM_LAT=2 : BRAM 의 **선택적 출력 레지스터**(DOx_REG) 를 켭니다.
+    // 읽기 지연이 1 -> 2 사이클이 되는 대신 CLK->DOUT 이 0.826 ns 에서 절반 수준
+    // 으로 떨어지고, 뒤따르는 변환기 18 단이 온전히 한 사이클을 씁니다.
+    // (실측 WNS -0.102, xbuf -> g_norm[*].diff_r 계통)
+    // 비용은 타일당 1 사이클 = 전체 39 사이클(0.06 %) 이고 FF 는 BRAM 안이라 0 입니다.
+    LayerNorm_Unit #(.LANE(N), .D(E), .DLOG(7), .XSW(XSW), .SRAM_LAT(2), .NB(3))
     u_core (
         .clk(clk), .rst_n(~rst),
         .in_valid(rd_v_q), .in_ready(core_iready),

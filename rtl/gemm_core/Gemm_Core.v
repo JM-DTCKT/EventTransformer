@@ -72,7 +72,7 @@ module Gemm_Core #(
     output reg                     col_valid,
     output reg  [N*PSUM_W-1:0]     col_data,   // col_data[i] = acc[mt*32+i][n]
     output reg  [DIM_W-1:0]        col_n,      // 전역 출력채널 n
-    output reg  [DIM_W-1:0]        col_mt      // 행 타일
+    output reg  [DIM_W-1:0]        col_mt      // 출력 행 타일
 );
     // =========================================================================
     // ping-pong 누산기 + 타일 파이프라인 — 타일 주기 max(K+4, 36)
@@ -112,7 +112,7 @@ module Gemm_Core #(
     wire [DIM_W-1:0] num_nt  = (Nout + N - 1) / N;
     wire [DIM_W-1:0] snap_tile_ph = K + 16'd3;
     wire [DIM_W-1:0] k_plus4     = K + 16'd4;
-    wire [DIM_W-1:0] tile_period  = (k_plus4 > 16'd36) ? k_plus4 : 16'd36;
+    wire [DIM_W-1:0] tile_period  = (k_plus4 > 16'd36) ? k_plus4 : 16'd36; // Tile 주기 max(K+4, 36)
     // 타일 T 의 컬럼 0 은 T*tile_period + K+34+RD_LEAD 에 뽑습니다. 그때는 이미
     // 타일 T+1 의 주기이므로 위상은 그만큼 뺀 값입니다.
     wire [DIM_W-1:0] rd_trig_tile_ph = K + (34 + RD_LEAD - 1) - tile_period;
@@ -120,10 +120,10 @@ module Gemm_Core #(
     localparam ST_IDLE=2'd0, ST_ISSUE=2'd1, ST_TAIL=2'd2, ST_DONE=2'd3;
     reg [1:0]        state;
     reg [DIM_W-1:0]  tile_ph;                 // 발행 중인 타일의 위상
-    reg [DIM_W-1:0]  mt_iss,  nt_iss;        // 발행 중인 타일
-    reg [DIM_W-1:0]  mt_rd_pend, nt_rd_pend;       // 그 직전 타일 (읽기 대상)
+    reg [DIM_W-1:0]  mt_iss,  nt_iss;        // 발행 중인 타일 idx
+    reg [DIM_W-1:0]  mt_rd_pend, nt_rd_pend;       // Core에서 읽을 차례인(발행이 끝난) 타일 idx
     reg              tile_start;             // clr 파면 주입
-    reg              rd_arm;             // 첫 주기에는 읽을 타일이 없습니다
+    reg              rd_arm;             // 첫 주기에는 읽을 타일이 없습니다 -> 첫 타일 끝에서 1이 된다.
     reg              all_done_r;
     reg [AW_A-1:0]   a_tile_base;
     reg [AW_B-1:0]   b_tile_base;
@@ -137,7 +137,7 @@ module Gemm_Core #(
 
     reg              rd_run;
     reg [5:0]        rd_cnt;
-    reg [DIM_W-1:0]  mt_rd, nt_rd;
+    reg [DIM_W-1:0]  mt_rd, nt_rd; // Core에서 읽는 중인 Tile idx
 
     always @(posedge clk) begin
         tile_start <= 1'b0;
@@ -160,7 +160,7 @@ module Gemm_Core #(
                     end
                 end
                 ST_ISSUE: begin
-                    if (tile_ph == tile_period - 1'b1) begin
+                    if (tile_ph == tile_period - 1'b1) begin // Tile 경계
                         tile_ph     <= {DIM_W{1'b0}};
                         mt_rd_pend  <= mt_iss;  nt_rd_pend <= nt_iss;   // 읽기는 한 타일 뒤
                         rd_arm <= 1'b1;

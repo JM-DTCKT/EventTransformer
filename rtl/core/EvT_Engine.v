@@ -320,7 +320,7 @@ module EvT_Engine #(
     // 실어 옵니다.
 
     reg  [N*16-1:0]  bias_k_word;      // bias_k 워드 (레인 = head_dim)
-    wire             use_bkv     = op_flag2[2];
+    wire             use_bkv     = op_flag2[2]; // 현재 B에 bias token을 끼워넣으라는 flag
     wire             bkv_is_qk   = use_bkv && (op_fmt == FMT_Q69);
     wire             bkv_is_av   = use_bkv && (op_fmt != FMT_Q69);
     wire [AW_A-1:0]  b_word_off  = gemm_b_rd_addr[AW_A-1:0] - op_bin[AW_A-1:0];
@@ -328,11 +328,11 @@ module EvT_Engine #(
     // bias 토큰은 **마지막 키** 입니다. cross 는 Lk = n_tok+1, latent 은 96+1 로
     // 고정이라 `n_tok` 이 아니라 **그 명령어의 Lk** 로 잡아야 합니다.
     //   QK : 출력 열이 키라 Lk = op_nout      AV : reduce 가 키라 Lk = op_k
-    wire [DIM_W-1:0] qk_key      = op_nout - 1'b1;
+    wire [DIM_W-1:0] qk_key      = op_nout - 1'b1; // bias key의 Tile idx
     wire [DIM_W-1:0] av_key      = op_k    - 1'b1;
-    wire [4:0]       qk_lane     = qk_key[4:0];
+    wire [4:0]       qk_lane     = qk_key[4:0]; // bias key의 lane idx
     wire [4:0]       qk_dim      = b_word_off[4:0];   // reduce 인덱스 = head_dim
-    wire             qk_hit      = bkv_is_qk && (b_word_off[AW_A-1:5] == qk_key[AW_A-1:5]);
+    wire             qk_hit      = bkv_is_qk && (b_word_off[AW_A-1:5] == qk_key[AW_A-1:5]); // 현재 Tile과 bias key의 Tile 일치 여부
     wire             av_hit      = bkv_is_av && (b_word_off == av_key[AW_A-1:0]);
 
     // [함정] QK 의 B 워드는 레인 = 키입니다. 마지막 타일에서 `Lk` 를 넘는 레인은
@@ -586,14 +586,36 @@ module EvT_Engine #(
     // Softmax (attention)
     // =========================================================================
     reg             smax_start;
-    wire            smax_done, smax_valid;
+    wire            smax_done, smax_valid, smax_last;
     wire [7:0]      smax_col;
     wire [N*8-1:0]  smax_out;
 
+    // QK 는 행타일 `⌈M/32⌉` 개를 한 명령어로 돕니다. 나눗셈이 아니라 비트 슬라이스
+    // 입니다 (M 은 32 의 배수). OP_SMAX 단독 경로는 예전처럼 타일 1개입니다.
+    wire [5:0] smax_ntile = (op_fmt == FMT_Q69)
+                          ? (op_m[10:5] + {5'd0, |op_m[4:0]}) : 6'd1;
+
     Softmax_Top #(.N(N), .CMAX(TOKMAX+1)) u_smax (
-        .clk(clk), .rst(rst), .start(smax_start), .n_col(op_nout[7:0]), .done(smax_done),
+        .clk(clk), .rst(rst), .start(smax_start), .n_col(op_nout[7:0]),
+        .n_tile(smax_ntile), .out_last(smax_last), .done(smax_done),
         .in_valid(smax_in_valid), .in_data(smax_in_data),
         .out_valid(smax_valid), .out_n(smax_col), .out_data(smax_out));
+
+    // =========================================================================
+    // softmax 출력의 행타일 베이스 — **곱셈 없이 누적**합니다
+    //
+    // `OSTR + smax_mt*SMSTR + col` 을 그대로 쓰면 곱셈기가 A_Mem 주소 경로에 붙고,
+    // CLB 가 95 % 인 상황에서 그 LUT/캐리 사슬을 놓을 자리가 없습니다. 행타일은
+    // 순서대로만 진행하고 증분이 정확히 SMSTR 이라 **덧셈 하나**로 끝납니다
+    // (`Gemm_Core` 의 `a_tile_base`, RES 의 `rs_base_*` 와 같은 처방).
+    // =========================================================================
+    localparam [AW_A-1:0] SMSTR = TOKMAX + 1;      // SM 의 행타일 간 간격
+    reg [AW_A-1:0] smax_wr_base;
+    always @(posedge clk) begin
+        if (!smax_start)                   smax_wr_base <= ostr_as_smax_base;
+        else if (smax_valid && smax_last)  smax_wr_base <= smax_wr_base + SMSTR;
+    end
+
 
     // QK GEMM 의 Q6.9 컬럼을 메모리를 안 거치고 softmax 로 직결합니다.
     // [함정] `smax_start` 로 한 번 더 막습니다 — `op_fmt` 는 ST_DECODE 에서 바뀌는데
@@ -825,8 +847,9 @@ module EvT_Engine #(
 
                 end else if (smax_valid && op_fmt == FMT_Q69) begin
                     // QK 직결 softmax 의 출력 : 워드 = 키, 레인 = latent 행
+                    // 행타일마다 SMSTR 만큼 떨어진 자리에 씁니다 (베이스는 누적).
                     a_we_en   = 1'b1;
-                    a_we_addr = ostr_as_smax_base + {{(AW_A-8){1'b0}}, smax_col};
+                    a_we_addr = smax_wr_base + {{(AW_A-8){1'b0}}, smax_col};
                     for (wr_lane = 0; wr_lane < N; wr_lane = wr_lane + 1)
                         a_we_data[wr_lane*16 +: 16] = {8'd0, smax_out[wr_lane*8 +: 8]};
 

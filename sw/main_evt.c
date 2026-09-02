@@ -75,7 +75,7 @@
 #define R_BKV_BASE   6728
 
 /* ---- 실행 파라미터 (data/schedule.json) ---- */
-#define N_BODY 118
+#define N_BODY 94
 #define N_TAIL 5
 #define POS_ROWS 441         /* 21 x 21 */
 

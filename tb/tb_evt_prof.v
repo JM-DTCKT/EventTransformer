@@ -29,20 +29,20 @@ module tb_evt_prof;
              R_EV1=1732, R_EV=2244, R_LATV=2756, R_Z=3140,
              R_ZATT=3524, R_LNX=3908, R_LN1=4420, R_LNA=4804,
              R_Q=5188, R_K=5572, R_V=6212, R_BKV=6728,
-             R_SM=6752, R_CTX=6881, R_FFN=7265;
-  localparam W_WORDS=14000, PB_WORDS=869, PG_WORDS=208, S_WORDS=123,
+             R_SM=6752, R_CTX=7139, R_FFN=7523;
+  localparam W_WORDS=14000, PB_WORDS=869, PG_WORDS=208, S_WORDS=99,
              LAT_WORDS=384, BKV_WORDS=24;
-  localparam S_QK0 = 11, S_OUTPROJ = 35;      // 스냅 시점 (cross 블록)
-  // 꼬리 : 117 embs.ln  118 embs.linear1  119 MEAN  120 clf.linear_1  121 argmax
-  localparam S_MEAN = 120;
+  localparam S_QK0 = 11, S_OUTPROJ = 27;      // 스냅 시점 (cross 블록)
+  // 꼬리 : 94 embs.ln  95 embs.linear1  96 MEAN  97 clf.linear_1  98 argmax
+  localparam S_MEAN = 96;
   // cross 블록 FFN 체인 스냅 시점 (그 명령어 진입 시 = 직전 명령어 의 출력)
-  //   36 ln_att(입력 ZATT)  37 linear1(입력 LNA)  39 linear2(입력 LNA)
-  //   40 linear3(입력 FFN)
-  localparam S_ZATT = 37, S_LNA1 = 38, S_LNA2 = 40, S_FFN3 = 41;
+  //   29 ln_att(입력 ZATT)  30 linear1(입력 LNA)  32 linear2(입력 LNA)
+  //   33 linear3(입력 FFN)
+  localparam S_ZATT = 29, S_LNA1 = 30, S_LNA2 = 32, S_FFN3 = 33;
 
   reg clk = 0, rst = 1; always #5 clk = ~clk;
 
-  reg  [AW_INST-1:0] n_body = 118, n_tail = 5;
+  reg  [AW_INST-1:0] n_body = 94, n_tail = 5;
   reg  [5:0]      n_tstep = 1;
   reg  [31:0]     eps = 32'h3727c5ac;
   reg             start = 0;

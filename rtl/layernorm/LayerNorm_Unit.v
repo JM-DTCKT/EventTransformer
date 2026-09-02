@@ -232,7 +232,11 @@ module LayerNorm_Unit #(
     //
     //  그룹마다 사본을 두면 배치기가 각 사본을 자기 8레인 근처에 놓아 배선이
     //  짧아진다.  DONT_TOUCH 가 없으면 합성이 다시 하나로 합쳐버린다.
-    localparam integer NG  = 4;                 // 8 레인씩 4 그룹
+    // [타이밍] 4벌(8레인/벌) 에서는 `xsh_g -> x_p` 가 로직 1.665 ns / **배선
+    // 3.744 ns (69 %)** 였습니다 — 논리는 얕은데 사본 하나가 8 레인에 걸쳐
+    // 흩어졌다는 뜻입니다. 8벌(4레인/벌) 로 늘려 사본을 레인 가까이 붙입니다.
+    // 비용은 (XSW+1) x 4 벌 = 약 28 FF 뿐입니다.
+    localparam integer NG  = 8;                 // 4 레인씩 8 그룹
     localparam integer GSZ = LANE / NG;
     (* DONT_TOUCH = "yes" *) reg signed [XSW-1:0] xsh_g [0:NG-1];
     (* DONT_TOUCH = "yes" *) reg                  q4_g  [0:NG-1];
@@ -464,6 +468,24 @@ module LayerNorm_Unit #(
     //   B2 : ds = round(d * 2^-e)  (미리 <<MAXSHL 해두고 단방향 배럴 시프트)
     //   C  : y = round(ds * r >> YSH)  + 포화     -> out_col
     // ======================================================================
+    // [타이밍] S1 의 `xsh_g` 와 같은 처방을 S3 에도 겁니다. `xshift_slot[slot_norm]`
+    // 은 NB:1 먹스 출력인데 그 하나가 32 레인의 배럴 시프터로 뻗어, BRAM 출력 →
+    // 변환 → mu 뺄셈 경로 앞에 배선이 붙습니다 (실측 WNS -0.127 ns, 20 로직단).
+    // 8 레인마다 사본을 두면 배치기가 각 사본을 자기 그룹 근처에 놓습니다.
+    //
+    // 한 단 늦어도 안전합니다 — `slot_norm` 은 S3 가 타일을 잡을 때 확정되고
+    // 첫 `sram_rd` 는 BRAM 지연 때문에 그보다 뒤에 옵니다. 값 자체는 타일 내내
+    // 상수입니다.
+    (* DONT_TOUCH = "yes" *) reg signed [XSW-1:0] xsh_n [0:NG-1];
+    (* DONT_TOUCH = "yes" *) reg                  q4_n  [0:NG-1];
+    integer gn;
+    always @(posedge clk) begin
+        for (gn = 0; gn < NG; gn = gn + 1) begin
+            xsh_n[gn] <= xshift_slot[slot_norm];
+            q4_n [gn] <= q411_slot  [slot_norm];
+        end
+    end
+
     reg                   norm_v1, norm_l1, norm_v2, norm_l2;
     reg  signed [DDW-1:0] diff_r  [0:LANE-1];
     reg  signed [DSW-1:0] dscaled_r [0:LANE-1];
@@ -473,18 +495,19 @@ module LayerNorm_Unit #(
 
     generate
         for (gl = 0; gl < LANE; gl = gl + 1) begin : g_norm
+            localparam integer GN = gl / GSZ;     // 이 레인이 쓸 사본
             // ---- B1 : 재변환 + mu 뺄셈 ------------------------------------
             // xbuf 는 **원본 포맷 그대로** 담으므로 S3 도 같은 분기가 필요합니다.
             wire signed [IW-1:0]  xo_bf, xo_q4;
             wire                  ovb, ovq;
             Bf16_To_Fix #(.IW(IW), .IF(IF), .XSW(XSW)) u_cvt (
-                .bf(sram_rd[gl*16 +: 16]), .xsh(xshift_slot[slot_norm]),
+                .bf(sram_rd[gl*16 +: 16]), .xsh(xsh_n[GN]),
                 .x(xo_bf), .ovf(ovb));
             Q411_To_Fix #(.IW(IW), .IF(IF), .QF(11), .XSW(XSW)) u_cvt_q (
-                .code(sram_rd[gl*16 +: 16]), .xsh(xshift_slot[slot_norm]),
+                .code(sram_rd[gl*16 +: 16]), .xsh(xsh_n[GN]),
                 .x(xo_q4), .ovf(ovq));
-            wire signed [IW-1:0]  xo = q411_slot[slot_norm] ? xo_q4 : xo_bf;
-            assign xo_ovf[gl] = q411_slot[slot_norm] ? ovq : ovb;
+            wire signed [IW-1:0]  xo = q4_n[GN] ? xo_q4 : xo_bf;
+            assign xo_ovf[gl] = q4_n[GN] ? ovq : ovb;
             // d = x - mu 를 Q(MUF) 로 맞춘다 : (X << DLOG) - SX
             wire signed [DDW-1:0] x_aligned = {{(DDW-IW-DLOG){xo[IW-1]}}, xo, {DLOG{1'b0}}};
             wire signed [DDW-1:0] mu_aligned  = {{(DDW-SXW){sum_x[slot_norm][gl][SXW-1]}},

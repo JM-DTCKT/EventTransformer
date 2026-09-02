@@ -140,6 +140,7 @@ def build(n_tok):
     Lk = n_tok + 1                       # +1 = bias_k 토큰 (절대 마스킹 안 됨)
     TT, QT, KT = tiles(TOK_MAX), tiles(LAT), tiles(TOK_MAX + 1)
     KSTR, VSTR = KT * HD, TOK_MAX + 1          # head 간 간격
+    SMSTR = TOK_MAX + 1                        # SM 의 행타일 간 간격 (최악치 고정)
 
     a = Arena()
     # ---- 토큰 경로 ----
@@ -170,7 +171,9 @@ def build(n_tok):
     # 없습니다 — 블록마다 값이 다르기 때문입니다.
     #   레이아웃 : [블록][k/v][head]  레인 = head_dim
     R['BKV']  = a.alloc('BKV',  len(BLOCKS) * 2 * HEADS, 'bias_k/bias_v 토큰 int8')
-    R['SM']   = a.alloc('SM',   TOK_MAX + 1,     'softmax 출력 uint8 (행타일 1개분)')
+    # QK 를 행타일 3개(M=96) 로 합쳤으므로 SM 도 3벌입니다. 스트라이드는
+    # 런타임 `Lk` 가 아니라 **최악치 고정**(TOK_MAX+1) 이라 AV 의 AIN 이 상수로 남습니다.
+    R['SM']   = a.alloc('SM',   QT * SMSTR,      'softmax 출력 uint8 (행타일 QT 벌)')
     R['CTX']  = a.alloc('CTX',  QT * E,          'attn·V 결과 int8 (head 이어붙임)')
     R['FFN']  = a.alloc('FFN',  QT * E,          '블록 내 FFN 중간 int8')
 
@@ -277,27 +280,33 @@ def build(n_tok):
              note='rows 256-383 → Transpose32 → Vᵀ. 마지막 1칸은 bias_v ROM')
         S[-1]['OSTR'] = VSTR           # Vᵀ 는 head 마다 최악치 + bias_v 1칸
 
-        # head x 행타일 : QK → softmax → AV
+        # head 마다 : QK(행타일 3개 한 번에) → softmax → AV x 3
+        #
+        # QK 를 행타일마다 쪼개면 명령어가 softmax 를 기다리느라 배열이 150 사이클씩
+        # 멈추고, `Softmax_Unit` 의 3단 파이프라인(RECV/EXP/MUL)도 타일이 하나뿐이라
+        # 텅 빕니다. `M=LAT` 로 합치면 코어가 행타일 3개를 연달아 발행하므로 배열이
+        # 쉬지 않고, softmax 도 서로 다른 타일로 세 단계가 겹칩니다.
         for h in range(HEADS):
+            S.append(dict(kind=OP_GEMM, name=f'{short}.qk.h{h}',
+                          layer=f'{blk}:QK', M=LAT, K=HD, NOUT=kv_lk,
+                          AIN=R['Q'] + h * QT * HD,
+                          BIN=R['K'] + h * KSTR,             # stride 고정
+                          # AOUT 은 QK 에서 안 쓰므로 bias_k 워드 주소로 씁니다
+                          AOUT=R['BKV'] + (bi * 2 + 0) * HEADS + h,
+                          FMT=FMT_Q69, FLAG2=F2_BKV,
+                          # attention 의 재양자화는 **블록당 스칼라 1개**
+                          RQ_BASE=ARQ[blk]['qk'][0], SHIFT=ARQ[blk]['qk'][2],
+                          # softmax 는 **같은 명령어** 입니다 — QK 의 컬럼이
+                          # 메모리를 안 거치고 바로 들어가고, 나온 uint8 이
+                          # OSTR + mt*SMSTR 자리에 실립니다 (엔진이 mt 를 셉니다).
+                          OSTR=R['SM'],
+                          note=f'Q6.9 → softmax(C=Lk) x{QT}행타일 → SM. 키 Lk-1 = bias_k'))
             for mt in range(QT):
-                S.append(dict(kind=OP_GEMM, name=f'{short}.qk.h{h}.t{mt}',
-                              layer=f'{blk}:QK', M=N, K=HD, NOUT=kv_lk,
-                              AIN=R['Q'] + h * QT * HD + mt * HD,
-                              BIN=R['K'] + h * KSTR,             # stride 고정
-                              # AOUT 은 QK 에서 안 쓰므로 bias_k 워드 주소로 씁니다
-                              AOUT=R['BKV'] + (bi * 2 + 0) * HEADS + h,
-                              FMT=FMT_Q69, FLAG2=F2_BKV,
-                              # attention 의 재양자화는 **블록당 스칼라 1개**
-                              RQ_BASE=ARQ[blk]['qk'][0], SHIFT=ARQ[blk]['qk'][2],
-                              # softmax 는 **같은 명령어** 입니다 — QK 의 컬럼이
-                              # 메모리를 안 거치고 바로 들어가고, 나온 uint8 이
-                              # OSTR 이 가리키는 SM 영역에 실립니다. 명령어를 따로
-                              # 두면 두 번째 start 가 모아 둔 입력을 지웁니다.
-                              OSTR=R['SM'],
-                              note='Q6.9 → softmax(C=Lk) → SM. 키 Lk-1 = bias_k'))
                 S.append(dict(kind=OP_GEMM, name=f'{short}.av.h{h}.t{mt}',
                               layer=f'{blk}:AV', M=N, K=kv_lk, NOUT=HD,
-                              AIN=R['SM'], BIN=R['V'] + h * VSTR, FLAG2=F2_BKV,
+                              # QK 가 SMSTR 간격으로 써 둔 행타일 mt 를 읽습니다
+                              AIN=R['SM'] + mt * SMSTR,
+                              BIN=R['V'] + h * VSTR, FLAG2=F2_BKV,
                               # AV 는 mt=0 하나뿐이라 OSTR 이 남습니다
                               OSTR=R['BKV'] + (bi * 2 + 1) * HEADS + h,
                               AOUT=R['CTX'] + mt * E + h * HD,
@@ -459,7 +468,7 @@ def annotate(S):
                 var |= V_M
         # cross 의 attention 만 Lk 가 토큰에 의존 (latent 는 96+1 상수)
         if nm.startswith('cross'):
-            if '.qk.' in nm:  var |= V_NOUT
+            if '.qk.' in nm:  var |= V_NOUT   # 이름은 f'{short}.qk.h{h}'
             if '.sm.' in nm:  var |= V_C
             if '.av.' in nm:  var |= V_K
         # 라우팅

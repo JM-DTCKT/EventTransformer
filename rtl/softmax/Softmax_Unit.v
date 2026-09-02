@@ -125,9 +125,17 @@ module Softmax_Unit #(
     // ======================================================================
     //  뱅크 full 플래그  (단일 드라이버 — 각 FSM 은 done 펄스만 낸다)
     // ======================================================================
-    reg  [1:0] xfull, efull;      // xbuf / ebuf 뱅크가 소비 대기중인가
-    reg        wbank;             // S1 이 쓰는 xbuf 뱅크
-    reg        xrb, ewb;          // S2 가 읽는 xbuf / 쓰는 ebuf 뱅크
+    // [뱅크 수] xbuf 는 **4 벌**입니다. S1(RECV) 은 GEMM 이 주는 대로 받는데
+    // S2(EXP+RCP) 가 타일당 `T+40` 으로 더 느려서, 행타일을 연달아 받으면 S1 이
+    // `in_ready` 를 내립니다. 그런데 GEMM 에는 백프레셔 경로가 없어 그 컬럼이
+    // **그대로 유실**됩니다(= 타일이 영영 안 끝남). 한 명령어가 주는 행타일이
+    // 최대 3 개(QT)라 4 벌이면 뱅크를 재사용할 일이 없어 S1 이 멈추지 않습니다.
+    // 비용은 xbuf BRAM 뿐이고 rmax/tlen 만 두 벌 늘어납니다.
+    reg  [3:0] xfull;             // xbuf 뱅크가 소비 대기중인가
+    reg  [1:0] efull;             // ebuf 뱅크 (S2->S3 는 S3 가 더 빨라 2 벌로 충분)
+    reg  [1:0] wbank;             // S1 이 쓰는 xbuf 뱅크
+    reg  [1:0] xrb;               // S2 가 읽는 xbuf 뱅크
+    reg        ewb;               // S2 가 쓰는 ebuf 뱅크
     reg        erb;               // S3 가 읽는 ebuf 뱅크
 
     wire recv_hs   = in_valid & in_ready;
@@ -140,7 +148,7 @@ module Softmax_Unit #(
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            xfull <= 2'b00; efull <= 2'b00;
+            xfull <= 4'b0000; efull <= 2'b00;
         end else begin
             if (recv_done) xfull[wbank] <= 1'b1;   // S1 -> S2 로 넘김
             if (exp_done)  xfull[xrb]   <= 1'b0;   // S2 가 xbuf 반납
@@ -152,8 +160,8 @@ module Softmax_Unit #(
     // ======================================================================
     //  S1 : 수신 + running max   (뒤 단계와 독립적으로 굴러감)
     // ======================================================================
-    reg  [DW-1:0]   rmax [0:1][0:LANE-1];      // 행별 max (수신 중 갱신)
-    reg  [TCW-1:0]  tlen [0:1];             // 뱅크별 유효 열 수 T
+    reg  [DW-1:0]   rmax [0:3][0:LANE-1];      // 행별 max (수신 중 갱신)
+    reg  [TCW-1:0]  tlen [0:3];             // 뱅크별 유효 열 수 T (xbuf 4 벌)
     reg  [TCW-1:0]  wptr;                   // 수신 열 포인터
 
     wire signed [DW-1:0] xcol     [0:LANE-1];
@@ -170,19 +178,21 @@ module Softmax_Unit #(
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            wbank <= 1'b0;
+            wbank <= 2'd0;
             wptr  <= {TCW{1'b0}};
             for (i = 0; i < LANE; i = i + 1) begin
                 rmax[0][i] <= XMIN; rmax[1][i] <= XMIN;
+                rmax[2][i] <= XMIN; rmax[3][i] <= XMIN;
             end
             tlen[0] <= {TCW{1'b0}};  tlen[1] <= {TCW{1'b0}};
+            tlen[2] <= {TCW{1'b0}};  tlen[3] <= {TCW{1'b0}};
         end else if (recv_hs) begin
             for (i = 0; i < LANE; i = i + 1)
                 rmax[wbank][i] <= rmax_nxt[i];               // 비교기 LANE개
             wptr <= wptr + 1'b1;
             if (in_last) begin                                // Tile 완성
                 tlen[wbank] <= wptr + 1'b1;
-                wbank       <= ~wbank;
+                wbank       <= wbank + 2'd1;
                 wptr        <= {TCW{1'b0}};
             end
         end
@@ -222,9 +232,9 @@ module Softmax_Unit #(
     // Vivado 가 3D-RAM 으로 보고 BRAM 추론을 포기해 **FF 132,096개**로 깔립니다
     // (Synth 8-11357). 그러면 배선이 혼잡도 6 으로 실패합니다.
     // `LayerNorm_Unit` 의 `xbuf [0:NB*D-1]` 과 같은 형태입니다.
-    // 주소를 `{뱅크, 열}` 로 이으므로 깊이는 2^(TW+1) 입니다 (TMAX 가 2의
+    // 주소를 `{뱅크, 열}` 로 이으므로 깊이는 2^(TW+2) 입니다 (TMAX 가 2의
     // 거듭제곱이 아니면 남는 자리가 생기지만 BRAM 한 벌 안이라 무해합니다).
-    reg [LANE*DW-1:0] xbuf [0:(2<<TW)-1];     // 입력 Tile
+    reg [LANE*DW-1:0] xbuf [0:(4<<TW)-1];     // 입력 Tile (뱅크 4 벌)
     reg [LANE*DW-1:0] xrd_c;   // BRAM 코어 출력 레지스터 (= 읽기 1단째, 필수)
     reg                 xrv_c;
 
@@ -291,7 +301,7 @@ module Softmax_Unit #(
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             estate <= ES_IDLE;
-            xrb <= 1'b0; ewb <= 1'b0;
+            xrb <= 2'd0; ewb <= 1'b0;
             ei <= 0; ec <= 0; etc_ <= 0; qi <= 0; qc <= 0;
             for (i = 0; i < LANE; i = i + 1) sum[i] <= {SW{1'b0}};
             etlen[0] <= 0; etlen[1] <= 0;
@@ -325,7 +335,7 @@ module Softmax_Unit #(
                     qc <= qc + 1'b1;
                     if (qc == LANE-1) begin                      // exp_done 펄스
                         etlen[ewb] <= etc_;
-                        xrb    <= ~xrb;                       // xbuf 뱅크 넘김
+                        xrb    <= xrb + 2'd1;                 // xbuf 뱅크 넘김
                         ewb    <= ~ewb;                       // ebuf 뱅크 넘김
                         estate <= ES_IDLE;
                     end
