@@ -74,3 +74,14 @@ novas_dump.log
 ucli.key
 verdiLog/
 *.fsdb
+
+# --- A8W4 작업 사본 / 백업 (data/ 가 정본, 각 130 MB) ---
+data_a8w4/
+data_a8w8_backup/
+data_w4pack/
+data/*.bak
+data/*.bak/
+data/golden.stale-*.bak/
+
+# --- 양자화 실험 스크래치 (정본은 EVT_ROOT/quantization) ---
+quant/

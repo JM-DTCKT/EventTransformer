@@ -17,7 +17,7 @@ set -eu
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 root="$(cd "$here/.." && pwd)"
 n="${1:-0}"
-XSA="${XSA:-build_pp/evt_zcu102.xsa}"
+XSA="${XSA:-build_w4/evt_zcu102.xsa}"
 [ "$XSA" = "build/evt_zcu102.xsa" ] && tag="" || tag="_pp"
 if [ "$n" = "0" ]; then out="$root/evt_board_bundle${tag}_all.tar.gz"
 else out="$root/evt_board_bundle${tag}_n$n.tar.gz"; fi
@@ -32,7 +32,7 @@ need=(
     "$XSA"
     sw/main_evt.c
     board/load_ddr.tcl
-    data/wmem.bin data/rqmem.bin data/afmem.bin data/instmem.bin
+    data/board/wmem_ddr.bin data/rqmem.bin data/afmem.bin data/instmem.bin
     data/latinit.bin data/bkv.bin data/posmem.bin
     data/board/amem_x.int16.bin data/board/amem_pidx.int16.bin
     data/board/board_index.int32.bin data/board/board_samples.int32.bin

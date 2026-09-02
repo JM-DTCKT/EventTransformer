@@ -55,6 +55,7 @@ module Top #(
     parameter ACT_W  = 8,
     parameter PSUM_W = 32,
     parameter DIM_W  = 16,
+    parameter W_W    = 4,        // 가중치 레인 폭 : 8 = A8W8, 4 = A8W4 (니블 팩)
     parameter AW_W   = 14,
     parameter AW_A   = 13,       // A_Mem 깊이 2^13 = 8,192 (실사용 7,649)
     parameter AW_RQ  = 10,
@@ -198,7 +199,7 @@ module Top #(
     wire [AW_A-1:0]     dump_rd_addr;
     wire [N*16-1:0]     dump_rd_data;
 
-    EvT_Engine #(.N(N), .ACT_W(ACT_W), .PSUM_W(PSUM_W), .DIM_W(DIM_W),
+    EvT_Engine #(.N(N), .ACT_W(ACT_W), .W_W(W_W), .PSUM_W(PSUM_W), .DIM_W(DIM_W),
                  .AW_W(AW_W), .AW_A(AW_A), .AW_RQ(AW_RQ), .AW_AF(AW_AF),
                  .AW_INST(AW_INST), .N_CLASS(N_CLASS)) u_engine (
         .clk(aclk), .rst(rst),

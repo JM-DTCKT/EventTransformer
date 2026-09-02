@@ -41,8 +41,14 @@ import torch
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.normpath(os.path.join(SCRIPT_DIR, '..', 'data'))
-RDS = '/hai/home/sgh/01_assignment/EventTransformer/real_dvs_script'
-QUANT = '/hai/home/sgh/01_assignment/EventTransformer/quantization'
+# sjm: 원래는 sgh 저장소를 가리켰습니다 (아래 두 줄).
+#   RDS   = <sgh>/EventTransformer/real_dvs_script
+#   QUANT = <sgh>/EventTransformer/quantization
+# real_dvs_script 를 EvT_quant 로 복사해 두고 그쪽을 봅니다.
+# EVT_ROOT 로 덮어쓸 수 있습니다.
+EVT_ROOT = os.environ.get('EVT_ROOT', '/hai/home/sjm/EvT_quant')
+RDS = os.path.join(EVT_ROOT, 'real_dvs_script')
+QUANT = os.path.join(EVT_ROOT, 'quantization')
 for p in (RDS, QUANT, os.path.dirname(QUANT)):
     if p not in sys.path:
         sys.path.insert(0, p)
@@ -263,7 +269,8 @@ def main():
     # ---- MEAN 의 입력 = embs.linear1 → ReLU 뒤 int8 (A_Mem 의 FFN) ----
     if 'embs_site' in box:
         mfj = json.load(open(os.path.join(
-            QUANT, 'fpga_export', 'DVS128_10', 'manifest.json')))
+            QUANT, 'fpga_export',
+            os.environ.get('EVT_EXPORT', 'DVS128_10'), 'manifest.json')))
         rscale = next(f['lsb'] for f in mfj['nonlinear_formats']
                      if f['site'] == 'backbone.proc_embs_block.relu.in')
         y = np.squeeze(box['embs_site'].numpy())

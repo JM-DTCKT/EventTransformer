@@ -59,6 +59,10 @@
 module EvT_Engine #(
     parameter N      = 32,
     parameter ACT_W  = 8,
+    // 가중치(W_Mem) 레인 폭. 8 = 기존, 4 = A8W4 니블 팩.
+    // **활성값은 항상 8비트입니다** — QK/AV 의 B 는 A_Mem 에서 오므로 배열의 B
+    // 포트는 8비트 그대로 두고, W_Mem 에서 읽자마자 부호확장합니다.
+    parameter W_W    = 8,
     parameter PSUM_W = 32,
     parameter DIM_W  = 16,
     parameter E      = 128,
@@ -209,10 +213,10 @@ module EvT_Engine #(
     // =========================================================================
     wire            w_rd_en;
     wire [AW_W-1:0] w_rd_addr;
-    wire [N*8-1:0]  w_rd_data;
-    Bram_Sdp #(.DW(N*8), .AW(AW_W)) u_w_mem (
+    wire [N*W_W-1:0] w_rd_data;
+    Bram_Sdp #(.DW(N*W_W), .AW(AW_W)) u_w_mem (
         .clk(clk), .we_en(ld_we && ld_sel == LD_W), .we_addr(ld_addr),
-        .we_be({N{1'b1}}), .we_data(ld_data[N*8-1:0]),
+        .we_be({(N*W_W/8){1'b1}}), .we_data(ld_data[N*W_W-1:0]),
         .rd_en(w_rd_en), .rd_addr(w_rd_addr), .rd_data(w_rd_data));
 
     // A_Mem : 읽기 2포트가 필요합니다 (GEMM 이 A 와 B 를 동시에 읽는 경우).
@@ -296,7 +300,16 @@ module EvT_Engine #(
 
     // B 피연산자 출처 : Linear 은 W_Mem, attention(Q·Kᵀ, attn·V)은 A_Mem
     wire b_src_amem = (op_kind == OP_GEMM) && op_flag[2];
-    wire [N*8-1:0] gemm_b_from_w = w_rd_data;
+    // W_Mem 은 W_W 비트 레인이지만 배열의 B 포트는 항상 8비트입니다 (QK/AV 의 B 가
+    // A_Mem 의 int8 이므로). **읽자마자 부호확장**해 아래 경로를 하나로 유지합니다 —
+    // `pack_evt.py --w_pack_bits` 의 니블 순서(짝수 레인 = 하위 니블)와 한 벌입니다.
+    wire [N*8-1:0] gemm_b_from_w;
+    generate
+        for (lane = 0; lane < N; lane = lane + 1) begin : g_w_sext
+            assign gemm_b_from_w[lane*8 +: 8] =
+                   {{(8-W_W){w_rd_data[lane*W_W + W_W-1]}}, w_rd_data[lane*W_W +: W_W]};
+        end
+    endgenerate
     wire [N*8-1:0] gemm_b_from_a;
     generate
         for (lane = 0; lane < N; lane = lane + 1) begin : g_b_narrow

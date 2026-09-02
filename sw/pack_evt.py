@@ -61,7 +61,10 @@ import sys
 import numpy as np
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-EVT = '/hai/home/sgh/01_assignment/EventTransformer'
+# fpga_export 를 가진 저장소. 환경변수 EVT_ROOT 로 덮어쓸 수 있다.
+EVT = os.environ.get('EVT_ROOT', '/hai/home/sjm/EvT_quant')
+# 기본은 재학습 DVS128_10 의 A8W8 export. --export 로 다른 것을 지정할 수 있다
+# (예: pretrained + A8W4 = 'paper_DVS128_10__a8w4').
 EXPORT = os.path.join(EVT, 'quantization', 'fpga_export', 'DVS128_10')
 DEF_DST = os.path.normpath(os.path.join(SCRIPT_DIR, '..', 'data'))
 
@@ -161,14 +164,26 @@ def rd(name, dtype):
 
 
 def emit_words(dst, name, words, bits):
-    """워드 리스트(레인 값 리스트) → .bin + .hex"""
+    """워드 리스트(레인 값 리스트) → .bin + .hex
+
+    `bits=8` 은 레인당 1바이트입니다. `bits=4` 는 **니블 팩** — 레인 j 를 워드의
+    비트 `[4j +: 4]` 에 넣습니다 (짝수 레인이 하위 니블). RTL 의
+
+        gemm_b_from_w[j*8 +: 8] = sext(w_rd_data[j*4 +: 4])
+
+    와 한 벌이라, 여기 순서를 바꾸면 가중치가 조용히 뒤섞입니다.
+    """
     nb = N * bits // 8
     with open(os.path.join(dst, f'{name}.bin'), 'wb') as fb, \
          open(os.path.join(dst, f'{name}.hex'), 'w') as fh:
         for w in words:
-            raw = b''
-            for v in w:
-                raw += int(v).to_bytes(bits // 8, 'little', signed=True)
+            if bits == 4:
+                assert all(-8 <= int(v) <= 7 for v in w), 'int4 범위를 벗어난 가중치'
+                raw = bytes((int(w[i]) & 0xF) | ((int(w[i + 1]) & 0xF) << 4)
+                            for i in range(0, len(w), 2))
+            else:
+                raw = b''.join(int(v).to_bytes(bits // 8, 'little', signed=True)
+                               for v in w)
             assert len(raw) == nb, (len(raw), nb)
             fb.write(raw)
             fh.write(raw[::-1].hex() + '\n')
@@ -187,7 +202,16 @@ def emit_raw(dst, name, words_bytes):
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split('\n')[0])
     ap.add_argument('--dst', default=DEF_DST)
+    ap.add_argument('--export', default=None,
+                    help='fpga_export 하위 디렉토리 이름 (기본 DVS128_10)')
+    ap.add_argument('--w_pack_bits', type=int, default=8,
+                    help='wmem 레인 폭. 8 = 기존 레이아웃, 4 = 니블 팩 (RTL 변경 필요)')
     args = ap.parse_args()
+    global EXPORT
+    if args.export:
+        EXPORT = os.path.join(EVT, 'quantization', 'fpga_export', args.export)
+    assert os.path.isdir(EXPORT), f'missing {EXPORT}'
+    print(f'export: {EXPORT}')
     os.makedirs(args.dst, exist_ok=True)
 
     mf = json.load(open(os.path.join(EXPORT, 'manifest.json')))
@@ -363,7 +387,7 @@ def main():
     # =========================================================================
     # 출력
     # =========================================================================
-    nw = emit_words(args.dst, 'wmem', w_words, 8)
+    nw = emit_words(args.dst, 'wmem', w_words, args.w_pack_bits)
     n_rq = emit_raw(args.dst, 'rqmem', rq_words)
     n_af = emit_raw(args.dst, 'afmem', af_words)
 

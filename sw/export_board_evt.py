@@ -38,9 +38,13 @@ import numpy as np
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.normpath(os.path.join(SCRIPT_DIR, '..', 'data'))
-RDS = '/hai/home/sgh/01_assignment/EventTransformer/real_dvs_script'
+# sjm: 원래는 sgh 저장소를 가리켰습니다.
+#   RDS = <sgh>/EventTransformer/real_dvs_script
+EVT_ROOT = os.environ.get('EVT_ROOT', '/hai/home/sjm/EvT_quant')
+RDS = os.path.join(EVT_ROOT, 'real_dvs_script')
 
 N, TOKEN_DIM, POS_DIM, PIN_DIM = 32, 144, 64, 160
+W_WORDS_BOARD = 14000          # main_evt.c 의 W_WORDS 와 한 벌
 POS_GRID = 21
 
 
@@ -59,12 +63,18 @@ def lane_words(rows, nfeat, n_row):
 
 
 def main():
+    global DATA
     ap = argparse.ArgumentParser(description=__doc__.split('\n')[0])
     ap.add_argument('--n', type=int, default=0)
-    ap.add_argument('--dst', default=os.path.join(DATA, 'board'))
+    ap.add_argument('--data', default=DATA,
+                    help='config.json / schedule.json / posenc 를 읽을 디렉토리')
+    ap.add_argument('--dst', default=None)
     ap.add_argument('--sim_sample', type=int, default=0,
                     help='시뮬용으로 이 샘플의 **전 타임스텝**을 고정 stride 로 덤프')
     args = ap.parse_args()
+    DATA = args.data
+    if args.dst is None:
+        args.dst = os.path.join(DATA, 'board')
     os.makedirs(args.dst, exist_ok=True)
 
     cfg = json.load(open(os.path.join(DATA, 'config.json')))
@@ -214,6 +224,36 @@ def main():
         with open(os.path.join(args.dst, f'{nm}.hex'), 'w') as f:
             for w in arr[:nw]:
                 f.write(''.join(f'{int(v) & 0xFFFF:04x}' for v in w[::-1]) + '\n')
+
+
+    # ---- 보드 DDR 용 W_Mem 이미지 -------------------------------------------
+    # `Axis_Loader` 는 `SEL_W` 를 **워드당 2 beat(256b)** 로 고정합니다. A8W8 은
+    # 한 워드가 32레인 x 8b = 256b 라 딱 맞지만, **A8W4 는 128b(1 beat)** 뿐이라
+    # 니블팩 이미지를 그대로 DMA 하면 로더가 쓰는 `ld_data[127:0]`(첫 beat)만
+    # 남고 **16 B 마다 하나씩 버려집니다**.
+    #
+    # 그래서 여기서 각 워드를 32 B 경계로 제로패딩해 둡니다 — 첫 beat 가 실제
+    # 가중치, 둘째 beat 는 0 이고 엔진이 무시합니다. `main_evt.c` 의
+    # `wbytes(SEL_W) = 32` / `W_WORDS = 14000` 과 한 벌이라 A8W8·A8W4 어느
+    # 쪽이든 DMA 길이는 448,000 B 로 같습니다.
+    #
+    # 시뮬레이션 TB 는 `ld_data` 를 직접 구동해 로더를 우회하므로 이 경로를
+    # 검사하지 않습니다 — 보드에서만 드러납니다.
+    wsrc = os.path.join(DATA, 'wmem.bin')
+    if os.path.exists(wsrc):
+        wraw = open(wsrc, 'rb').read()
+        WSTEP = 32                                  # 로더가 요구하는 워드 스트라이드
+        wlane = len(wraw) // W_WORDS_BOARD          # A8W8 32 B / A8W4 16 B
+        assert wlane * W_WORDS_BOARD == len(wraw), (
+            f'wmem.bin {len(wraw)} B 가 {W_WORDS_BOARD} 워드로 나뉘지 않습니다')
+        if wlane == WSTEP:
+            wimg = wraw
+        else:
+            wimg = b''.join(wraw[i * wlane:(i + 1) * wlane] + b'\x00' * (WSTEP - wlane)
+                            for i in range(W_WORDS_BOARD))
+        open(os.path.join(args.dst, 'wmem_ddr.bin'), 'wb').write(wimg)
+        print(f"  wmem_ddr.bin        {W_WORDS_BOARD:>9,} 워드  {len(wimg)/1024:>7.1f} KB"
+              f"  (레인 {wlane} B -> 스트라이드 {WSTEP} B)")
 
     print(f'\n-> {args.dst}\n')
     print(f"  amem_x.int16.bin    {X.shape[0]:>9,} 워드  {X.nbytes/1024/1024:>7.1f} MB")

@@ -22,7 +22,7 @@ module tb_accel_evt;
              R_CYC=12'h020, R_EPS=12'h024, R_DBASE=12'h028, R_DLEN=12'h02C,
              R_WLOAD=12'h030, R_TOKN=12'h034, R_TACK=12'h038, R_CLASS=12'h03C;
   // 워드 수 (data/config.json · schedule.json 과 한 벌)
-  localparam W_WORDS=14000, PB_WORDS=869, PG_WORDS=208, S_WORDS=123,
+  localparam W_WORDS=14000, PB_WORDS=869, PG_WORDS=208, S_WORDS=99,
              LAT_WORDS=384, BKV_WORDS=24, POS_ROWS=441;
   localparam R_X=0, R_PIDX=576, R_PIN=580, R_LATV=2756,
              R_Z=3140, R_BKV=6728;
@@ -172,7 +172,7 @@ module tb_accel_evt;
     dma_load(1, R_LATV, LAT_WORDS, 4);
     dma_load(1, R_BKV,  BKV_WORDS, 5);
 
-    axi_w(R_NBODY, 118);  axi_w(R_NTAIL, 5);  axi_w(R_NTIME, 1);
+    axi_w(R_NBODY, 94);  axi_w(R_NTAIL, 5);  axi_w(R_NTIME, 1);
     axi_w(R_EPS, 32'h3727c5ac);
 
     $display("-- 실행");

@@ -115,16 +115,22 @@ class Arena:
         return self.regions, self.at
 
 
-def load_consts():
+def load_consts(src=None):
     """`pack_evt.py` 가 만든 config.json 에서 레이어별 shift / Requant_Mem 베이스를 읽습니다.
 
     이걸 손으로 적으면 22개 레이어를 다 틀립니다. **한 곳(manifest)에서만** 옵니다.
+
+    [함정] `src` 는 **출력(--dst)과 같은 디렉토리여야 합니다.** shift 는 명령어 워드
+    안에 들어가는데(`SHIFT[21:16]`), 예전에는 이 경로가 `DATA` 로 고정돼 있어
+    `--dst data_a8w4` 로 뽑아도 shift 만 `data/`(다른 양자화 조건) 것이 섞였습니다.
+    A8W4 는 s_w 가 16배 커져 shift 가 4 작아지는데, 옛 값을 쓰면 결과가 1/16 로
+    줄어 대부분 0 이 됩니다 — **컴파일도 시뮬도 되는데 값만 틀립니다.**
     """
-    cfg = json.load(open(os.path.join(DATA, 'config.json')))
+    cfg = json.load(open(os.path.join(src or DATA, 'config.json')))
     return cfg
 
 
-def build(n_tok):
+def build(n_tok, cfg_dir=None):
     """토큰 수 `n_tok` 인 타임스텝 하나의 명령어 목록 + A_Mem 영역.
 
     ## 영역 크기는 **최악치(TOK_MAX)로 고정**합니다
@@ -177,7 +183,7 @@ def build(n_tok):
     R['CTX']  = a.alloc('CTX',  QT * E,          'attn·V 결과 int8 (head 이어붙임)')
     R['FFN']  = a.alloc('FFN',  QT * E,          '블록 내 FFN 중간 int8')
 
-    CFG = load_consts()
+    CFG = load_consts(cfg_dir)
     SH, RQB, ARQ = CFG['shifts'], CFG['rq_base'], CFG['attn_rq']
     S = []
 
@@ -567,14 +573,14 @@ def main():
     ap.add_argument('--dst', default=DATA)
     args = ap.parse_args()
 
-    S, tail, arena, R, dims = build(args.tok)
+    S, tail, arena, R, dims = build(args.tok, args.dst)
     # **본체와 꼬리에 똑같이** 걸어야 합니다. 꼬리를 빠뜨리면 `OSTR` 이 0 으로
     # 나가고, 쓰기 주소가 `AOUT + mt*OSTR + n` 이라 **행타일 3개가 같은 워드에
     # 겹쳐 써집니다** (뒤 64행은 직전 블록의 잔재가 남습니다).
     for lst in (S, tail):
         annotate(lst)
         set_ostr(lst)
-        annotate2(lst, load_consts())
+        annotate2(lst, load_consts(args.dst))   # ← --dst 와 같은 config 를 봐야 합니다
     errs, total = selfcheck(S, tail, arena, R, dims, args.aw_a)
 
     print(f"[schedule_evt] n_tok={args.tok}  Lk={dims['Lk']}  "

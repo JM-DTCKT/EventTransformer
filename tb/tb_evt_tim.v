@@ -20,7 +20,7 @@
 // cross 블록 값을 보려면 그 순간에 떠야 합니다 (`snap_*`).
 // -----------------------------------------------------------------------------
 `timescale 1ns/1ps
-module tb_evt_prof;
+module tb_evt_tim;
   localparam N=32, AW_A=14, AW_W=14, AW_INST=8, DIM_W=16, W_W=4;
   localparam NTOK = 52, TT = 2, QT = 3, HD = 32, HEADS = 4;
   localparam KSTR = 160, VSTR = 129;          // head 간 간격 (schedule_evt.py)
@@ -221,15 +221,65 @@ module tb_evt_prof;
 
   // ---- 명령어 별 사이클 프로파일 ----
   integer psc [0:255], psk [0:255], psn [0:255], psm [0:255];
+  // ---- 단계별 계측 (타이밍 다이어그램용) ----
+  integer pFD  [0:255];   // 엔진 FETCH+DECODE+CONST
+  integer pISS [0:255];   // Gemm_Core ST_ISSUE
+  integer pTL  [0:255];   // Gemm_Core ST_TAIL
+  integer pGD  [0:255];   // Gemm_Core ST_DONE (핸드셰이크 대기)
+  integer pSMX [0:255];   // softmax 가 아직 안 끝난 구간 (GEMM 종료 후)
+  integer pFCA [0:255];   // Format_Cast_Act 드레인 (fca_busy)
+  integer pCOL [0:255];   // 컬럼이 실제로 나오는 사이클 (col_valid)
+  integer pWR  [0:255];   // A_Mem 쓰기
+  integer pRA  [0:255], pRB [0:255];  // A_Mem 읽기 포트 A / B
+  integer icnt, prev_inst;
+  integer eISS0[0:255], eISS1[0:255];
+  integer eTL0 [0:255], eTL1 [0:255];
+  integer eCOL0[0:255], eCOL1[0:255];
+  integer eFCA0[0:255], eFCA1[0:255];
+  integer eSMV0[0:255], eSMV1[0:255];
+  integer eWR0 [0:255], eWR1 [0:255];
+  integer eGD  [0:255];
   integer pf;
+  initial begin icnt=0; prev_inst=-1; end
   initial for (pf = 0; pf < 256; pf = pf + 1) begin
     psc[pf]=0; psk[pf]=15; psn[pf]=0; psm[pf]=0;
+    pFD[pf]=0; pISS[pf]=0; pTL[pf]=0; pGD[pf]=0; pSMX[pf]=0;
+    pFCA[pf]=0; pCOL[pf]=0; pWR[pf]=0; pRA[pf]=0; pRB[pf]=0;
+    eISS0[pf]=-1; eISS1[pf]=-1; eTL0[pf]=-1; eTL1[pf]=-1;
+    eCOL0[pf]=-1; eCOL1[pf]=-1; eFCA0[pf]=-1; eFCA1[pf]=-1;
+    eSMV0[pf]=-1; eSMV1[pf]=-1; eWR0[pf]=-1; eWR1[pf]=-1; eGD[pf]=-1;
   end
   always @(posedge clk) if (!rst && dut.busy && dbg_inst < 256) begin
     psc[dbg_inst] <= psc[dbg_inst] + 1;
     psk[dbg_inst] <= dut.op_kind;
     psn[dbg_inst] <= dut.op_nout;
     psm[dbg_inst] <= dut.op_m;
+    if (dut.state==4'd1 || dut.state==4'd2 || dut.state==4'd3) pFD[dbg_inst] <= pFD[dbg_inst]+1;
+    if (dut.u_gemm.state==2'd1) pISS[dbg_inst] <= pISS[dbg_inst]+1;
+    if (dut.u_gemm.state==2'd2) pTL [dbg_inst] <= pTL [dbg_inst]+1;
+    if (dut.u_gemm.state==2'd3) pGD [dbg_inst] <= pGD [dbg_inst]+1;
+    if (dut.gemm_done && !dut.smax_done && dut.smax_start) pSMX[dbg_inst] <= pSMX[dbg_inst]+1;
+    if (dut.fca_busy)  pFCA[dbg_inst] <= pFCA[dbg_inst]+1;
+    if (dut.col_valid) pCOL[dbg_inst] <= pCOL[dbg_inst]+1;
+    if (dut.a_we_en)   pWR [dbg_inst] <= pWR [dbg_inst]+1;
+    if (dut.a_ra_en)   pRA [dbg_inst] <= pRA [dbg_inst]+1;
+    if (dut.a_rb_en)   pRB [dbg_inst] <= pRB [dbg_inst]+1;
+    // --- 상대 시각 ---
+    if (dbg_inst !== prev_inst) begin icnt <= 0; prev_inst <= dbg_inst; end
+    else icnt <= icnt + 1;
+    if (dut.u_gemm.state==2'd1) begin
+      if (eISS0[dbg_inst]<0) eISS0[dbg_inst] <= icnt;  eISS1[dbg_inst] <= icnt; end
+    if (dut.u_gemm.state==2'd2) begin
+      if (eTL0[dbg_inst]<0)  eTL0[dbg_inst]  <= icnt;  eTL1[dbg_inst]  <= icnt; end
+    if (dut.col_valid) begin
+      if (eCOL0[dbg_inst]<0) eCOL0[dbg_inst] <= icnt;  eCOL1[dbg_inst] <= icnt; end
+    if (dut.fca_valid) begin
+      if (eFCA0[dbg_inst]<0) eFCA0[dbg_inst] <= icnt;  eFCA1[dbg_inst] <= icnt; end
+    if (dut.smax_valid) begin
+      if (eSMV0[dbg_inst]<0) eSMV0[dbg_inst] <= icnt;  eSMV1[dbg_inst] <= icnt; end
+    if (dut.a_we_en) begin
+      if (eWR0[dbg_inst]<0)  eWR0[dbg_inst]  <= icnt;  eWR1[dbg_inst]  <= icnt; end
+    if (dut.gemm_done && eGD[dbg_inst]<0) eGD[dbg_inst] <= icnt;
   end
 
   // ---- 명령어 별 활동 계수 (어디서 끊겼는지) ----
@@ -705,9 +755,9 @@ module tb_evt_prof;
       errors = errors + 1;
       $display("    [FAIL] res_class %0d != 9", res_class);
     end
-    if (errors == 0) $display("=== tb_evt: %0d checks (허용 %0d), TEST PASSED ===",
+    if (errors == 0) $display("=== tb_evt_tim: %0d checks (허용 %0d), TEST PASSED ===",
                               checks, soft);
-    else             $display("=== tb_evt: %0d/%0d failed, TEST FAILED ===",
+    else             $display("=== tb_evt_tim: %0d/%0d failed, TEST FAILED ===",
                               errors, checks);
     $finish;
   end
@@ -736,8 +786,13 @@ module tb_evt_prof;
       $display("PROF KIND ARGMAX %0d", kc5);
       $display("PROF KIND POS    %0d", kc6);
       for (i = 0; i < 256; i = i + 1) if (psk[i] < 7)
-        $display("PROF STEP %0d kind %0d M %0d NOUT %0d cyc %0d",
-                 i, psk[i], psm[i], psn[i], psc[i]);
+        $display("PROF STEP %0d kind %0d M %0d NOUT %0d cyc %0d fd %0d iss %0d tl %0d gd %0d smx %0d fca %0d col %0d wr %0d ra %0d rb %0d",
+                 i, psk[i], psm[i], psn[i], psc[i], pFD[i], pISS[i], pTL[i], pGD[i],
+                 pSMX[i], pFCA[i], pCOL[i], pWR[i], pRA[i], pRB[i]);
+      for (i = 0; i < 256; i = i + 1) if (psk[i] < 7)
+        $display("PROF EVT %0d iss %0d %0d tl %0d %0d col %0d %0d fca %0d %0d smv %0d %0d wr %0d %0d gd %0d end %0d",
+                 i, eISS0[i], eISS1[i], eTL0[i], eTL1[i], eCOL0[i], eCOL1[i],
+                 eFCA0[i], eFCA1[i], eSMV0[i], eSMV1[i], eWR0[i], eWR1[i], eGD[i], psc[i]);
     end
   endtask
 endmodule
