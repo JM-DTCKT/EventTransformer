@@ -30,10 +30,9 @@ catch {stop}
 if {[catch {state} st]} { set st "?" }
 puts "target state: $st"
 
-# W_Mem 은 `data/board/wmem_ddr.bin` 을 씁니다 — `Axis_Loader` 가 SEL_W 를 워드당
-# 2 beat(32 B)로 고정하므로 A8W4 니블팩(16 B/워드)은 32 B 로 패딩해야 합니다.
-# A8W8 이면 `wmem.bin` 과 바이트 동일합니다. 만드는 곳은 `sw/export_board_evt.py`.
-put $data/board/wmem_ddr.bin            0x10000000
+# DSP 패킹으로 W_Mem 워드가 256b(32 B) 가 되어 `Axis_Loader` 의 SEL_W 2 beat 와
+# 정확히 맞습니다 — A8W4 니블팩 시절의 패딩 이미지가 필요 없습니다.
+put $data/wmem.bin                      0x10000000
 put $data/rqmem.bin                     0x10100000
 put $data/afmem.bin                     0x10110000
 put $data/instmem.bin                   0x10120000

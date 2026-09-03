@@ -59,10 +59,9 @@
 module EvT_Engine #(
     parameter N      = 32,
     parameter ACT_W  = 8,
-    // 가중치(W_Mem) 레인 폭. 8 = 기존, 4 = A8W4 니블 팩.
-    // **활성값은 항상 8비트입니다** — QK/AV 의 B 는 A_Mem 에서 오므로 배열의 B
-    // 포트는 8비트 그대로 두고, W_Mem 에서 읽자마자 부호확장합니다.
-    parameter W_W    = 8,
+    // 가중치는 int4 고정입니다 (A8W4). W_Mem 레인 하나가 **니블 두 개**를 담고
+    // DSP48E2 의 pre-adder 가 둘을 한 곱셈에 실어 배열 처리량을 두 배로 냅니다
+    // (`PE_OS.v` 의 "DSP 패킹"). 활성값은 8비트 그대로입니다.
     parameter PSUM_W = 32,
     parameter DIM_W  = 16,
     parameter E      = 128,
@@ -71,7 +70,7 @@ module EvT_Engine #(
     parameter HD     = 32,
     parameter TOKMAX = 128,
     parameter N_CLASS = 10,      // 분류 클래스 수 (DVS128_10)
-    parameter AW_W   = 14,       // W_Mem 워드 주소폭 (14,000 워드)
+    parameter AW_W   = 14,       // 명령어의 B 베이스 폭 (W_Mem 실사용 7,000 워드)
     // A_Mem 실사용 7,649 워드 (`schedule.json` 의 a_words) → 2^13 = 8,192 로 충분.
     // 여유가 543 워드뿐이므로 영역을 늘릴 때 `schedule_evt.py` 상한을 보십시오.
     // [타이밍] 14 로 두면 BRAM 깊이 캐스케이드가 4단이 돼 읽기가 1.69 ns 입니다.
@@ -211,13 +210,18 @@ module EvT_Engine #(
     // =========================================================================
     // 메모리
     // =========================================================================
+    // 한 워드가 출력채널 **64개**를 담습니다 — 레인 j 에 {w[n+32], w[n]} 두 니블.
+    // 32x8 = 256b 로 A8W8 과 폭이 같지만 담는 채널 수는 두 배라 워드 수가 절반
+    // (14,000 -> 7,000) 이고, 그래서 깊이를 2^13 으로 줄여 BRAM 을 A8W4 수준
+    // (379 타일) 으로 유지합니다.
+    localparam AW_WM = 13;
     wire            w_rd_en;
     wire [AW_W-1:0] w_rd_addr;
-    wire [N*W_W-1:0] w_rd_data;
-    Bram_Sdp #(.DW(N*W_W), .AW(AW_W)) u_w_mem (
-        .clk(clk), .we_en(ld_we && ld_sel == LD_W), .we_addr(ld_addr),
-        .we_be({(N*W_W/8){1'b1}}), .we_data(ld_data[N*W_W-1:0]),
-        .rd_en(w_rd_en), .rd_addr(w_rd_addr), .rd_data(w_rd_data));
+    wire [N*8-1:0]  w_rd_data;
+    Bram_Sdp #(.DW(N*8), .AW(AW_WM)) u_w_mem (
+        .clk(clk), .we_en(ld_we && ld_sel == LD_W), .we_addr(ld_addr[AW_WM-1:0]),
+        .we_be({(N){1'b1}}), .we_data(ld_data[N*8-1:0]),
+        .rd_en(w_rd_en), .rd_addr(w_rd_addr[AW_WM-1:0]), .rd_data(w_rd_data));
 
     // A_Mem : 읽기 2포트가 필요합니다 (GEMM 이 A 와 B 를 동시에 읽는 경우).
     // 같은 내용을 두 벌에 미러링합니다 — BRAM 이 남고 제어가 가장 단순합니다.
@@ -300,16 +304,11 @@ module EvT_Engine #(
 
     // B 피연산자 출처 : Linear 은 W_Mem, attention(Q·Kᵀ, attn·V)은 A_Mem
     wire b_src_amem = (op_kind == OP_GEMM) && op_flag[2];
-    // W_Mem 은 W_W 비트 레인이지만 배열의 B 포트는 항상 8비트입니다 (QK/AV 의 B 가
-    // A_Mem 의 int8 이므로). **읽자마자 부호확장**해 아래 경로를 하나로 유지합니다 —
-    // `pack_evt.py --w_pack_bits` 의 니블 순서(짝수 레인 = 하위 니블)와 한 벌입니다.
-    wire [N*8-1:0] gemm_b_from_w;
-    generate
-        for (lane = 0; lane < N; lane = lane + 1) begin : g_w_sext
-            assign gemm_b_from_w[lane*8 +: 8] =
-                   {{(8-W_W){w_rd_data[lane*W_W + W_W-1]}}, w_rd_data[lane*W_W +: W_W]};
-        end
-    endgenerate
+    // W_Mem 레인은 이미 {w1, w0} 두 니블이라 **그대로** 배열에 넣습니다. 부호확장도
+    // 자리 맞추기도 DSP48E2 의 pre-adder 가 합니다 (`PE_OS.v` 참고). 니블 순서는
+    // `pack_evt.py` 가 만드는 레이아웃과 한 벌입니다 — 하위 = 출력채널 nt*64+j,
+    // 상위 = nt*64+32+j.
+    wire [N*8-1:0] gemm_b_from_w = w_rd_data;
     wire [N*8-1:0] gemm_b_from_a;
     generate
         for (lane = 0; lane < N; lane = lane + 1) begin : g_b_narrow
@@ -385,6 +384,11 @@ module EvT_Engine #(
     Gemm_Core #(.N(N), .ACT_W(ACT_W), .PSUM_W(PSUM_W), .DIM_W(DIM_W),
                    .AW_A(AW_A), .AW_B(AW_W)) u_gemm (
         .clk(clk), .rst(rst), .start(gemm_start), .all_done(gemm_done),
+        // W_Mem 에서 읽을 때만 DSP 패킹입니다. 단 **Transpose32 경유(FLAG[0])는
+        // 제외**합니다 — 전치 버퍼는 32컬럼을 받은 뒤 "다음 타일을 계산하는 동안"
+        // 32사이클에 걸쳐 쏟는 구조인데, 패킹하면 64컬럼이 연속으로 나와 쏟는
+        // 도중에 덮어씁니다. 해당하는 것은 in_proj.V 뿐입니다.
+        .pack(!b_src_amem && !op_flag[0]),
         .M(op_m), .K(op_k), .Nout(op_nout), .a_base(op_ain), .b_base(op_bin),
         .a_rd_en(gemm_a_rd_en), .a_rd_addr(gemm_a_rd_addr), .a_rd_data(a_ra_data),
         .b_rd_en(gemm_b_rd_en), .b_rd_addr(gemm_b_rd_addr), .b_rd_data(gemm_b_data),

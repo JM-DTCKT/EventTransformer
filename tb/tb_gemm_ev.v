@@ -47,6 +47,7 @@ module tb_gemm_ev;
   Gemm_Core #(.N(N), .ACT_W(ACT_W), .PSUM_W(PSUM_W), .DIM_W(DIM_W),
                  .AW_A(AW_A), .AW_B(AW_B)) dut (
     .clk(clk), .rst(rst), .start(start), .all_done(all_done),
+    .pack(1'b0),
     .M(M), .K(K), .Nout(Nout), .a_base(a_base), .b_base(b_base),
     .a_rd_en(a_rd_en), .a_rd_addr(a_rd_addr), .a_rd_data(a_rd_data),
     .b_rd_en(b_rd_en), .b_rd_addr(b_rd_addr), .b_rd_data(b_rd_data),

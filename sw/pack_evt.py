@@ -199,6 +199,54 @@ def emit_raw(dst, name, words_bytes):
     return len(words_bytes)
 
 
+W_PER_WORD = 2 * N                          # 패킹 워드가 담는 출력채널 수 = 64
+
+
+def w_bands(name, Eo):
+    """레이어를 (시작채널, 끝채널, 패킹여부) 밴드로 나눕니다.
+
+    `*.attention` 은 in_proj 하나에 Q|K|V 가 붙어 있습니다. 이 중 **V 만**
+    `Transpose32` 를 거치는데, 전치 버퍼는 32컬럼을 받은 뒤 다음 타일 계산
+    시간을 빌려 32사이클에 걸쳐 쏟습니다. 패킹하면 64컬럼이 연속으로 나와
+    쏟는 도중에 덮어쓰므로 **V 밴드만 32채널/워드로** 깔아 둡니다
+    (`EvT_Engine` 의 `.pack(!b_src_amem && !op_flag[0])` 와 한 벌).
+    """
+    if name.endswith('.attention'):
+        E = Eo // 3
+        return [(0, E, True), (E, 2 * E, True), (2 * E, 3 * E, False)]
+    return [(0, Eo, True)]
+
+
+def build_w(layers, rd_fn):
+    w_words, w_base, w_shape = [], {}, {}
+    for name, L in layers.items():
+        Eo, Ei = L['shape']
+        w = rd_fn(L['weight_file'], np.int8).astype(np.int64).reshape(Eo, Ei)
+        if w.size and (w.min() < -8 or w.max() > 7):
+            raise SystemExit(f'{name}: int4 범위를 벗어난 가중치 '
+                             f'[{w.min()}, {w.max()}] — A8W4 export 인지 확인하세요')
+        w_base[name] = len(w_words)
+        w_shape[name] = (Eo, Ei)
+        for c0, c1, packed in w_bands(name, Eo):
+            per = W_PER_WORD if packed else N
+            for nt in range((c1 - c0 + per - 1) // per):
+                for k in range(Ei):
+                    word = bytearray(N)
+                    for j in range(N):
+                        if packed:
+                            n_lo = c0 + nt * W_PER_WORD + j
+                            n_hi = n_lo + N
+                            lo = int(w[n_lo, k]) if n_lo < c1 else 0
+                            hi = int(w[n_hi, k]) if n_hi < c1 else 0
+                            word[j] = (lo & 0xF) | ((hi & 0xF) << 4)
+                        else:
+                            n = c0 + nt * N + j
+                            word[j] = int(w[n, k]) & 0xFF if n < c1 else 0
+                    w_words.append(bytes(word))
+    return w_words, w_base, w_shape
+
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split('\n')[0])
     ap.add_argument('--dst', default=DEF_DST)
@@ -218,20 +266,21 @@ def main():
     layers = {L['name']: L for L in mf['layers']}
     attn = {a['block']: a for a in mf['attention']}
     fxp = {f['name']: f for f in mf['fx_params']}
+    w_words, w_base, w_shape = build_w(layers, rd)
 
     # =========================================================================
-    # W_Mem : 워드[w_base + nt*K + k] 레인 j = w_int[nt*32+j][k]   (전치)
+    # W_Mem : 워드[w_base + nt*K + k] 레인 j = {w[nt*64+32+j][k], w[nt*64+j][k]}
+    #
+    # **한 워드가 출력채널 64개**를 담습니다 (레인 32개 x 니블 2개). DSP48E2 의
+    # pre-adder 가 두 니블을 한 곱셈에 실어 배열이 32x64 타일을 한 번에 내므로
+    # (`rtl/gemm_core/PE_OS.v` 의 "DSP 패킹"), 배치도 그 짝으로 만듭니다:
+    #
+    #     하위 니블 = 출력채널 nt*64 + j        → 드레인 rd_cnt 0..31
+    #     상위 니블 = 출력채널 nt*64 + 32 + j   → 드레인 rd_cnt 32..63
+    #
+    # 여기 순서를 바꾸면 가중치가 조용히 뒤섞입니다.
     # =========================================================================
-    w_words, w_base, w_shape = [], {}, {}
-    for name, L in layers.items():
-        Eo, Ei = L['shape']
-        w = rd(L['weight_file'], np.int8).astype(np.int64).reshape(Eo, Ei)
-        w_base[name] = len(w_words)
-        w_shape[name] = (Eo, Ei)
-        for nt in range((Eo + N - 1) // N):
-            for k in range(Ei):
-                w_words.append([int(w[nt * N + j, k]) if nt * N + j < Eo else 0
-                                for j in range(N)])
+
 
     # =========================================================================
     # Requant_Mem : 채널별 {mult, bias} 8바이트, 4채널/워드
@@ -374,20 +423,34 @@ def main():
         Eo, Ei = L['shape']
         w = rd(L['weight_file'], np.int8).astype(np.int64).reshape(Eo, Ei)
         x = rng.integers(-128, 128, size=Ei)
-        for c in (0, Eo // 2, Eo - 1):
-            nt, j = c // N, c % N
-            s = sum(int(x[k]) * w_words[w_base[name] + nt * Ei + k][j]
-                    for k in range(Ei))
-            ref = int(x @ w[c])
-            if s != ref:
-                bad.append(f'{name}[{c}]')
+        # 밴드마다 배치가 달라(패킹/비패킹) 워드 오프셋을 누적해 따라갑니다.
+        off = 0
+        for c0, c1, packed in w_bands(name, Eo):
+            per = W_PER_WORD if packed else N
+            nwd = ((c1 - c0 + per - 1) // per) * Ei
+            for c in (c0, (c0 + c1) // 2, c1 - 1):
+                r = c - c0
+                nt, r = r // per, r % per
+                j = r % N
+                tot = 0
+                for k in range(Ei):
+                    byte = w_words[w_base[name] + off + nt * Ei + k][j]
+                    if packed:
+                        nib = (byte >> 4) if r >= N else (byte & 0xF)
+                        v = nib - 16 if nib >= 8 else nib
+                    else:
+                        v = byte - 256 if byte >= 128 else byte
+                    tot += int(x[k]) * v
+                if tot != int(x @ w[c]):
+                    bad.append(f'{name}[{c}]')
+            off += nwd
     if bad:
         raise SystemExit(f'W_Mem 레이아웃 불일치: {bad[:6]}')
 
     # =========================================================================
     # 출력
     # =========================================================================
-    nw = emit_words(args.dst, 'wmem', w_words, args.w_pack_bits)
+    nw = emit_raw(args.dst, 'wmem', w_words)
     n_rq = emit_raw(args.dst, 'rqmem', rq_words)
     n_af = emit_raw(args.dst, 'afmem', af_words)
 

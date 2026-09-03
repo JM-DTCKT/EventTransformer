@@ -21,7 +21,7 @@
 // -----------------------------------------------------------------------------
 `timescale 1ns/1ps
 module tb_evt_prof;
-  localparam N=32, AW_A=14, AW_W=14, AW_INST=8, DIM_W=16, W_W=4;
+  localparam N=32, AW_A=14, AW_W=14, AW_INST=8, DIM_W=16;
   localparam NTOK = 52, TT = 2, QT = 3, HD = 32, HEADS = 4;
   localparam KSTR = 160, VSTR = 129;          // head 간 간격 (schedule_evt.py)
   // 영역 베이스 — `data/schedule.json` 과 한 벌
@@ -30,7 +30,7 @@ module tb_evt_prof;
              R_ZATT=3524, R_LNX=3908, R_LN1=4420, R_LNA=4804,
              R_Q=5188, R_K=5572, R_V=6212, R_BKV=6728,
              R_SM=6752, R_CTX=7139, R_FFN=7523;
-  localparam W_WORDS=14000, PB_WORDS=869, PG_WORDS=208, S_WORDS=99,
+  localparam W_WORDS=7904, PB_WORDS=869, PG_WORDS=208, S_WORDS=99,
              LAT_WORDS=384, BKV_WORDS=24;
   localparam S_QK0 = 11, S_OUTPROJ = 27;      // 스냅 시점 (cross 블록)
   // 꼬리 : 94 embs.ln  95 embs.linear1  96 MEAN  97 clf.linear_1  98 argmax
@@ -61,7 +61,7 @@ module tb_evt_prof;
   reg  [AW_A-1:0] dbg_rd_addr = 0;
   wire [N*16-1:0] dbg_rd_data;
 
-  EvT_Engine #(.N(N), .W_W(W_W), .AW_A(AW_A), .AW_W(AW_W), .AW_INST(AW_INST)) dut (
+  EvT_Engine #(.N(N), .AW_A(AW_A), .AW_W(AW_W), .AW_INST(AW_INST)) dut (
     .clk(clk), .rst(rst), .start(start), .done(done), .busy(busy),
     .dbg_state(dbg_state), .dbg_inst(dbg_inst),
     .n_body(n_body), .n_tail(n_tail), .n_tstep(n_tstep), .eps(eps),
@@ -73,7 +73,7 @@ module tb_evt_prof;
     .dbg_rd_en(dbg_rd_en), .dbg_rd_addr(dbg_rd_addr), .dbg_rd_data(dbg_rd_data));
 
   // ---- 메모리 이미지 ----
-  reg [N*W_W-1:0] wimg  [0:W_WORDS-1];
+  reg [N*8-1:0]  wimg  [0:W_WORDS-1];
   reg [N*8-1:0]  rqimg [0:PB_WORDS-1];
   reg [N*8-1:0]  afimg [0:PG_WORDS-1];
   reg [N*8-1:0]  instimg  [0:S_WORDS-1];
@@ -114,7 +114,7 @@ module tb_evt_prof;
       for (w = 0; w < nw; w = w + 1) begin
         @(negedge clk); ld_we = 1; ld_sel = sel; ld_addr = w;
         case (which)
-          0: ld_data = {{(N*16-N*W_W){1'b0}}, wimg[w]};
+          0: ld_data = {{(N*8){1'b0}}, wimg[w]};
           1: ld_data = {{(N*8){1'b0}}, rqimg[w]};
           2: ld_data = {{(N*8){1'b0}}, afimg[w]};
           3: ld_data = {{(N*8){1'b0}}, instimg[w]};

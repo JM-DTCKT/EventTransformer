@@ -80,7 +80,7 @@
 #define POS_ROWS 441         /* 21 x 21 */
 
 /* ---- DDR 배치 (board/load_ddr.tcl 과 한 벌) ---- */
-#define DDR_W        0x10000000u    /* board/wmem_ddr.bin  14000 x 32B  (A8W4 는 패딩본) */
+#define DDR_W        0x10000000u    /* wmem.bin       7904 x 32B (레인당 int4 x2) */
 #define DDR_RQ       0x10100000u    /* rqmem.bin       869 x 32B */
 #define DDR_AF       0x10110000u    /* afmem.bin       208 x 32B */
 #define DDR_INST     0x10120000u    /* instmem.bin     123 x 32B */
@@ -92,7 +92,7 @@
 #define DDR_INDEX    0x40000000u    /* board_index.int32.bin   */
 #define DDR_SAMPLES  0x40100000u    /* board_samples.int32.bin */
 
-#define W_WORDS   14000
+#define W_WORDS   7904
 #define RQ_WORDS  869
 #define AF_WORDS  208
 #define INST_WORDS   123

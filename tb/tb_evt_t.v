@@ -15,12 +15,12 @@
 // -----------------------------------------------------------------------------
 `timescale 1ns/1ps
 module tb_evt_t;
-  localparam N=32, AW_A=13, AW_W=14, AW_INST=8, DIM_W=16, W_W=4;
+  localparam N=32, AW_A=13, AW_W=14, AW_INST=8, DIM_W=16;
   localparam TTM = 4;                       // 최악치 타일 수 (TOK_MAX=128)
   localparam T = 20, EXP_CLASS = 9;
   localparam R_X=0, R_PIDX=576, R_PIN=580, R_LATV=2756,
              R_Z=3140, R_BKV=6728;
-  localparam W_WORDS=14000, PB_WORDS=869, PG_WORDS=208, S_WORDS=99,
+  localparam W_WORDS=7904, PB_WORDS=869, PG_WORDS=208, S_WORDS=99,
              LAT_WORDS=384, BKV_WORDS=24;
 
   reg clk = 0, rst = 1; always #5 clk = ~clk;
@@ -43,7 +43,7 @@ module tb_evt_t;
   wire [3:0]      res_class;
   wire [10*32-1:0] res_logits;
 
-  EvT_Engine #(.N(N), .W_W(W_W), .AW_A(AW_A), .AW_W(AW_W), .AW_INST(AW_INST)) dut (
+  EvT_Engine #(.N(N), .AW_A(AW_A), .AW_W(AW_W), .AW_INST(AW_INST)) dut (
     .clk(clk), .rst(rst), .start(start), .done(done), .busy(busy),
     .dbg_state(dbg_state), .dbg_inst(dbg_inst),
     .n_body(n_body), .n_tail(n_tail), .n_tstep(n_tstep), .eps(eps),
@@ -53,7 +53,7 @@ module tb_evt_t;
     .res_class(res_class), .res_logits(res_logits),
     .dbg_rd_en(1'b0), .dbg_rd_addr({AW_A{1'b0}}), .dbg_rd_data());
 
-  reg [N*W_W-1:0] wimg  [0:W_WORDS-1];
+  reg [N*8-1:0]  wimg  [0:W_WORDS-1];
   reg [N*8-1:0]  rqimg [0:PB_WORDS-1];
   reg [N*8-1:0]  afimg [0:PG_WORDS-1];
   reg [N*8-1:0]  instimg  [0:S_WORDS-1];
@@ -73,7 +73,7 @@ module tb_evt_t;
       for (k = 0; k < nw; k = k + 1) begin
         @(negedge clk); ld_we = 1; ld_sel = sel; ld_addr = k;
         case (which)
-          0: ld_data = {{(N*16-N*W_W){1'b0}}, wimg[k]};
+          0: ld_data = {{(N*8){1'b0}}, wimg[k]};
           1: ld_data = {{(N*8){1'b0}}, rqimg[k]};
           2: ld_data = {{(N*8){1'b0}}, afimg[k]};
           3: ld_data = {{(N*8){1'b0}}, instimg[k]};

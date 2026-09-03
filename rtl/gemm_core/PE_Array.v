@@ -17,16 +17,18 @@
 module PE_Array #(
     parameter N      = 32,
     parameter ACT_W  = 8,
-    parameter PSUM_W = 32
+    parameter PK_S   = 21,
+    parameter SH_W   = 41
 )(
     input  wire                    clk,
     input  wire                    rst,
     input  wire                    ce,
+    input  wire                    pack,       // 1 = b 가 int4 두 개 (DSP 패킹)
     input  wire [N-1:0]            clr_edge,   // 행 i 의 타일 시작   (i 사이클 지연)
     input  wire [N-1:0]            snap_edge,  // 행 i 의 확정 시점   (i 사이클 지연)
     input  wire [N*ACT_W-1:0]      a_edge,
     input  wire [N*ACT_W-1:0]      b_edge,
-    output wire [N*N*PSUM_W-1:0]   acc_out
+    output wire [N*N*SH_W-1:0]     acc_out    // PE 마다 shadow 원본 (필드 분리는 Gemm_Core)
 );
     wire signed [ACT_W-1:0] amesh [0:N-1][0:N];
     wire signed [ACT_W-1:0] bmesh [0:N][0:N-1];
@@ -45,16 +47,16 @@ module PE_Array #(
         end
         for (i = 0; i < N; i = i + 1) begin : ROW
             for (j = 0; j < N; j = j + 1) begin : COL
-                wire signed [PSUM_W-1:0] acc_ij;
-                PE_OS #(.ACT_W(ACT_W), .PSUM_W(PSUM_W)) u_pe (
-                    .clk(clk), .rst(rst), .ce(ce),
+                wire [SH_W-1:0] acc_ij;
+                PE_OS #(.ACT_W(ACT_W), .PK_S(PK_S), .SH_W(SH_W)) u_pe (
+                    .clk(clk), .rst(rst), .ce(ce), .pack(pack),
                     .clr_in (cmesh[i][j]), .clr_out (cmesh[i][j+1]),
                     .snap_in(smesh[i][j]), .snap_out(smesh[i][j+1]),
                     .a_in  (amesh[i][j]),   .b_in  (bmesh[i][j]),
                     .a_out (amesh[i][j+1]), .b_out (bmesh[i+1][j]),
                     .acc_out(acc_ij)
                 );
-                assign acc_out[(i*N + j)*PSUM_W +: PSUM_W] = acc_ij;
+                assign acc_out[(i*N + j)*SH_W +: SH_W] = acc_ij;
             end
         end
     endgenerate

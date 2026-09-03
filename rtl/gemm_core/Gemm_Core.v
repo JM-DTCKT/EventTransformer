@@ -41,12 +41,18 @@ module Gemm_Core #(
     parameter DIM_W  = 16,
     parameter AW_A   = 12,      // A_Mem 워드 주소폭
     parameter AW_B   = 14,      // B 주소폭 (W_Mem 기준, A_Mem 도 담김)
+    parameter PK_S   = 21,      // DSP 패킹 : 상위 곱의 자리
+    parameter SH_W   = 41,      // shadow 폭
     parameter RD_LEAD = 1       // 읽기 시점의 여유 사이클 (0 이 이론 하한)
 )(
     input  wire                    clk,
     input  wire                    rst,
     input  wire                    start,
     output wire                    all_done,
+
+    // 1 = B 가 int4 두 개씩 담긴 W_Mem (Linear). 타일이 32x64 가 되고 컬럼을
+    //     64개 뽑습니다. 0 = B 가 A_Mem 의 int8 (attention), 32x32 그대로.
+    input  wire                    pack,
 
     // ---- 형상 / 베이스 (레이어마다 다름, start 이전에 안정) ----
     input  wire [DIM_W-1:0]        M,
@@ -66,7 +72,7 @@ module Gemm_Core #(
     //   attn·V   → A_Mem 의 전치된 V 영역
     output wire                    b_rd_en,
     output wire [AW_B-1:0]         b_rd_addr,
-    input  wire [N*ACT_W-1:0]      b_rd_data,
+    input  wire [N*ACT_W-1:0]      b_rd_data,   // pack 이면 레인당 {w1,w0}
 
     // ---- 완성된 컬럼 (출력채널 n 하나에 대한 32개 행) ----
     output reg                     col_valid,
@@ -108,14 +114,23 @@ module Gemm_Core #(
     // `mt_rd_pend`/`nt_rd_pend`(직전 타일)을 쓰고, 마지막 타일을 위해 꼬리에서
     // 주기를 한 번 더 돕니다. 타일이 겹쳐 흐르므로 순서기도 여기 전용입니다.
     // =========================================================================
-    wire [DIM_W-1:0] num_mt  = (M    + N - 1) / N;
-    wire [DIM_W-1:0] num_nt  = (Nout + N - 1) / N;
-    wire [DIM_W-1:0] snap_tile_ph = K + 16'd3;
-    wire [DIM_W-1:0] k_plus4     = K + 16'd4;
-    wire [DIM_W-1:0] tile_period  = (k_plus4 > 16'd36) ? k_plus4 : 16'd36; // Tile 주기 max(K+4, 36)
+    // 패킹이면 컬럼 타일이 64 폭입니다.
+    wire [DIM_W-1:0] col_per_tile = pack ? 16'd64 : 16'd32;
+    wire [5:0]       rd_last      = pack ?  6'd63 :  6'd31;
+    wire [DIM_W-1:0] num_mt  = (M + N - 1) / N;
+    wire [DIM_W-1:0] num_nt  = pack ? ((Nout + 16'd63) >> 6) : ((Nout + 16'd31) >> 5);
+    // DSP 에 ADREG/BREG 가 붙어 지연이 3 입니다 (전에는 2) — 한 사이클씩 밀립니다.
+    wire [DIM_W-1:0] snap_tile_ph = K + 16'd4;
+    // ① snap 펄스가 주기 **안에** 떨어져야 합니다 — `tile_ph` 는 0..TILE_P-1 만
+    //    돌므로 TILE_P >= snap_tile_ph + 1 = K + 5 입니다. (K+4 로 두면 K=32 인
+    //    attention 에서 tile_ph 가 36 에 닿지 못해 snap 이 **한 번도 안 뜹니다**.)
+    // ② 컬럼을 col_per_tile 개 소비해야 하므로 그만큼도 필요합니다.
+    wire [DIM_W-1:0] k_plus5     = K + 16'd5;
+    wire [DIM_W-1:0] tp_min      = col_per_tile + 16'd4;
+    wire [DIM_W-1:0] tile_period = (k_plus5 > tp_min) ? k_plus5 : tp_min;
     // 타일 T 의 컬럼 0 은 T*tile_period + K+34+RD_LEAD 에 뽑습니다. 그때는 이미
     // 타일 T+1 의 주기이므로 위상은 그만큼 뺀 값입니다.
-    wire [DIM_W-1:0] rd_trig_tile_ph = K + (34 + RD_LEAD - 1) - tile_period;
+    wire [DIM_W-1:0] rd_trig_tile_ph = K + (35 + RD_LEAD - 1) - tile_period;
 
     localparam ST_IDLE=2'd0, ST_ISSUE=2'd1, ST_TAIL=2'd2, ST_DONE=2'd3;
     reg [1:0]        state;
@@ -238,11 +253,17 @@ module Gemm_Core #(
     generate
         for (g = 0; g < N; g = g + 1) begin : g_edge_mask
             wire row_ok = ((mt_iss << 5) + g) < M;
-            wire col_ok = ((nt_iss << 5) + g) < Nout;
+            // 패킹이면 레인 g 가 출력채널 두 개를 담습니다 — 하위 니블 = nt*64+g,
+            // 상위 니블 = nt*64+32+g. Nout 이 64 의 배수가 아니면 한쪽만 삽니다.
+            wire col_ok    = ((nt_iss << 5) + g) < Nout;
+            wire col_ok_lo = ((nt_iss << 6) + g) < Nout;
+            wire col_ok_hi = ((nt_iss << 6) + 32 + g) < Nout;
             assign a_masked[g*ACT_W +: ACT_W] =
                    row_ok ? a_rd_data[g*16 +: ACT_W]    : {ACT_W{1'b0}};
             assign b_masked[g*ACT_W +: ACT_W] =
-                   col_ok ? b_rd_data[g*ACT_W +: ACT_W] : {ACT_W{1'b0}};
+                   pack ? {col_ok_hi ? b_rd_data[g*ACT_W+4 +: 4] : 4'd0,
+                           col_ok_lo ? b_rd_data[g*ACT_W   +: 4] : 4'd0}
+                        : (col_ok ? b_rd_data[g*ACT_W +: ACT_W] : {ACT_W{1'b0}});
         end
     endgenerate
 
@@ -261,9 +282,9 @@ module Gemm_Core #(
     // =========================================================================
     // PE 배열 — `acc` 는 **shadow** 라 읽는 동안 값이 안 변합니다
     // =========================================================================
-    wire [N*N*PSUM_W-1:0] acc;
-    PE_Array #(.N(N), .ACT_W(ACT_W), .PSUM_W(PSUM_W)) u_array (
-        .clk(clk), .rst(rst), .ce(array_ce),
+    wire [N*N*SH_W-1:0] acc;
+    PE_Array #(.N(N), .ACT_W(ACT_W), .PK_S(PK_S), .SH_W(SH_W)) u_array (
+        .clk(clk), .rst(rst), .ce(array_ce), .pack(pack),
         .clr_edge(clr_edge), .snap_edge(snap_edge),
         .a_edge(a_skew), .b_edge(b_skew), .acc_out(acc));
 
@@ -280,15 +301,33 @@ module Gemm_Core #(
         end else if (rd_trig) begin
             rd_run <= 1'b1; rd_cnt <= 6'd0; mt_rd <= mt_rd_pend; nt_rd <= nt_rd_pend;
         end else if (rd_run) begin
-            if (rd_cnt == N-1) rd_run <= 1'b0;
+            if (rd_cnt == rd_last) rd_run <= 1'b0;
             else rd_cnt <= rd_cnt + 1'b1;
         end
     end
 
-    // 컬럼 j = rd_cnt 를 뽑아 레지스터에 잡음 (32:1 mux x 32 를 파이프라인 밖으로)
-    wire [DIM_W-1:0] col_n_glb = (nt_rd << 5) + {{(DIM_W-6){1'b0}}, rd_cnt};
+    // =========================================================================
+    // 컬럼 j 를 뽑아 레지스터에 잡음 (32:1 mux x 32 를 파이프라인 밖으로)
+    //
+    // 패킹이면 rd_cnt 는 0..63 이고 상위 비트가 **어느 필드인지**를 고릅니다:
+    //   rd_cnt[4:0] = PE 컬럼,  rd_cnt[5] = 0 -> 하위 곱(n = nt*64 + j)
+    //                                     1 -> 상위 곱(n = nt*64 + 32 + j)
+    //
+    // 필드 분리는 shadow 를 자르는 것뿐입니다. **하위가 음수면 상위 자리에서
+    // 1을 빌려갔으므로** 되돌려 줘야 합니다 — `+ sh[PK_S-1]` 이 그것입니다.
+    //
+    // attention(pack=0) 은 int8 하나를 두 니블로 쪼개 곱한 것이라 자리값으로
+    // 다시 합칩니다 : int8 = 상위*16 + 하위(부호없음) → acc = hi*16 + lo.
+    // =========================================================================
+    wire [4:0]       rd_col   = rd_cnt[4:0];
+    wire             rd_hi    = rd_cnt[5];
+    wire [DIM_W-1:0] col_n_glb = pack
+        ? ((nt_rd << 6) + {{(DIM_W-6){1'b0}}, rd_cnt})
+        : ((nt_rd << 5) + {{(DIM_W-6){1'b0}}, rd_cnt});
 
     integer i;
+    reg  [SH_W-1:0]      sh_i;
+    reg  signed [PSUM_W-1:0] lo_i, hi_i;
     always @(posedge clk) begin
         if (rst) begin
             col_valid <= 1'b0;
@@ -298,8 +337,17 @@ module Gemm_Core #(
             col_valid <= rd_run && (col_n_glb < Nout);
             col_n     <= col_n_glb;
             col_mt    <= mt_rd;
-            for (i = 0; i < N; i = i + 1)
-                col_data[i*PSUM_W +: PSUM_W] <= acc[(i*N + rd_cnt)*PSUM_W +: PSUM_W];
+            for (i = 0; i < N; i = i + 1) begin
+                sh_i = acc[(i*N + rd_col)*SH_W +: SH_W];
+                lo_i = $signed(sh_i[PK_S-1:0]);
+                // [함정] `$signed(...) + sh_i[..]` 로 쓰면 피연산자 하나가
+                // unsigned 라 **식 전체가 unsigned** 가 되어 부호확장이 사라집니다
+                // (오차가 정확히 2^(SH_W-PK_S-1)). 빌림 보정도 signed 로 만듭니다.
+                hi_i = $signed(sh_i[SH_W-1:PK_S]) + $signed({1'b0, sh_i[PK_S-1]});
+                col_data[i*PSUM_W +: PSUM_W] <=
+                    pack ? (rd_hi ? hi_i : lo_i)
+                         : ((hi_i <<< 4) + lo_i);
+            end
         end
     end
 endmodule

@@ -193,7 +193,8 @@ def build(n_tok, cfg_dir=None):
         # bf16 소비자는 shift 가 없습니다(None) → 0.
         #
         # `b_off` 는 그 레이어 안에서의 **오프셋**입니다 — in_proj 의 K/V 밴드가
-        # `4*E`/`8*E` (출력 타일 4개분) 만큼 들어간 자리를 가리킵니다. 베이스는
+        # `2*E`/`4*E` 만큼 들어간 자리를 가리킵니다 — W_Mem 워드 하나가 출력채널
+        # **64개**를 담으므로(DSP 패킹) Q(128채널)가 2*Ei 워드입니다. 베이스는
         # 손으로 적지 않습니다. (처음에 `b_off` 를 그대로 BIN 에 넣어 **모든 GEMM
         # 이 W_Mem 0번지**를 읽었습니다 — event_projection 만 우연히 맞았습니다.)
         if sh is None:
@@ -278,11 +279,11 @@ def build(n_tok, cfg_dir=None):
              note='rows 0-127 → Q (head-major)')
         S[-1]['OSTR'] = QT * HD        # head 간 간격 = latent 타일수 x 32
         gemm(f'{short}.in_proj.K', f'{blk}.attention', kv_rows, E, E,
-             R['LNX'], 4 * E, FMT_INT8, None, R['K'], row0=E,
+             R['LNX'], 2 * E, FMT_INT8, None, R['K'], row0=E,
              note='rows 128-255 → K (head-major). 마지막 1칸은 bias_k ROM')
         S[-1]['OSTR'] = KSTR           # head 간 간격 (bias_k 칸 포함, 최악치 고정)
         gemm(f'{short}.in_proj.V', f'{blk}.attention', kv_rows, E, E,
-             R['LNX'], 8 * E, FMT_INT8, None, R['V'], row0=2 * E,
+             R['LNX'], 4 * E, FMT_INT8, None, R['V'], row0=2 * E,
              note='rows 256-383 → Transpose32 → Vᵀ. 마지막 1칸은 bias_v ROM')
         S[-1]['OSTR'] = VSTR           # Vᵀ 는 head 마다 최악치 + bias_v 1칸
 
@@ -397,8 +398,15 @@ def selfcheck(S, tail, arena, R, dims, aw_a):
     for st in S + tail:
         for key in ('AIN', 'BIN'):
             v = st.get(key)
-            if v is None or key == 'BIN' and st.get('kind') == OP_GEMM and v == 0:
+            if v is None:
                 continue
+            # GEMM 의 BIN 은 **attention 일 때만** A_Mem 주소입니다. Linear 은
+            # W_Mem 베이스라 A_Mem 영역과 번지 공간이 겹칠 뿐 무관합니다.
+            # (DSP 패킹으로 W_Mem 베이스가 절반이 되면서 실제로 겹쳤습니다.)
+            if key == 'BIN' and st.get('kind') == OP_GEMM:
+                nm = st.get('name', '')
+                if v == 0 or not ('.qk.' in nm or '.av.' in nm):
+                    continue
             reg = max((r for r in regs if r['base'] <= v < r['base'] + r['words']),
                       key=lambda r: r['base'], default=None)
             if reg and reg['base'] not in produced:
